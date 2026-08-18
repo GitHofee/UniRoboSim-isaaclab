@@ -85,7 +85,7 @@ class IsaacLabProvider:
                 backend_id=self.descriptor.provider_id,
                 cause=exc,
             ) from exc
-        session = IsaacLabSession(self.descriptor, native, on_close=self._session_closed)
+        session = IsaacLabSession(self.descriptor, native, config=self._config, on_close=self._session_closed)
         self._active_session = session
         return session
 
@@ -100,10 +100,12 @@ class IsaacLabSession:
         descriptor: ProviderDescriptor,
         native: NativeRuntime,
         *,
+        config: IsaacLabAdapterConfig,
         on_close: Callable[[IsaacLabSession], None],
     ) -> None:
         self._descriptor = descriptor
         self._native = native
+        self._config = config
         self._on_close = on_close
         self._session_id = f"isaaclab-session-{next(_SESSION_IDS)}"
         self._state = SessionState.OPEN
@@ -121,6 +123,10 @@ class IsaacLabSession:
     @property
     def state(self) -> SessionState:
         return self._state
+
+    @property
+    def config(self) -> IsaacLabAdapterConfig:
+        return self._config
 
     def _ensure_open(self, operation: str, *, allow_ready: bool = False) -> None:
         accepted = {SessionState.OPEN, SessionState.READY} if allow_ready else {SessionState.OPEN}

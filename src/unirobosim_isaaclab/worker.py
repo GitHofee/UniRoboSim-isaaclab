@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import faulthandler
 import multiprocessing
 import os
 import signal
+import sys
 import traceback
 from collections.abc import Callable
 from multiprocessing.connection import Connection
@@ -15,7 +17,15 @@ from typing import Any, Protocol, cast
 from unirobosim import CommandMode, DebugBatch, EntityPath, PointCommandMode, WorldSpec
 
 from .config import IsaacLabAdapterConfig
-from .native_protocols import Matrix, NativeRuntime, NativeSensorSample, NativeWorldDriver, PointBatch
+from .native_protocols import (
+    Matrix,
+    NativeRuntime,
+    NativeSensorSample,
+    NativeWorldDriver,
+    PointBatch,
+    Quaternion,
+    Vector3,
+)
 
 _CALL_TIMEOUT_SECONDS = 300.0
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
@@ -104,6 +114,14 @@ def _dispatch(
         return active, None, False
     if operation == "read_rigid_body":
         return active, active.read_rigid_body(cast(EntityPath, args[0])), False
+    if operation == "set_rigid_body_pose":
+        active.set_rigid_body_pose(
+            cast(EntityPath, args[0]),
+            cast(Vector3, args[1]),
+            cast(Quaternion, args[2]),
+            cast(int, args[3]),
+        )
+        return active, None, False
     if operation == "read_contact":
         return active, active.read_contact(cast(EntityPath, args[0])), False
     if operation == "apply_deformable_position":
@@ -132,7 +150,15 @@ def _dispatch(
     if operation == "publish_debug":
         return active, active.publish_debug(cast(DebugBatch, args[0])), False
     if operation == "clear_debug":
-        return active, active.clear_debug(cast(str | None, args[0]), cast(str | None, args[1])), False
+        return (
+            active,
+            active.clear_debug(
+                cast(str | None, args[0]),
+                cast(str | None, args[1]),
+                cast(str | None, args[2]),
+            ),
+            False,
+        )
     if operation == "step":
         active.step(cast(int, args[0]))
         return active, None, False
@@ -147,6 +173,11 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
 
     if hasattr(os, "setsid"):
         os.setsid()
+    if hasattr(signal, "SIGUSR1"):
+        # A stalled native SDK call can otherwise leave only the parent IPC wait
+        # visible.  SIGUSR1 emits every Python-thread stack without changing the
+        # worker state, making native acceptance runs diagnosable and repeatable.
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     runtime: NativeRuntime | None = None
     world: NativeWorldDriver | None = None
     try:
@@ -417,6 +448,22 @@ class IsaacLabWorkerWorld:
             self._runtime._request("read_rigid_body", path),
         )
 
+    def set_rigid_body_pose(
+        self,
+        path: EntityPath,
+        position_m: Vector3,
+        orientation_xyzw: Quaternion,
+        environment_index: int,
+    ) -> None:
+        self._ensure_open("set_rigid_body_pose")
+        self._runtime._request(
+            "set_rigid_body_pose",
+            path,
+            position_m,
+            orientation_xyzw,
+            environment_index,
+        )
+
     def read_contact(self, path: EntityPath) -> Matrix:
         self._ensure_open("read_contact")
         return cast(Matrix, self._runtime._request("read_contact", path))
@@ -471,9 +518,9 @@ class IsaacLabWorkerWorld:
         self._ensure_open("publish_debug")
         return cast(tuple[int, int, int], self._runtime._request("publish_debug", batch))
 
-    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int:
+    def clear_debug(self, layer: str | None, group: str | None, primitive_id: str | None) -> int:
         self._ensure_open("clear_debug")
-        return cast(int, self._runtime._request("clear_debug", layer, primitive_id))
+        return cast(int, self._runtime._request("clear_debug", layer, group, primitive_id))
 
     def step(self, count: int) -> None:
         self._ensure_open("step")

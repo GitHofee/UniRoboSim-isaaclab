@@ -28,13 +28,25 @@ from unirobosim import (
     EntityNotFoundError,
     EntityPath,
     EntitySpec,
+    FrozenMap,
     LifecycleError,
     ParticleFluidCommand,
     ParticleFluidState,
     PointCommandMode,
+    Pose,
     ResetResult,
     RigidBodyCommand,
     RigidBodyState,
+    SceneCommand,
+    SceneCommandKind,
+    SceneCommandResult,
+    SceneCommandStatus,
+    SceneDelta,
+    SceneDragMode,
+    SceneEntityState,
+    SceneSnapshot,
+    SceneVisual,
+    SceneVisualKind,
     SensorChannel,
     SensorSample,
     StaleHandleError,
@@ -79,6 +91,9 @@ class IsaacLabWorld:
         self._state = WorldState.READY
         self._step_index = 0
         self._reset_count = 0
+        self._scene_sequence = 0
+        self._scene_results: dict[str, SceneCommandResult] = {}
+        self._drags: dict[str, tuple[EntityPath, int, Pose]] = {}
         self._entities = {entity.path: entity for entity in spec.entities}
         self._build_report = BuildReport(
             fingerprint=BuildFingerprint(
@@ -117,16 +132,18 @@ class IsaacLabWorld:
                         details={"asset_uri": entity.asset_uri},
                     )
             if entity.kind is EntityKind.RIGID_BODY:
-                if entity.asset_uri is None:
+                if entity.asset_uri is None and entity.box is None:
                     raise WorldBuildError(
-                        "Isaac Lab rigid bodies require a local USD asset_uri",
+                        "Isaac Lab rigid bodies require a portable box or local USD asset_uri",
                         operation="session.build.preflight",
                         backend_id=backend_id,
                         world_id=spec.world_id,
                         entity_path=entity.path.value,
                     )
-                asset = _local_asset_path(entity.asset_uri)
-                if asset is None or asset.suffix.lower() not in {".usd", ".usda", ".usdc"} or not asset.is_file():
+                asset = None if entity.asset_uri is None else _local_asset_path(entity.asset_uri)
+                if entity.asset_uri is not None and (
+                    asset is None or asset.suffix.lower() not in {".usd", ".usda", ".usdc"} or not asset.is_file()
+                ):
                     raise WorldBuildError(
                         "rigid asset_uri must resolve to an existing local USD file",
                         operation="session.build.preflight",
@@ -273,6 +290,8 @@ class IsaacLabWorld:
         )
         self._native_call(operation, lambda: self._native.reset(environments))
         self._reset_count += 1
+        self._scene_sequence += 1
+        self._drags.clear()
         return ResetResult(environments, self._reset_count, self.tick)
 
     def apply_articulation_command(self, command: ArticulationCommand) -> None:
@@ -564,13 +583,19 @@ class IsaacLabWorld:
         accepted, dropped, active = self._native_call(operation, lambda: self._native.publish_debug(batch))
         return DebugPublishReport(accepted, dropped, active)
 
-    def clear_debug(self, *, layer: str | None = None, primitive_id: str | None = None) -> int:
+    def clear_debug(
+        self,
+        *,
+        layer: str | None = None,
+        group: str | None = None,
+        primitive_id: str | None = None,
+    ) -> int:
         operation = "world.clear_debug"
         self._ensure_ready(operation)
-        for name, value in (("layer", layer), ("primitive_id", primitive_id)):
+        for name, value in (("layer", layer), ("group", group), ("primitive_id", primitive_id)):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValidationError(f"debug {name} must be a non-empty string", operation=operation)
-        return self._native_call(operation, lambda: self._native.clear_debug(layer, primitive_id))
+        return self._native_call(operation, lambda: self._native.clear_debug(layer, group, primitive_id))
 
     def step(self, count: int = 1) -> Tick:
         self._ensure_ready("world.step")
@@ -578,12 +603,206 @@ class IsaacLabWorld:
             raise ValidationError("step count must be a positive integer", operation="world.step")
         self._native_call("world.step", lambda: self._native.step(count))
         self._step_index += count
+        self._scene_sequence += count
         return self.tick
+
+    @staticmethod
+    def _proxy_visual(entity: EntitySpec) -> SceneVisual:
+        if entity.kind is EntityKind.RIGID_BODY:
+            dimensions = (0.5, 0.5, 0.5) if entity.box is None else entity.box.dimensions_m
+            color = (0.15, 0.7, 0.95, 1.0) if entity.box is None else entity.box.color_rgba
+        elif entity.kind is EntityKind.ARTICULATION:
+            dimensions = (0.55, 0.45, 0.7)
+            color = (0.92, 0.49, 0.16, 1.0)
+        elif entity.kind is EntityKind.PARTICLE_FLUID:
+            dimensions = (0.45, 0.45, 0.45)
+            color = (0.1, 0.45, 1.0, 0.72)
+        elif entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
+            dimensions = (0.7, 0.7, 0.15)
+            color = (0.55, 0.35, 0.9, 0.82)
+        else:
+            dimensions = (0.18, 0.18, 0.28)
+            color = (0.2, 0.85, 0.45, 0.9)
+        return SceneVisual("body", SceneVisualKind.BOX, dimensions_m=dimensions, color_rgba=color)
+
+    def _rigid_pose(self, path: EntityPath, environment: int) -> Pose:
+        state = self.read_rigid_body(self.resolve(path))
+        return Pose(
+            tuple(float(value) for value in state.positions_m.rows()[environment]),  # type: ignore[arg-type]
+            tuple(float(value) for value in state.orientations_xyzw.rows()[environment]),  # type: ignore[arg-type]
+        )
+
+    def _scene_entities(self) -> tuple[SceneEntityState, ...]:
+        result: list[SceneEntityState] = []
+        for entity in self._spec.entities:
+            rigid_state = (
+                self.read_rigid_body(self.resolve(entity.path)) if entity.kind is EntityKind.RIGID_BODY else None
+            )
+            articulation_state = (
+                self.read_articulation(self.resolve(entity.path)) if entity.kind is EntityKind.ARTICULATION else None
+            )
+            for environment in range(self._spec.environments.count):
+                if rigid_state is not None:
+                    pose = Pose(
+                        tuple(float(value) for value in rigid_state.positions_m.rows()[environment]),  # type: ignore[arg-type]
+                        tuple(float(value) for value in rigid_state.orientations_xyzw.rows()[environment]),  # type: ignore[arg-type]
+                    )
+                    linear = tuple(float(value) for value in rigid_state.linear_velocities_m_s.rows()[environment])
+                    angular = tuple(float(value) for value in rigid_state.angular_velocities_rad_s.rows()[environment])
+                    joints: tuple[float, ...] = ()
+                else:
+                    pose = entity.pose
+                    linear = angular = (0.0, 0.0, 0.0)
+                    joints = (
+                        ()
+                        if articulation_state is None
+                        else tuple(float(value) for value in articulation_state.joint_positions.rows()[environment])
+                    )
+                result.append(
+                    SceneEntityState(
+                        entity.path,
+                        entity.kind,
+                        environment,
+                        pose,
+                        linear,  # type: ignore[arg-type]
+                        angular,  # type: ignore[arg-type]
+                        entity.joint_names,
+                        joints,
+                        (self._proxy_visual(entity),),
+                        draggable=entity.kind is EntityKind.RIGID_BODY,
+                        metadata=FrozenMap(
+                            {
+                                "native_backend": "isaaclab",
+                                "visual_fidelity": "portable_proxy",
+                                "asset_uri": entity.asset_uri,
+                            }
+                        ),
+                    )
+                )
+        return tuple(result)
+
+    def scene_snapshot(self) -> SceneSnapshot:
+        self._ensure_ready("world.scene_snapshot")
+        return SceneSnapshot(
+            self._session.descriptor.provider_id,
+            self.world_id,
+            self.generation,
+            self._scene_sequence,
+            self.tick,
+            self._scene_entities(),
+        )
+
+    def scene_delta(self, base_sequence: int) -> SceneDelta:
+        self._ensure_ready("world.scene_delta")
+        if (
+            not isinstance(base_sequence, int)
+            or isinstance(base_sequence, bool)
+            or not 0 <= base_sequence <= self._scene_sequence
+        ):
+            raise ValidationError("base sequence is invalid", operation="world.scene_delta")
+        return SceneDelta(
+            self.world_id,
+            self.generation,
+            base_sequence,
+            self._scene_sequence,
+            self.tick,
+            () if base_sequence == self._scene_sequence else self._scene_entities(),
+        )
+
+    def _scene_result(
+        self,
+        command: SceneCommand,
+        status: SceneCommandStatus,
+        code: str | None = None,
+        message: str | None = None,
+    ) -> SceneCommandResult:
+        result = SceneCommandResult(
+            command.command_id,
+            status,
+            self.generation,
+            self._scene_sequence,
+            self.tick,
+            code,
+            message,
+        )
+        self._scene_results[command.command_id] = result
+        if len(self._scene_results) > self._session.config.max_cached_scene_commands:
+            del self._scene_results[next(iter(self._scene_results))]
+        return result
+
+    def _set_rigid_pose(self, path: EntityPath, environment: int, pose: Pose) -> None:
+        self._native_call(
+            "world.apply_scene_command",
+            lambda: self._native.set_rigid_body_pose(
+                path,
+                pose.position,
+                pose.orientation_xyzw,
+                environment,
+            ),
+            entity_path=path.value,
+        )
+
+    def apply_scene_command(self, command: SceneCommand) -> SceneCommandResult:
+        self._ensure_ready("world.apply_scene_command")
+        if not isinstance(command, SceneCommand):
+            raise ValidationError("operation requires SceneCommand", operation="world.apply_scene_command")
+        previous = self._scene_results.get(command.command_id)
+        if previous is not None:
+            return SceneCommandResult(
+                command.command_id,
+                SceneCommandStatus.DUPLICATE,
+                previous.generation,
+                previous.scene_sequence,
+                previous.tick,
+                message="command was already processed",
+            )
+        if command.expected_generation != self.generation:
+            return self._scene_result(command, SceneCommandStatus.REJECTED, "stale_generation", "generation mismatch")
+        entity = self._entities.get(command.entity_path)
+        if entity is None or command.environment_index >= self._spec.environments.count:
+            return self._scene_result(command, SceneCommandStatus.REJECTED, "target_not_found", "target does not exist")
+        if entity.kind is not EntityKind.RIGID_BODY:
+            return self._scene_result(
+                command,
+                SceneCommandStatus.REJECTED,
+                "unsupported_entity_kind",
+                "only free rigid bodies are draggable",
+            )
+        environment = command.environment_index
+        if command.kind is SceneCommandKind.SET_POSE:
+            assert command.target_pose is not None
+            self._set_rigid_pose(entity.path, environment, command.target_pose)
+        elif command.kind is SceneCommandKind.DRAG_BEGIN:
+            assert command.drag_id is not None
+            if command.drag_mode is not SceneDragMode.KINEMATIC:
+                return self._scene_result(
+                    command, SceneCommandStatus.REJECTED, "unsupported_drag_mode", "use kinematic"
+                )
+            if command.drag_id in self._drags:
+                return self._scene_result(command, SceneCommandStatus.REJECTED, "drag_exists", "drag already exists")
+            self._drags[command.drag_id] = (entity.path, environment, self._rigid_pose(entity.path, environment))
+        else:
+            assert command.drag_id is not None
+            active = self._drags.get(command.drag_id)
+            if active is None or active[:2] != (entity.path, environment):
+                return self._scene_result(command, SceneCommandStatus.REJECTED, "drag_not_active", "drag is not active")
+            if command.kind is SceneCommandKind.DRAG_UPDATE:
+                assert command.target_pose is not None
+                self._set_rigid_pose(entity.path, environment, command.target_pose)
+            elif command.kind is SceneCommandKind.DRAG_CANCEL:
+                self._set_rigid_pose(entity.path, environment, active[2])
+                del self._drags[command.drag_id]
+            else:
+                del self._drags[command.drag_id]
+        self._scene_sequence += 1
+        return self._scene_result(command, SceneCommandStatus.APPLIED)
 
     def _close(self, *, notify_session: bool) -> None:
         if self._state is WorldState.CLOSED:
             return
         self._state = WorldState.CLOSED
+        self._scene_results.clear()
+        self._drags.clear()
         self._entities.clear()
         try:
             self._native_call("world.close", self._native.close)

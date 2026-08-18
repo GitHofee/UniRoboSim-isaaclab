@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import math
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +19,8 @@ from unirobosim import (
     CameraModality,
     CommandMode,
     DebugBatch,
+    DebugLifetimeMode,
+    DebugPrimitive,
     DebugPrimitiveKind,
     EntityKind,
     EntityPath,
@@ -26,7 +30,232 @@ from unirobosim import (
 )
 
 from .config import IsaacLabAdapterConfig
+from .native_debug import NativeDebugOverlay, NativeDebugPayload
 from .native_protocols import Matrix, NativeDebugReport, NativeSensorSample, PointBatch
+
+Vector3 = tuple[float, float, float]
+Segment = tuple[Vector3, Vector3]
+Color = tuple[float, float, float, float]
+
+_GLYPHS = {
+    "0": "01110/10001/10011/10101/11001/10001/01110",
+    "1": "00100/01100/00100/00100/00100/00100/01110",
+    "2": "01110/10001/00001/00010/00100/01000/11111",
+    "3": "11110/00001/00001/01110/00001/00001/11110",
+    "4": "00010/00110/01010/10010/11111/00010/00010",
+    "5": "11111/10000/10000/11110/00001/00001/11110",
+    "6": "01110/10000/10000/11110/10001/10001/01110",
+    "7": "11111/00001/00010/00100/01000/01000/01000",
+    "8": "01110/10001/10001/01110/10001/10001/01110",
+    "9": "01110/10001/10001/01111/00001/00001/01110",
+    "A": "01110/10001/10001/11111/10001/10001/10001",
+    "B": "11110/10001/10001/11110/10001/10001/11110",
+    "C": "01111/10000/10000/10000/10000/10000/01111",
+    "D": "11110/10001/10001/10001/10001/10001/11110",
+    "E": "11111/10000/10000/11110/10000/10000/11111",
+    "F": "11111/10000/10000/11110/10000/10000/10000",
+    "G": "01111/10000/10000/10111/10001/10001/01110",
+    "H": "10001/10001/10001/11111/10001/10001/10001",
+    "I": "01110/00100/00100/00100/00100/00100/01110",
+    "J": "00001/00001/00001/00001/10001/10001/01110",
+    "K": "10001/10010/10100/11000/10100/10010/10001",
+    "L": "10000/10000/10000/10000/10000/10000/11111",
+    "M": "10001/11011/10101/10101/10001/10001/10001",
+    "N": "10001/11001/10101/10011/10001/10001/10001",
+    "O": "01110/10001/10001/10001/10001/10001/01110",
+    "P": "11110/10001/10001/11110/10000/10000/10000",
+    "Q": "01110/10001/10001/10001/10101/10010/01101",
+    "R": "11110/10001/10001/11110/10100/10010/10001",
+    "S": "01111/10000/10000/01110/00001/00001/11110",
+    "T": "11111/00100/00100/00100/00100/00100/00100",
+    "U": "10001/10001/10001/10001/10001/10001/01110",
+    "V": "10001/10001/10001/10001/10001/01010/00100",
+    "W": "10001/10001/10001/10101/10101/10101/01010",
+    "X": "10001/10001/01010/00100/01010/10001/10001",
+    "Y": "10001/10001/01010/00100/00100/00100/00100",
+    "Z": "11111/00001/00010/00100/01000/10000/11111",
+    "-": "00000/00000/00000/11111/00000/00000/00000",
+    ".": "00000/00000/00000/00000/00000/00110/00110",
+    ":": "00000/00110/00110/00000/00110/00110/00000",
+    "?": "01110/10001/00001/00010/00100/00000/00100",
+    " ": "00000/00000/00000/00000/00000/00000/00000",
+}
+
+
+def _find_debug_extension(isaacsim_root: Path) -> Path:
+    extension = next(iter(sorted((isaacsim_root / "extscache").glob("isaacsim.util.debug_draw-*"))), None)
+    if extension is None:
+        raise RuntimeError(
+            "Isaac native debug sink requires isaacsim.util.debug_draw; install "
+            "isaacsim-extscache-kit-sdk matching the Isaac Sim version"
+        )
+    return extension
+
+
+def _offset(point: tuple[float, ...], origin: Vector3) -> Vector3:
+    return float(point[0]) + origin[0], float(point[1]) + origin[1], float(point[2]) + origin[2]
+
+
+def _text_segments(anchor: Vector3, value: str, scale: float) -> tuple[Segment, ...]:
+    cell = scale / 7.0
+    cursor = 0.0
+    result: list[Segment] = []
+    for character in value.upper():
+        rows = _GLYPHS.get(character, _GLYPHS["?"]).split("/")
+        for row_index, row in enumerate(rows):
+            for column_index, enabled in enumerate(row):
+                if enabled == "1":
+                    left = (
+                        anchor[0],
+                        anchor[1] + cursor + column_index * cell,
+                        anchor[2] + (6 - row_index) * cell,
+                    )
+                    right = (left[0], left[1] + cell * 0.8, left[2])
+                    result.append((left, right))
+        cursor += cell * 6.0
+    return tuple(result)
+
+
+def _debug_points(primitive: DebugPrimitive, origins: tuple[Vector3, ...]) -> tuple[Vector3, ...]:
+    if primitive.kind is not DebugPrimitiveKind.POINT_SET:
+        return ()
+    nested = primitive.geometry_m.nested()
+    return tuple(
+        _offset(point, origins[environment])
+        for row_index, environment in enumerate(primitive.environment_indices)
+        for point in nested[row_index]
+    )
+
+
+def _append_segment(groups: dict[Color, list[Segment]], color: Color, segment: Segment) -> None:
+    groups.setdefault(color, []).append(segment)
+
+
+def _debug_line_groups(
+    primitive: DebugPrimitive,
+    origins: tuple[Vector3, ...],
+) -> dict[Color, tuple[Segment, ...]]:
+    nested = primitive.geometry_m.nested()
+    groups: dict[Color, list[Segment]] = {}
+    color = primitive.color_rgba
+    if primitive.kind is DebugPrimitiveKind.LINE_LIST:
+        for row_index, environment in enumerate(primitive.environment_indices):
+            for segment in nested[row_index]:
+                _append_segment(
+                    groups,
+                    color,
+                    (_offset(segment[0], origins[environment]), _offset(segment[1], origins[environment])),
+                )
+    elif primitive.kind is DebugPrimitiveKind.COORDINATE_AXES:
+        axis_colors: tuple[Color, ...] = (
+            (1.0, 0.15, 0.15, color[3]),
+            (0.15, 1.0, 0.25, color[3]),
+            (0.15, 0.4, 1.0, color[3]),
+        )
+        axes: tuple[Vector3, ...] = (
+            (primitive.size, 0.0, 0.0),
+            (0.0, primitive.size, 0.0),
+            (0.0, 0.0, primitive.size),
+        )
+        for row_index, environment in enumerate(primitive.environment_indices):
+            for raw_pose in nested[row_index]:
+                origin = _offset(raw_pose[:3], origins[environment])
+                quaternion = tuple(float(item) for item in raw_pose[3:7])
+                for axis, axis_color in zip(axes, axis_colors, strict=True):
+                    endpoint = _rotate_xyzw(axis, quaternion)  # type: ignore[arg-type]
+                    _append_segment(groups, axis_color, (origin, _offset(endpoint, origin)))
+    elif primitive.kind is DebugPrimitiveKind.TEXT:
+        assert primitive.text is not None
+        for row_index, environment in enumerate(primitive.environment_indices):
+            for text_index, anchor in enumerate(nested[row_index]):
+                world_anchor = _offset(anchor, origins[environment])
+                for segment in _text_segments(world_anchor, primitive.text[row_index][text_index], primitive.size):
+                    _append_segment(groups, color, segment)
+    elif primitive.kind is DebugPrimitiveKind.BOUNDING_BOX:
+        edges = (
+            (0, 1),
+            (0, 2),
+            (0, 4),
+            (1, 3),
+            (1, 5),
+            (2, 3),
+            (2, 6),
+            (3, 7),
+            (4, 5),
+            (4, 6),
+            (5, 7),
+            (6, 7),
+        )
+        for row_index, environment in enumerate(primitive.environment_indices):
+            for raw_box in nested[row_index]:
+                center = _offset(raw_box[:3], origins[environment])
+                half = tuple(float(item) * 0.5 for item in raw_box[3:6])
+                quaternion = tuple(float(item) for item in raw_box[6:10])
+                corners = tuple(
+                    _offset(
+                        _rotate_xyzw(
+                            (
+                                half[0] if index & 1 else -half[0],
+                                half[1] if index & 2 else -half[1],
+                                half[2] if index & 4 else -half[2],
+                            ),
+                            quaternion,  # type: ignore[arg-type]
+                        ),
+                        center,
+                    )
+                    for index in range(8)
+                )
+                for edge_left, edge_right in edges:
+                    _append_segment(groups, color, (corners[edge_left], corners[edge_right]))
+    elif primitive.kind is DebugPrimitiveKind.TRAJECTORY:
+        for row_index, environment in enumerate(primitive.environment_indices):
+            points = tuple(_offset(point, origins[environment]) for point in nested[row_index])
+            for point_left, point_right in zip(points, points[1:], strict=False):
+                _append_segment(groups, color, (point_left, point_right))
+    return {key: tuple(value) for key, value in groups.items()}
+
+
+def _debug_draw_payload(
+    primitives: Iterable[DebugPrimitive],
+    origins: tuple[Vector3, ...],
+) -> NativeDebugPayload:
+    """Lower portable primitives without importing any Isaac/Kit modules."""
+
+    points: list[Vector3] = []
+    point_colors: list[Color] = []
+    point_sizes: list[float] = []
+    line_starts: list[Vector3] = []
+    line_ends: list[Vector3] = []
+    line_colors: list[Color] = []
+    line_widths: list[float] = []
+    for primitive in primitives:
+        lowered_points = _debug_points(primitive, origins)
+        if lowered_points:
+            points.extend(lowered_points)
+            point_colors.extend((primitive.color_rgba,) * len(lowered_points))
+            # The native API uses viewport pixels, while UniRoboSim sizes are expressed in
+            # world-scale display units. This bounded conversion keeps tiny SI values visible.
+            point_sizes.extend((max(1.0, min(64.0, primitive.size * 50.0)),) * len(lowered_points))
+        line_groups = _debug_line_groups(primitive, origins)
+        if primitive.kind in {DebugPrimitiveKind.COORDINATE_AXES, DebugPrimitiveKind.TEXT}:
+            line_width = 2.0
+        else:
+            line_width = max(1.0, min(10.0, primitive.size * 40.0))
+        for color, segments in line_groups.items():
+            for start, end in segments:
+                line_starts.append(start)
+                line_ends.append(end)
+                line_colors.append(color)
+                line_widths.append(line_width)
+    return NativeDebugPayload(
+        points=tuple(points),
+        point_colors=tuple(point_colors),
+        point_sizes=tuple(point_sizes),
+        line_starts=tuple(line_starts),
+        line_ends=tuple(line_ends),
+        line_colors=tuple(line_colors),
+        line_widths=tuple(line_widths),
+    )
 
 
 @dataclass
@@ -126,7 +355,9 @@ class IsaacLabNativeRuntime:
         self._launcher = AppLauncher(**_launcher_kwargs(config, process_isolated=process_isolated))
         self._app = self._launcher.app
 
+        import carb  # type: ignore[import-not-found]
         import isaaclab.sim as sim_utils  # type: ignore[import-not-found]
+        import isaacsim  # type: ignore[import-not-found]
         import omni.physics.tensors as physics_tensors  # type: ignore[import-not-found]
         import torch  # type: ignore[import-not-found]
         from isaaclab.actuators import ImplicitActuatorCfg  # type: ignore[import-not-found]
@@ -148,6 +379,17 @@ class IsaacLabNativeRuntime:
         from isaaclab_physx.sim.schemas import (  # type: ignore[import-not-found]
             PhysxDeformableBodyPropertiesCfg,
         )
+
+        isaacsim_root = Path(next(iter(isaacsim.__path__)))
+        debug_extension = _find_debug_extension(isaacsim_root)
+        # Loading this one native plugin directly avoids asking Kit to re-resolve
+        # all optional packages in the 16 GB pip SDK cache after AppLauncher has
+        # started.  The latter is both slow and fails offline on unrelated
+        # telemetry metadata in Isaac Sim 6.0.1.
+        debug_python_root = str(debug_extension / "isaacsim")
+        if debug_python_root not in isaacsim.__path__:
+            isaacsim.__path__.append(debug_python_root)
+        from isaacsim.util.debug_draw import _debug_draw  # type: ignore[import-not-found]
         from pxr import PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade, Vt  # type: ignore[import-not-found]
 
         self._modules = SimpleNamespace(
@@ -165,6 +407,9 @@ class IsaacLabNativeRuntime:
             PhysxCfg=PhysxCfg,
             PhysxDeformableBodyPropertiesCfg=PhysxDeformableBodyPropertiesCfg,
             define_deformable_body_properties=define_deformable_body_properties,
+            carb=carb,
+            debug_draw=_debug_draw,
+            debug_draw_plugin_path=debug_extension / "bin",
             sim_utils=sim_utils,
             physics_tensors=physics_tensors,
             torch=torch,
@@ -238,8 +483,10 @@ class IsaacLabNativeWorld:
         self._deformables: dict[EntityPath, Any] = {}
         self._fluids: dict[EntityPath, tuple[_FluidSet, ...]] = {}
         self._cameras: dict[EntityPath, Any] = {}
-        self._debug_roots: dict[tuple[str, str], str] = {}
-        self._debug_expirations: dict[tuple[str, str], int | None] = {}
+        self._debug_draw_interface: Any | None = None
+        self._debug_overlay: NativeDebugOverlay | None = None
+        self._debug_expirations: dict[tuple[str, str, str], int | None] = {}
+        self._debug_lifetimes: dict[tuple[str, str, str], DebugLifetimeMode] = {}
         self._step_index = 0
         self._joint_maps: dict[EntityPath, tuple[int, ...]] = {}
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
@@ -254,6 +501,25 @@ class IsaacLabNativeWorld:
         except Exception:
             self._close(notify_runtime=False)
             raise
+
+    def _native_debug_overlay(self) -> NativeDebugOverlay:
+        if self._debug_overlay is None:
+            # Keep the optional render-side plugin out of control-only worlds.
+            # Loading it during SimulationContext construction causes a busy loop;
+            # loading it in minimal experiences can also fail on absent graph
+            # services even though simulation itself is fully usable.
+            self._m.carb.get_framework().load_plugins(
+                loaded_file_wildcards=["isaacsim.util.debug_draw.plugin"],
+                search_paths=[str(self._m.debug_draw_plugin_path)],
+            )
+            self._debug_draw_interface = self._m.debug_draw.acquire_debug_draw_interface()
+            self._debug_overlay = NativeDebugOverlay(
+                self._debug_draw_interface,
+                lambda primitives: _debug_draw_payload(primitives, self._origins_cpu),
+            )
+        overlay = self._debug_overlay
+        assert overlay is not None
+        return overlay
 
     def _build(self) -> None:
         sim_utils = self._m.sim_utils
@@ -281,6 +547,12 @@ class IsaacLabNativeWorld:
             render_interval=1,
         )
         self._sim = sim_utils.SimulationContext(sim_cfg)
+        if any(entity.kind is EntityKind.CAMERA_SENSOR for entity in self._spec.entities):
+            # Headless RTX scenes have no viewport headlight. A renderer-neutral
+            # camera contract must therefore provide deterministic environment
+            # illumination or valid geometry can produce an all-black frame.
+            light = sim_utils.DomeLightCfg(intensity=2500.0, color=(1.0, 1.0, 1.0))
+            light.func("/World/unirobosimDefaultDomeLight", light)
         if has_fluid:
             # Isaac Sim 6.0 has no public particle tensor view. Particle state therefore uses
             # PhysX-to-USD readback. Rigid bodies in such worlds use the USD bridge below so the
@@ -291,6 +563,8 @@ class IsaacLabNativeWorld:
             self._sim.set_setting("/physics/updateVelocitiesToUsd", True)
         for index, origin in enumerate(self._origins_cpu):
             sim_utils.create_prim(f"/World/env_{index}", "Xform", translation=origin)
+        ground = sim_utils.GroundPlaneCfg(color=(0.2, 0.23, 0.28))
+        ground.func("/World/unirobosimGround", ground)
         for entity in self._spec.entities:
             if entity.kind is EntityKind.ARTICULATION:
                 self._author_articulation(entity)
@@ -328,6 +602,11 @@ class IsaacLabNativeWorld:
             actuators={
                 "unirobosim": self._m.ImplicitActuatorCfg(
                     joint_names_expr=[".*"],
+                    effort_limit_sim=(
+                        dict(zip(entity.joint_names, entity.joint_effort_limits, strict=True))
+                        if entity.joint_effort_limits
+                        else None
+                    ),
                     stiffness=self._config.position_stiffness,
                     damping=self._config.position_damping,
                 )
@@ -336,6 +615,44 @@ class IsaacLabNativeWorld:
         self._articulations[entity.path] = self._m.Articulation(cfg)
 
     def _author_rigid(self, entity: EntitySpec) -> None:
+        if entity.box is not None:
+            color = entity.box.color_rgba
+            cfg = self._m.RigidObjectCfg(
+                prim_path=f"/World/env_.*/{_native_name(entity.path)}",
+                spawn=self._m.sim_utils.CuboidCfg(
+                    size=entity.box.dimensions_m,
+                    rigid_props=self._m.sim_utils.RigidBodyPropertiesCfg(),
+                    mass_props=self._m.sim_utils.MassPropertiesCfg(mass=entity.box.mass_kg),
+                    collision_props=self._m.sim_utils.CollisionPropertiesCfg(),
+                    visual_material=self._m.sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=color[:3],
+                        opacity=color[3],
+                    ),
+                    physics_material=self._m.sim_utils.RigidBodyMaterialCfg(
+                        static_friction=entity.box.static_friction,
+                        dynamic_friction=entity.box.dynamic_friction,
+                        restitution=entity.box.restitution,
+                    ),
+                    activate_contact_sensors=True,
+                ),
+                init_state=self._m.RigidObjectCfg.InitialStateCfg(
+                    pos=entity.pose.position,
+                    rot=entity.pose.orientation_xyzw,
+                ),
+            )
+            self._rigids[entity.path] = self._m.RigidObject(cfg)
+            contact_cfg = self._m.ContactSensorCfg(
+                prim_path=f"/World/env_.*/{_native_name(entity.path)}",
+                update_period=0.0,
+                track_pose=False,
+                track_air_time=False,
+                track_contact_points=False,
+                track_friction_forces=False,
+                history_length=0,
+                debug_vis=False,
+            )
+            self._contacts[entity.path] = self._m.ContactSensor(contact_cfg)
+            return
         assert entity.asset_uri is not None
         if self._has_fluid:
             self._author_usd_rigid(entity)
@@ -555,7 +872,10 @@ class IsaacLabNativeWorld:
             offset=self._m.CameraCfg.OffsetCfg(
                 pos=entity.pose.position,
                 rot=entity.pose.orientation_xyzw,
-                convention="world",
+                # UniRoboSim camera poses use the OpenGL optical frame: -Z forward,
+                # +Y up. Isaac Lab performs the conversion to its native camera
+                # frame when the convention is declared explicitly.
+                convention="opengl",
             ),
             spawn=self._m.sim_utils.PinholeCameraCfg(
                 focal_length=focal_length,
@@ -690,6 +1010,11 @@ class IsaacLabNativeWorld:
                 fluid_set.points.GetVelocitiesAttr().Set(self._m.Vt.Vec3fArray(fluid_set.initial_velocities))
         for camera in self._cameras.values():
             camera.reset(env_ids=env_ids)
+        reset_debug_keys = tuple(
+            key for key, mode in self._debug_lifetimes.items() if mode is not DebugLifetimeMode.MANUAL
+        )
+        if reset_debug_keys:
+            self._remove_debug_keys(reset_debug_keys)
         assert self._sim is not None
         self._sim.forward()
         self._update_assets(0.0)
@@ -800,6 +1125,45 @@ class IsaacLabNativeWorld:
             tuple(tuple(float(value) for value in row) for row in values)
             for values in (positions, orientations, linear_velocities, angular_velocities)
         )  # type: ignore[return-value]
+
+    def set_rigid_body_pose(
+        self,
+        path: EntityPath,
+        position_m: Vector3,
+        orientation_xyzw: tuple[float, float, float, float],
+        environment_index: int,
+    ) -> None:
+        if path in self._usd_rigid_views:
+            view = self._usd_rigid_views[path]
+            transforms = view.get_transforms().clone()
+            origin = self._m.torch.tensor(
+                self._origins_cpu[environment_index], device=transforms.device, dtype=transforms.dtype
+            )
+            transforms[environment_index, :3] = (
+                self._m.torch.tensor(position_m, device=transforms.device, dtype=transforms.dtype) + origin
+            )
+            transforms[environment_index, 3:] = self._m.torch.tensor(
+                orientation_xyzw, device=transforms.device, dtype=transforms.dtype
+            )
+            indices = self._m.torch.tensor((environment_index,), device=transforms.device, dtype=self._m.torch.int64)
+            view.set_transforms(transforms[indices], indices)
+            view.set_velocities(self._m.torch.zeros((1, 6), device=transforms.device, dtype=transforms.dtype), indices)
+        else:
+            asset = self._rigids[path]
+            assert self._sim is not None and self._origins is not None
+            pose = self._m.torch.tensor(
+                ((*position_m, *orientation_xyzw),), device=self._sim.device, dtype=self._m.torch.float32
+            )
+            pose[:, :3] += self._origins[environment_index : environment_index + 1]
+            env_ids = self._m.torch.tensor((environment_index,), device=self._sim.device, dtype=self._m.torch.int64)
+            asset.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
+            asset.write_root_link_velocity_to_sim_index(
+                root_velocity=self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
+                env_ids=env_ids,
+            )
+        assert self._sim is not None
+        self._sim.forward()
+        self._update_assets(0.0)
 
     def read_contact(self, path: EntityPath) -> Matrix:
         if path in self._usd_rigids:
@@ -913,72 +1277,44 @@ class IsaacLabNativeWorld:
         return tuple(channels)
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport:
-        stage = self._m.sim_utils.get_current_stage()
-        debug_root = "/World/UniRoboSimDebug"
-        self._m.sim_utils.create_prim(debug_root, "Xform")
         for primitive in batch.primitives:
             key = primitive.key
-            existing = self._debug_roots.get(key)
-            if existing is not None:
-                stage.RemovePrim(self._m.Sdf.Path(existing))
-            digest = hashlib.sha256(f"{primitive.layer}\0{primitive.primitive_id}".encode()).hexdigest()[:20]
-            root = f"{debug_root}/item_{digest}"
-            self._m.sim_utils.create_prim(root, "Xform")
-            nested = primitive.geometry_m.nested()
-            if primitive.kind is DebugPrimitiveKind.POINT_SET:
-                values = tuple(
-                    (
-                        float(point[0]) + self._origins_cpu[environment][0],
-                        float(point[1]) + self._origins_cpu[environment][1],
-                        float(point[2]) + self._origins_cpu[environment][2],
-                    )
-                    for row_index, environment in enumerate(primitive.environment_indices)
-                    for point in nested[row_index]
-                )
-                points = self._m.UsdGeom.Points.Define(stage, f"{root}/points")
-                points.CreatePointsAttr().Set(self._m.Vt.Vec3fArray(values))
-                points.CreateWidthsAttr().Set(self._m.Vt.FloatArray((primitive.size,) * len(values)))
-                drawable = points
+            if primitive.lifetime.mode is DebugLifetimeMode.FRAME:
+                expiration = self._step_index + 1
+            elif primitive.lifetime.mode is DebugLifetimeMode.STEPS:
+                assert primitive.lifetime.step_count is not None
+                expiration = self._step_index + primitive.lifetime.step_count
             else:
-                values = tuple(
-                    (
-                        float(point[0]) + self._origins_cpu[environment][0],
-                        float(point[1]) + self._origins_cpu[environment][1],
-                        float(point[2]) + self._origins_cpu[environment][2],
-                    )
-                    for row_index, environment in enumerate(primitive.environment_indices)
-                    for segment in nested[row_index]
-                    for point in segment
-                )
-                curves = self._m.UsdGeom.BasisCurves.Define(stage, f"{root}/lines")
-                curves.CreateTypeAttr().Set(self._m.UsdGeom.Tokens.linear)
-                curves.CreateWrapAttr().Set(self._m.UsdGeom.Tokens.nonperiodic)
-                curves.CreatePointsAttr().Set(self._m.Vt.Vec3fArray(values))
-                curves.CreateCurveVertexCountsAttr().Set(self._m.Vt.IntArray((2,) * (len(values) // 2)))
-                curves.CreateWidthsAttr().Set(self._m.Vt.FloatArray((primitive.size,) * len(values)))
-                drawable = curves
-            drawable.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
-                self._m.Vt.Vec3fArray((primitive.color_rgba[:3],))
-            )
-            drawable.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.constant).Set(
-                self._m.Vt.FloatArray((primitive.color_rgba[3],))
-            )
-            self._debug_roots[key] = root
-            self._debug_expirations[key] = (
-                None if primitive.lifetime_steps == 0 else self._step_index + primitive.lifetime_steps
-            )
-        return len(batch.primitives), 0, len(self._debug_roots)
+                expiration = None
+            self._debug_expirations[key] = expiration
+            self._debug_lifetimes[key] = primitive.lifetime.mode
+        overlay = self._native_debug_overlay()
+        overlay.upsert(batch.primitives)
+        self._flush_debug_render()
+        return len(batch.primitives), 0, overlay.active_count
 
-    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int:
-        stage = self._m.sim_utils.get_current_stage()
+    def _flush_debug_render(self) -> None:
+        if self._config.render:
+            assert self._sim is not None
+            self._sim.render()
+
+    def _remove_debug_keys(self, keys: tuple[tuple[str, str, str], ...]) -> None:
+        for key in keys:
+            self._debug_expirations.pop(key)
+            self._debug_lifetimes.pop(key)
+        if self._native_debug_overlay().remove(keys):
+            self._flush_debug_render()
+
+    def clear_debug(self, layer: str | None, group: str | None, primitive_id: str | None) -> int:
         keys = tuple(
             key
-            for key in self._debug_roots
-            if (layer is None or key[0] == layer) and (primitive_id is None or key[1] == primitive_id)
+            for key in self._native_debug_overlay().keys
+            if (layer is None or key[0] == layer)
+            and (group is None or key[1] == group)
+            and (primitive_id is None or key[2] == primitive_id)
         )
-        for key in keys:
-            stage.RemovePrim(self._m.Sdf.Path(self._debug_roots.pop(key)))
-            self._debug_expirations.pop(key)
+        if keys:
+            self._remove_debug_keys(keys)
         return len(keys)
 
     @staticmethod
@@ -1011,8 +1347,8 @@ class IsaacLabNativeWorld:
                 for key, expiration in self._debug_expirations.items()
                 if expiration is not None and expiration <= self._step_index
             )
-            for layer, primitive_id in expired:
-                self.clear_debug(layer, primitive_id)
+            if expired:
+                self._remove_debug_keys(expired)
 
     def _update_assets(self, dt: float) -> None:
         for asset in self._articulations.values():
@@ -1041,8 +1377,14 @@ class IsaacLabNativeWorld:
         self._deformables.clear()
         self._fluids.clear()
         self._cameras.clear()
-        self._debug_roots.clear()
         self._debug_expirations.clear()
+        self._debug_lifetimes.clear()
+        if self._debug_overlay is not None:
+            self._debug_overlay.close()
+            self._debug_overlay = None
+        if self._debug_draw_interface is not None:
+            self._m.debug_draw.release_debug_draw_interface(self._debug_draw_interface)
+            self._debug_draw_interface = None
         self._initial_articulation.clear()
         self._initial_rigid.clear()
         self._initial_deformable.clear()

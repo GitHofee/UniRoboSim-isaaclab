@@ -107,10 +107,30 @@ CAPABILITIES = CapabilitySet(
             FrozenMap(
                 {
                     "frame": "environment-local-world",
-                    "primitives": ["point_set", "line_list"],
+                    "primitives": [
+                        "point_set",
+                        "line_list",
+                        "coordinate_axes",
+                        "text",
+                        "bounding_box",
+                        "trajectory",
+                    ],
                     "stable_ids": True,
+                    "stable_key": "layer-group-id",
+                    "text_fallback": "ascii-vector-strokes-or-question-mark",
                 }
             ),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("render.browser-scene@1"),
+            FrozenMap(
+                {
+                    "drag_modes": ["kinematic"],
+                    "draggable_entities": ["rigid_body"],
+                    "scene_representation": "portable-proxy",
+                }
+            ),
+            limitations=("browser visuals are portable proxies rather than streamed USD geometry",),
         ),
     )
 )
@@ -134,7 +154,7 @@ CAMERA_CAPABILITIES = (
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.3.0a0",
+    version="0.4.0a0",
     contract_version="v0alpha4",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(

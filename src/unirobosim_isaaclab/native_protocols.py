@@ -8,6 +8,7 @@ from unirobosim import CameraModality, CommandMode, DebugBatch, EntityPath, Poin
 
 Matrix = tuple[tuple[float, ...], ...]
 Vector3 = tuple[float, float, float]
+Quaternion = tuple[float, float, float, float]
 PointBatch = tuple[tuple[Vector3, ...], ...]
 NativeSensorChannel = tuple[CameraModality, tuple[int, ...], tuple[float | int, ...]]
 NativeSensorSample = tuple[NativeSensorChannel, ...]
@@ -38,6 +39,14 @@ class NativeWorldDriver(Protocol):
 
     def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]: ...
 
+    def set_rigid_body_pose(
+        self,
+        path: EntityPath,
+        position_m: Vector3,
+        orientation_xyzw: Quaternion,
+        environment_index: int,
+    ) -> None: ...
+
     def read_contact(self, path: EntityPath) -> Matrix: ...
 
     def apply_deformable_position(
@@ -65,7 +74,7 @@ class NativeWorldDriver(Protocol):
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport: ...
 
-    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int: ...
+    def clear_debug(self, layer: str | None, group: str | None, primitive_id: str | None) -> int: ...
 
     def step(self, count: int) -> None: ...
 

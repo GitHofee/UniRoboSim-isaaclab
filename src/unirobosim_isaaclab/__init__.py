@@ -6,11 +6,17 @@ from .probe import probe_environment
 from .provider import IsaacLabProvider, IsaacLabSession
 from .world import IsaacLabWorld
 
-__version__ = "0.3.0a0"
+__version__ = "0.4.0a0"
 
 
 def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProvider:
     return IsaacLabProvider(config)
+
+
+def create_easy_provider() -> IsaacLabProvider:
+    """Entry-point profile where an EasyAPI camera works without native config."""
+
+    return IsaacLabProvider(IsaacLabAdapterConfig(enable_cameras=True, render=True))
 
 
 __all__ = [
@@ -23,6 +29,7 @@ __all__ = [
     "IsaacLabWorld",
     "__version__",
     "create_provider",
+    "create_easy_provider",
     "descriptor_for_config",
     "probe_environment",
 ]

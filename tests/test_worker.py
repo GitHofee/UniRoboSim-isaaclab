@@ -174,6 +174,13 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     )
     world, rigid, _ = _dispatch(runtime, world, ("read_rigid_body", (EntityPath("/props/marker"),)))
     assert rigid[0] == ((0.0, 0.0, 1.0), (0.0, 0.0, 1.0))
+    world, _, _ = _dispatch(
+        runtime,
+        world,
+        ("set_rigid_body_pose", (EntityPath("/props/marker"), (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 1)),
+    )
+    world, moved, _ = _dispatch(runtime, world, ("read_rigid_body", (EntityPath("/props/marker"),)))
+    assert moved[0][1] == (1.0, 2.0, 3.0)
     world, contact, _ = _dispatch(runtime, world, ("read_contact", (EntityPath("/props/marker"),)))
     assert contact == ((0.0, 0.0, 9.81), (0.0, 0.0, 9.81))
 
@@ -199,7 +206,7 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     batch = debug_batch()
     world, report, _ = _dispatch(runtime, world, ("publish_debug", (batch,)))
     assert report == (1, 0, 1)
-    world, cleared, _ = _dispatch(runtime, world, ("clear_debug", ("test", "point")))
+    world, cleared, _ = _dispatch(runtime, world, ("clear_debug", ("test", "default", "point")))
     assert cleared == 1
 
     world, _, _ = _dispatch(runtime, world, ("step", (3,)))
@@ -270,6 +277,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
             ("ok", (positions, velocities)),
             ("ok", None),
             ("ok", (rigid_positions, orientations, rigid_zeros, rigid_zeros)),
+            ("ok", None),
             ("ok", contacts),
             ("ok", None),
             ("ok", (points, zeros)),
@@ -304,6 +312,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         rigid_zeros,
         rigid_zeros,
     )
+    world.set_rigid_body_pose(EntityPath("/props/marker"), (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 1)
     assert world.read_contact(EntityPath("/props/marker")) == contacts
     world.apply_deformable_position(EntityPath("/soft/jelly"), (((0.0, 0.0, 1.0),),), (0,), (0,))
     assert world.read_deformable(EntityPath("/soft/jelly")) == (points, zeros)
@@ -312,7 +321,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     assert world.read_sensor(EntityPath("/camera")) == sensor
     batch = debug_batch()
     assert world.publish_debug(batch) == (1, 0, 1)
-    assert world.clear_debug("test", "point") == 1
+    assert world.clear_debug("test", "default", "point") == 1
     world.step(2)
     world.close()
     world.close()
@@ -333,6 +342,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         "read_articulation",
         "apply_rigid_body_wrench",
         "read_rigid_body",
+        "set_rigid_body_pose",
         "read_contact",
         "apply_deformable_position",
         "read_deformable",

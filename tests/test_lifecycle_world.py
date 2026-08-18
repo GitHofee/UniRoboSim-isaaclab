@@ -27,8 +27,14 @@ from unirobosim import (
     ParticleFluidCommand,
     ParticleFluidSpec,
     PointCommandMode,
+    Pose,
     ProviderSelectionError,
     RigidBodyCommand,
+    SceneCommand,
+    SceneCommandKind,
+    SceneCommandStatus,
+    SceneControlWorld,
+    SceneDragMode,
     SessionState,
     StaleHandleError,
     UniRoboSimError,
@@ -224,6 +230,117 @@ def test_all_preflight_rejections(tmp_path: Path) -> None:
     )
     world = session.build(file_uri)
     world.close()
+    session.close()
+
+
+def test_scene_snapshot_delta_and_transactional_rigid_drag(tmp_path: Path) -> None:
+    runtime = FakeNativeRuntime()
+    _, session = open_test_session(runtime)
+    world = session.build(make_world(make_articulation_asset(tmp_path / "scene.usda")))
+    assert isinstance(world, SceneControlWorld)
+    initial = world.scene_snapshot()
+    assert initial.sequence == 0 and len(initial.entities) == 8
+    marker = next(
+        entity
+        for entity in initial.entities
+        if entity.path == EntityPath("/props/marker") and entity.environment_index == 1
+    )
+    assert marker.draggable and marker.visuals[0].kind.value == "box"
+    assert marker.metadata["visual_fidelity"] == "portable_proxy"
+
+    def command(
+        command_id: str,
+        kind: SceneCommandKind,
+        *,
+        target: Pose | None = None,
+        drag_mode: SceneDragMode | None = None,
+    ) -> SceneCommand:
+        return SceneCommand(
+            command_id,
+            "browser",
+            "lease",
+            world.generation,
+            kind,
+            EntityPath("/props/marker"),
+            1,
+            target,
+            "drag-1" if kind is not SceneCommandKind.SET_POSE else None,
+            drag_mode,
+            (0.0, 0.0, 1.0) if kind is SceneCommandKind.DRAG_BEGIN else None,
+        )
+
+    begin = command("begin", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.KINEMATIC)
+    assert world.apply_scene_command(begin).status is SceneCommandStatus.APPLIED
+    target = Pose((2.0, 3.0, 4.0))
+    update = command("update", SceneCommandKind.DRAG_UPDATE, target=target)
+    assert world.apply_scene_command(update).status is SceneCommandStatus.APPLIED
+    assert world.apply_scene_command(command("end", SceneCommandKind.DRAG_END)).status is SceneCommandStatus.APPLIED
+    moved = world.scene_snapshot()
+    moved_marker = next(
+        entity
+        for entity in moved.entities
+        if entity.path == EntityPath("/props/marker") and entity.environment_index == 1
+    )
+    assert moved_marker.pose == target
+    delta = world.scene_delta(0)
+    assert delta.sequence == 3 and len(delta.upserts) == 8
+    assert world.apply_scene_command(update).status is SceneCommandStatus.DUPLICATE
+
+    constraint = command("constraint", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.CONSTRAINT)
+    assert world.apply_scene_command(constraint).error_code == "unsupported_drag_mode"
+    articulation = SceneCommand(
+        "articulation",
+        "browser",
+        "lease",
+        world.generation,
+        SceneCommandKind.SET_POSE,
+        EntityPath("/robots/arm"),
+        target_pose=Pose(),
+    )
+    assert world.apply_scene_command(articulation).error_code == "unsupported_entity_kind"
+    with pytest.raises(ValidationError):
+        world.apply_scene_command(object())  # type: ignore[arg-type]
+
+    stale = SceneCommand(
+        "stale",
+        "browser",
+        "lease",
+        world.generation + 1,
+        SceneCommandKind.SET_POSE,
+        EntityPath("/props/marker"),
+        0,
+        Pose(),
+    )
+    assert world.apply_scene_command(stale).error_code == "stale_generation"
+    missing = SceneCommand(
+        "missing",
+        "browser",
+        "lease",
+        world.generation,
+        SceneCommandKind.SET_POSE,
+        EntityPath("/missing"),
+        0,
+        Pose(),
+    )
+    assert world.apply_scene_command(missing).error_code == "target_not_found"
+
+    set_pose = command("set-pose", SceneCommandKind.SET_POSE, target=Pose((0.5, 0.25, 1.25)))
+    assert world.apply_scene_command(set_pose).status is SceneCommandStatus.APPLIED
+    repeated_begin = command("begin-again", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.KINEMATIC)
+    assert world.apply_scene_command(repeated_begin).status is SceneCommandStatus.APPLIED
+    assert world.apply_scene_command(
+        command("begin-conflict", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.KINEMATIC)
+    ).error_code == "drag_exists"
+    cancel = command("cancel", SceneCommandKind.DRAG_CANCEL)
+    assert world.apply_scene_command(cancel).status is SceneCommandStatus.APPLIED
+    assert world.apply_scene_command(
+        command("inactive-update", SceneCommandKind.DRAG_UPDATE, target=Pose())
+    ).error_code == "drag_not_active"
+    with pytest.raises(ValidationError):
+        world.scene_delta(999)
+    sequence_before_reset = world.scene_snapshot().sequence
+    world.reset((1,))
+    assert world.scene_snapshot().sequence == sequence_before_reset + 1
     session.close()
 
 
@@ -526,6 +643,10 @@ def test_camera_and_debug_endpoints_are_strict_and_backend_neutral() -> None:
     world = session.build(spec)
     camera = world.resolve(EntityPath("/camera"))
     fluid = world.resolve(EntityPath("/fluid"))
+    scene = world.scene_snapshot()
+    visuals = {entity.path: entity.visuals[0] for entity in scene.entities}
+    assert visuals[EntityPath("/fluid")].color_rgba == (0.1, 0.45, 1.0, 0.72)
+    assert visuals[EntityPath("/camera")].dimensions_m == (0.18, 0.18, 0.28)
     before = world.tick
     sample = world.read_sensor(camera)
     assert sample.tick == before and world.tick == before

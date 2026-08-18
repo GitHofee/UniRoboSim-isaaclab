@@ -17,6 +17,7 @@ from unirobosim import (
     CameraSpec,
     DebugBatch,
     DebugBus,
+    DebugLifetime,
     DebugPrimitive,
     DebugPrimitiveKind,
     EntityKind,
@@ -139,7 +140,7 @@ def _debug_batch() -> DebugBatch:
         (0,),
         color_rgba=(1.0, 0.95, 0.05, 1.0),
         size=0.12,
-        lifetime_steps=30,
+        lifetime=DebugLifetime.steps(30),
     )
     return DebugBatch((axes, points))
 

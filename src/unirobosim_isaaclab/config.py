@@ -24,6 +24,7 @@ class IsaacLabAdapterConfig:
     position_stiffness: float = 1000.0
     position_damping: float = 100.0
     velocity_damping: float = 100.0
+    max_cached_scene_commands: int = 4096
 
     def __post_init__(self) -> None:
         if (
@@ -77,3 +78,12 @@ class IsaacLabAdapterConfig:
         object.__setattr__(self, "environment_spacing_m", spacing)
         for name, value in normalized.items():
             object.__setattr__(self, name, value)
+        if (
+            not isinstance(self.max_cached_scene_commands, int)
+            or isinstance(self.max_cached_scene_commands, bool)
+            or not 16 <= self.max_cached_scene_commands <= 1_000_000
+        ):
+            raise ValidationError(
+                "max_cached_scene_commands must be an integer in [16, 1000000]",
+                operation="isaaclab.config.validate",
+            )

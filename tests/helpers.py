@@ -87,6 +87,11 @@ class FakeNativeWorld:
         self.close_error = close_error
         self.reset_error: BaseException | None = None
         self.step_error: BaseException | None = None
+        self.rigid_poses = {
+            entity.path: [((0.0, 0.0, 1.0), entity.pose.orientation_xyzw) for _ in range(spec.environments.count)]
+            for entity in spec.entities
+            if entity.kind is EntityKind.RIGID_BODY
+        }
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
         if self.reset_error is not None:
@@ -120,12 +125,23 @@ class FakeNativeWorld:
     def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]:
         self.calls.append(("read_rigid_body", path))
         count = self.spec.environments.count
+        poses = self.rigid_poses[path]
         return (
-            tuple((0.0, 0.0, 1.0) for _ in range(count)),
-            tuple((0.0, 0.0, 0.0, 1.0) for _ in range(count)),
+            tuple(item[0] for item in poses),
+            tuple(item[1] for item in poses),
             tuple((0.0, 0.0, 0.0) for _ in range(count)),
             tuple((0.0, 0.0, 0.0) for _ in range(count)),
         )
+
+    def set_rigid_body_pose(
+        self,
+        path: EntityPath,
+        position_m: tuple[float, float, float],
+        orientation_xyzw: tuple[float, float, float, float],
+        environment_index: int,
+    ) -> None:
+        self.calls.append(("set_rigid_body_pose", (path, position_m, orientation_xyzw, environment_index)))
+        self.rigid_poses[path][environment_index] = (position_m, orientation_xyzw)
 
     def read_contact(self, path: EntityPath) -> Matrix:
         self.calls.append(("read_contact", path))
@@ -199,8 +215,8 @@ class FakeNativeWorld:
         self.calls.append(("publish_debug", batch))
         return len(batch.primitives), 0, len(batch.primitives)
 
-    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int:
-        self.calls.append(("clear_debug", (layer, primitive_id)))
+    def clear_debug(self, layer: str | None, group: str | None, primitive_id: str | None) -> int:
+        self.calls.append(("clear_debug", (layer, group, primitive_id)))
         return 1
 
     def step(self, count: int) -> None:
