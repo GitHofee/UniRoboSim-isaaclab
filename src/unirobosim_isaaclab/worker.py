@@ -12,10 +12,10 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from unirobosim import CommandMode, EntityPath, WorldSpec
+from unirobosim import CommandMode, DebugBatch, EntityPath, PointCommandMode, WorldSpec
 
 from .config import IsaacLabAdapterConfig
-from .native_protocols import Matrix, NativeRuntime, NativeWorldDriver, PointBatch
+from .native_protocols import Matrix, NativeRuntime, NativeSensorSample, NativeWorldDriver, PointBatch
 
 _CALL_TIMEOUT_SECONDS = 300.0
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
@@ -116,6 +116,23 @@ def _dispatch(
         return active, None, False
     if operation == "read_deformable":
         return active, active.read_deformable(cast(EntityPath, args[0])), False
+    if operation == "apply_particle_fluid":
+        active.apply_particle_fluid(
+            cast(EntityPath, args[0]),
+            cast(PointCommandMode, args[1]),
+            cast(PointBatch, args[2]),
+            cast(tuple[int, ...], args[3]),
+            cast(tuple[int, ...], args[4]),
+        )
+        return active, None, False
+    if operation == "read_particle_fluid":
+        return active, active.read_particle_fluid(cast(EntityPath, args[0])), False
+    if operation == "read_sensor":
+        return active, active.read_sensor(cast(EntityPath, args[0])), False
+    if operation == "publish_debug":
+        return active, active.publish_debug(cast(DebugBatch, args[0])), False
+    if operation == "clear_debug":
+        return active, active.clear_debug(cast(str | None, args[0]), cast(str | None, args[1])), False
     if operation == "step":
         active.step(cast(int, args[0]))
         return active, None, False
@@ -423,6 +440,40 @@ class IsaacLabWorkerWorld:
     def read_deformable(self, path: EntityPath) -> tuple[PointBatch, PointBatch]:
         self._ensure_open("read_deformable")
         return cast(tuple[PointBatch, PointBatch], self._runtime._request("read_deformable", path))
+
+    def apply_particle_fluid(
+        self,
+        path: EntityPath,
+        mode: PointCommandMode,
+        targets: PointBatch,
+        environment_indices: tuple[int, ...],
+        particle_indices: tuple[int, ...],
+    ) -> None:
+        self._ensure_open("apply_particle_fluid")
+        self._runtime._request(
+            "apply_particle_fluid",
+            path,
+            mode,
+            targets,
+            environment_indices,
+            particle_indices,
+        )
+
+    def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]:
+        self._ensure_open("read_particle_fluid")
+        return cast(tuple[PointBatch, PointBatch], self._runtime._request("read_particle_fluid", path))
+
+    def read_sensor(self, path: EntityPath) -> NativeSensorSample:
+        self._ensure_open("read_sensor")
+        return cast(NativeSensorSample, self._runtime._request("read_sensor", path))
+
+    def publish_debug(self, batch: DebugBatch) -> tuple[int, int, int]:
+        self._ensure_open("publish_debug")
+        return cast(tuple[int, int, int], self._runtime._request("publish_debug", batch))
+
+    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int:
+        self._ensure_open("clear_debug")
+        return cast(int, self._runtime._request("clear_debug", layer, primitive_id))
 
     def step(self, count: int) -> None:
         self._ensure_open("step")

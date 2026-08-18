@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0a0
+
+- Add real fixed-count PhysX PBD particle-fluid authoring, position/velocity commands, state readback,
+  stepping, and deterministic reset.
+- Add capability-gated Isaac Lab RTX RGB/depth camera samples without advancing the physics tick.
+- Add stable native USD point/line debug overlays with layer/ID replacement, filtering, and lifetimes.
+- Add a USD rigid-body bridge for verified rigid + particle-fluid mixed scenes.
+- Upgrade the exact core dependency and provider contract to UniRoboSim `0.4.0a0` / `v0alpha4`.
+- Document and fail explicitly for unsupported bridged contact-force and particle + articulation/deformable
+  same-world combinations in this Isaac Sim 6.0.1 profile.
+
 ## 0.2.0a0
 
 - Add batched rigid-body root-link pose and twist state.

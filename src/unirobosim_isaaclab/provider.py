@@ -22,7 +22,7 @@ from unirobosim import (
 )
 
 from .config import IsaacLabAdapterConfig
-from .descriptor import DESCRIPTOR
+from .descriptor import descriptor_for_config
 from .native_protocols import NativeRuntime
 from .probe import probe_environment
 from .world import IsaacLabWorld
@@ -51,11 +51,12 @@ class IsaacLabProvider:
             raise ValidationError("config must be an IsaacLabAdapterConfig", operation="isaaclab.provider.init")
         self._runtime_factory = runtime_factory or _default_runtime_factory
         self._probe_function = probe_function
+        self._descriptor = descriptor_for_config(self._config)
         self._active_session: IsaacLabSession | None = None
 
     @property
     def descriptor(self) -> ProviderDescriptor:
-        return DESCRIPTOR
+        return self._descriptor
 
     def probe(self) -> ProbeReport:
         return self._probe_function(self._config, self.descriptor)

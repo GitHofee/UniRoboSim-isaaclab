@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
 from unirobosim import (
     ArrayValue,
+    CameraModality,
+    DebugBatch,
     DeformableBodySpec,
     DeformableTopology,
     EntityKind,
@@ -12,12 +15,13 @@ from unirobosim import (
     EntitySpec,
     EnvironmentSpec,
     FrozenMap,
+    PointCommandMode,
     ProbeReport,
     ProviderDescriptor,
     WorldSpec,
 )
 
-from unirobosim_isaaclab.native_protocols import Matrix, PointBatch
+from unirobosim_isaaclab.native_protocols import Matrix, NativeSensorSample, PointBatch
 
 
 def available_probe(config: object, descriptor: ProviderDescriptor) -> ProbeReport:
@@ -146,6 +150,58 @@ class FakeNativeWorld:
             tuple(points for _ in range(self.spec.environments.count)),
             tuple(zeros for _ in range(self.spec.environments.count)),
         )
+
+    def apply_particle_fluid(
+        self,
+        path: EntityPath,
+        mode: PointCommandMode,
+        targets: PointBatch,
+        environment_indices: tuple[int, ...],
+        particle_indices: tuple[int, ...],
+    ) -> None:
+        self.calls.append(("fluid", (path, mode, targets, environment_indices, particle_indices)))
+
+    def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]:
+        self.calls.append(("read_fluid", path))
+        entity = next(item for item in self.spec.entities if item.path == path)
+        assert entity.particle_fluid is not None
+        points = tuple(
+            (float(row[0]), float(row[1]), float(row[2]))
+            for row in entity.particle_fluid.initial_particle_positions_m.rows()
+        )
+        zeros = tuple((0.0, 0.0, 0.0) for _ in points)
+        return (
+            tuple(points for _ in range(self.spec.environments.count)),
+            tuple(zeros for _ in range(self.spec.environments.count)),
+        )
+
+    def read_sensor(self, path: EntityPath) -> NativeSensorSample:
+        self.calls.append(("read_sensor", path))
+        entity = next(item for item in self.spec.entities if item.path == path)
+        assert entity.camera is not None
+        channels = []
+        for modality in entity.camera.modalities:
+            if modality is CameraModality.RGB:
+                shape = (
+                    self.spec.environments.count,
+                    entity.camera.height_px,
+                    entity.camera.width_px,
+                    3,
+                )
+                values: tuple[int | float, ...] = (17,) * math.prod(shape)
+            else:
+                shape = (self.spec.environments.count, entity.camera.height_px, entity.camera.width_px)
+                values = (1.25,) * math.prod(shape)
+            channels.append((modality, shape, values))
+        return tuple(channels)
+
+    def publish_debug(self, batch: DebugBatch) -> tuple[int, int, int]:
+        self.calls.append(("publish_debug", batch))
+        return len(batch.primitives), 0, len(batch.primitives)
+
+    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int:
+        self.calls.append(("clear_debug", (layer, primitive_id)))
+        return 1
 
     def step(self, count: int) -> None:
         if self.step_error is not None:

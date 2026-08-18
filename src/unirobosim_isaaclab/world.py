@@ -16,8 +16,11 @@ from unirobosim import (
     ArticulationState,
     BuildFingerprint,
     BuildReport,
+    CameraModality,
     CommandError,
     ContactState,
+    DebugBatch,
+    DebugPublishReport,
     DeformableCommand,
     DeformableState,
     EntityHandle,
@@ -32,6 +35,8 @@ from unirobosim import (
     ResetResult,
     RigidBodyCommand,
     RigidBodyState,
+    SensorChannel,
+    SensorSample,
     StaleHandleError,
     Tick,
     UniRoboSimError,
@@ -139,14 +144,6 @@ class IsaacLabWorld:
                         world_id=spec.world_id,
                         entity_path=entity.path.value,
                     )
-            if entity.kind is EntityKind.PARTICLE_FLUID:
-                raise UnsupportedCapabilityError(
-                    "particle-fluid state is not advertised by this adapter build",
-                    operation="session.build.preflight",
-                    backend_id=backend_id,
-                    world_id=spec.world_id,
-                    entity_path=entity.path.value,
-                )
 
     @property
     def world_id(self) -> str:
@@ -460,30 +457,120 @@ class IsaacLabWorld:
         return DeformableState(ArrayValue.from_nested(position), ArrayValue.from_nested(velocity), self.tick)
 
     def apply_particle_fluid_command(self, command: ParticleFluidCommand) -> None:
-        self._ensure_ready("world.apply_particle_fluid_command")
+        operation = "world.apply_particle_fluid_command"
+        self._ensure_ready(operation)
         if not isinstance(command, ParticleFluidCommand):
-            raise CommandError(
-                "operation requires a ParticleFluidCommand", operation="world.apply_particle_fluid_command"
+            raise CommandError("operation requires a ParticleFluidCommand", operation=operation)
+        entity = self._validate_handle(command.handle, operation)
+        if entity.kind is not EntityKind.PARTICLE_FLUID or entity.particle_fluid is None:
+            raise CommandError("entity is not a particle fluid", operation=operation, entity_path=entity.path.value)
+        if command.mode is PointCommandMode.FORCE:
+            raise UnsupportedCapabilityError(
+                "this adapter supports particle position and velocity commands, not force",
+                operation=operation,
+                backend_id=self._session.descriptor.provider_id,
+                world_id=self.world_id,
+                entity_path=entity.path.value,
             )
-        self._validate_handle(command.handle, "world.apply_particle_fluid_command")
-        raise UnsupportedCapabilityError(
-            "particle-fluid commands are not advertised by this adapter build",
-            operation="world.apply_particle_fluid_command",
-            backend_id=self._session.descriptor.provider_id,
-            world_id=self.world_id,
-            entity_path=command.handle.path.value,
+        environments = self._indices(
+            command.environment_indices,
+            self._spec.environments.count,
+            "environment_indices",
+            operation=operation,
+        )
+        particles = self._indices(
+            command.particle_indices,
+            entity.particle_fluid.particle_count,
+            "particle_indices",
+            operation=operation,
+        )
+        expected = (len(environments), len(particles), 3)
+        if command.targets.shape != expected:
+            raise CommandError(
+                "target shape must exactly match selected environments and particles",
+                operation=operation,
+                entity_path=entity.path.value,
+                details={"expected_shape": list(expected), "actual_shape": list(command.targets.shape)},
+            )
+        nested = command.targets.nested()
+        targets: PointBatch = tuple(
+            tuple((float(vector[0]), float(vector[1]), float(vector[2])) for vector in environment)
+            for environment in nested
+        )
+        self._native_call(
+            operation,
+            lambda: self._native.apply_particle_fluid(
+                entity.path,
+                command.mode,
+                targets,
+                environments,
+                particles,
+            ),
+            entity_path=entity.path.value,
         )
 
     def read_particle_fluid(self, handle: EntityHandle) -> ParticleFluidState:
-        self._ensure_ready("world.read_particle_fluid")
-        self._validate_handle(handle, "world.read_particle_fluid")
-        raise UnsupportedCapabilityError(
-            "particle-fluid state is not advertised by this adapter build",
-            operation="world.read_particle_fluid",
-            backend_id=self._session.descriptor.provider_id,
-            world_id=self.world_id,
-            entity_path=handle.path.value,
+        operation = "world.read_particle_fluid"
+        self._ensure_ready(operation)
+        entity = self._validate_handle(handle, operation)
+        if entity.kind is not EntityKind.PARTICLE_FLUID:
+            raise CommandError("entity is not a particle fluid", operation=operation, entity_path=entity.path.value)
+        positions, velocities = self._native_call(
+            operation,
+            lambda: self._native.read_particle_fluid(entity.path),
+            entity_path=entity.path.value,
         )
+        return ParticleFluidState(ArrayValue.from_nested(positions), ArrayValue.from_nested(velocities), self.tick)
+
+    def read_sensor(self, handle: EntityHandle) -> SensorSample:
+        operation = "world.read_sensor"
+        self._ensure_ready(operation)
+        entity = self._validate_handle(handle, operation)
+        if entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None:
+            raise CommandError("entity is not a camera sensor", operation=operation, entity_path=entity.path.value)
+        native_channels = self._native_call(
+            operation,
+            lambda: self._native.read_sensor(entity.path),
+            entity_path=entity.path.value,
+        )
+        if tuple(item[0] for item in native_channels) != entity.camera.modalities:
+            raise UniRoboSimError(
+                "Isaac Lab returned camera modalities in an invalid order",
+                operation=operation,
+                backend_id=self._session.descriptor.provider_id,
+                world_id=self.world_id,
+                entity_path=entity.path.value,
+            )
+        channels = tuple(
+            SensorChannel(
+                modality,
+                ArrayValue(shape, values, dtype="uint8" if modality is CameraModality.RGB else "float32"),
+            )
+            for modality, shape, values in native_channels
+        )
+        return SensorSample(handle, channels, self.tick)
+
+    def publish_debug(self, batch: DebugBatch) -> DebugPublishReport:
+        operation = "world.publish_debug"
+        self._ensure_ready(operation)
+        if not isinstance(batch, DebugBatch):
+            raise ValidationError("publish requires a DebugBatch", operation=operation)
+        if any(
+            environment >= self._spec.environments.count
+            for primitive in batch.primitives
+            for environment in primitive.environment_indices
+        ):
+            raise ValidationError("debug batch contains an out-of-range environment", operation=operation)
+        accepted, dropped, active = self._native_call(operation, lambda: self._native.publish_debug(batch))
+        return DebugPublishReport(accepted, dropped, active)
+
+    def clear_debug(self, *, layer: str | None = None, primitive_id: str | None = None) -> int:
+        operation = "world.clear_debug"
+        self._ensure_ready(operation)
+        for name, value in (("layer", layer), ("primitive_id", primitive_id)):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValidationError(f"debug {name} must be a non-empty string", operation=operation)
+        return self._native_call(operation, lambda: self._native.clear_debug(layer, primitive_id))
 
     def step(self, count: int = 1) -> Tick:
         self._ensure_ready("world.step")

@@ -30,13 +30,21 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.2.0a0"
+    assert unirobosim_isaaclab.__version__ == "0.3.0a0"
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
-    assert DESCRIPTOR.contract_version == "v0alpha3"
+    assert DESCRIPTOR.contract_version == "v0alpha4"
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
     assert CAPABILITIES.get(CapabilityId("control.rigid_body.wrench@1")) is not None
     assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None
-    assert CAPABILITIES.get(CapabilityId("state.fluid.particles@1")) is None
+    assert CAPABILITIES.get(CapabilityId("state.fluid.particles@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("control.fluid.particles@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("sensor.camera.rgb@1")) is None
+    camera_provider = unirobosim_isaaclab.create_provider(
+        IsaacLabAdapterConfig(device="cpu", enable_cameras=True, render=True)
+    )
+    assert camera_provider.descriptor is not DESCRIPTOR
+    assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.rgb@1")) is not None
     control = CAPABILITIES.get(CapabilityId("control.deformable.points@1"))
     assert control is not None
     assert control.properties == FrozenMap(

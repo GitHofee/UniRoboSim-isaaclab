@@ -6,7 +6,21 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from unirobosim import CommandMode, EntityPath
+from unirobosim import (
+    ArrayValue,
+    CameraModality,
+    CameraSpec,
+    CommandMode,
+    DebugBatch,
+    DebugPrimitive,
+    DebugPrimitiveKind,
+    EntityKind,
+    EntityPath,
+    EntitySpec,
+    ParticleFluidSpec,
+    PointCommandMode,
+    WorldSpec,
+)
 
 from unirobosim_isaaclab import worker as worker_module
 from unirobosim_isaaclab.config import IsaacLabAdapterConfig
@@ -22,6 +36,41 @@ from unirobosim_isaaclab.worker import (
 )
 
 from .helpers import FakeNativeRuntime, FakeNativeWorld, make_articulation_asset, make_world
+
+
+def extended_world(asset: Path) -> WorldSpec:
+    base = make_world(asset)
+    return WorldSpec(
+        base.world_id,
+        (
+            *base.entities,
+            EntitySpec(
+                EntityPath("/fluid"),
+                EntityKind.PARTICLE_FLUID,
+                particle_fluid=ParticleFluidSpec(ArrayValue.from_nested(((0.0, 0.0, 1.0),))),
+            ),
+            EntitySpec(
+                EntityPath("/camera"),
+                EntityKind.CAMERA_SENSOR,
+                camera=CameraSpec(width_px=2, height_px=2),
+            ),
+        ),
+        environments=base.environments,
+    )
+
+
+def debug_batch() -> DebugBatch:
+    return DebugBatch(
+        (
+            DebugPrimitive(
+                "point",
+                "test",
+                DebugPrimitiveKind.POINT_SET,
+                ArrayValue.from_nested([[[0.0, 0.0, 0.0]]]),
+                (0,),
+            ),
+        )
+    )
 
 
 class FakeProcess:
@@ -95,7 +144,7 @@ def fake_worker_factory(
 
 def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     runtime = FakeNativeRuntime()
-    spec = make_world(make_articulation_asset(tmp_path / "robot.usda"))
+    spec = extended_world(make_articulation_asset(tmp_path / "robot.usda"))
 
     world, result, stop = _dispatch(runtime, None, ("build_world", (spec,)))
     assert result is None and not stop and world is runtime.worlds[0]
@@ -136,6 +185,22 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     )
     world, deformable, _ = _dispatch(runtime, world, ("read_deformable", (EntityPath("/soft/jelly"),)))
     assert len(deformable[0]) == 2
+
+    fluid_targets = (((0.25, 0.0, 1.0),),)
+    world, _, _ = _dispatch(
+        runtime,
+        world,
+        ("apply_particle_fluid", (EntityPath("/fluid"), PointCommandMode.POSITION, fluid_targets, (0,), (0,))),
+    )
+    world, fluid, _ = _dispatch(runtime, world, ("read_particle_fluid", (EntityPath("/fluid"),)))
+    assert fluid[0][0][0] == (0.0, 0.0, 1.0)
+    world, sensor, _ = _dispatch(runtime, world, ("read_sensor", (EntityPath("/camera"),)))
+    assert tuple(channel[0] for channel in sensor) == (CameraModality.RGB, CameraModality.DEPTH)
+    batch = debug_batch()
+    world, report, _ = _dispatch(runtime, world, ("publish_debug", (batch,)))
+    assert report == (1, 0, 1)
+    world, cleared, _ = _dispatch(runtime, world, ("clear_debug", ("test", "point")))
+    assert cleared == 1
 
     world, _, _ = _dispatch(runtime, world, ("step", (3,)))
     last_call: Any = runtime.worlds[0].calls[-1]
@@ -192,6 +257,10 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     orientations = ((0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, 1.0))
     rigid_zeros = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
     contacts = ((0.0, 0.0, 9.81), (0.0, 0.0, 9.81))
+    sensor = (
+        (CameraModality.RGB, (2, 2, 2, 3), (17,) * 24),
+        (CameraModality.DEPTH, (2, 2, 2), (1.25,) * 8),
+    )
     factory, connection, process = fake_worker_factory(
         [
             ("ok", None),
@@ -205,12 +274,17 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
             ("ok", None),
             ("ok", (points, zeros)),
             ("ok", None),
+            ("ok", (points, zeros)),
+            ("ok", sensor),
+            ("ok", (1, 0, 1)),
+            ("ok", 1),
+            ("ok", None),
             ("ok", None),
             ("ok", None),
         ]
     )
     runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
-    spec = make_world(make_articulation_asset(tmp_path / "robot.usda"))
+    spec = extended_world(make_articulation_asset(tmp_path / "robot.usda"))
     world = runtime.build_world(spec)
     with pytest.raises(NativeWorkerError, match="already owns"):
         runtime.build_world(spec)
@@ -233,6 +307,12 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     assert world.read_contact(EntityPath("/props/marker")) == contacts
     world.apply_deformable_position(EntityPath("/soft/jelly"), (((0.0, 0.0, 1.0),),), (0,), (0,))
     assert world.read_deformable(EntityPath("/soft/jelly")) == (points, zeros)
+    world.apply_particle_fluid(EntityPath("/fluid"), PointCommandMode.VELOCITY, (((0.1, 0.0, 0.0),),), (0,), (0,))
+    assert world.read_particle_fluid(EntityPath("/fluid")) == (points, zeros)
+    assert world.read_sensor(EntityPath("/camera")) == sensor
+    batch = debug_batch()
+    assert world.publish_debug(batch) == (1, 0, 1)
+    assert world.clear_debug("test", "point") == 1
     world.step(2)
     world.close()
     world.close()
@@ -256,6 +336,11 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         "read_contact",
         "apply_deformable_position",
         "read_deformable",
+        "apply_particle_fluid",
+        "read_particle_fluid",
+        "read_sensor",
+        "publish_debug",
+        "clear_debug",
         "step",
         "close_world",
         "close_runtime",

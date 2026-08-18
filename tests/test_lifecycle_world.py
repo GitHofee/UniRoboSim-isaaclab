@@ -7,11 +7,16 @@ import pytest
 from unirobosim import (
     ArrayValue,
     ArticulationCommand,
+    CameraModality,
+    CameraSpec,
     CapabilityId,
     CapabilityNegotiationError,
     CapabilityRequirement,
     CommandError,
     CommandMode,
+    DebugBatch,
+    DebugPrimitive,
+    DebugPrimitiveKind,
     DeformableCommand,
     EntityKind,
     EntityNotFoundError,
@@ -36,8 +41,8 @@ from unirobosim import (
 )
 
 from unirobosim_isaaclab import IsaacLabProvider
+from unirobosim_isaaclab.config import IsaacLabAdapterConfig
 from unirobosim_isaaclab.provider import IsaacLabSession
-from unirobosim_isaaclab.world import IsaacLabWorld
 
 from .helpers import (
     FakeNativeRuntime,
@@ -444,7 +449,8 @@ def test_deformable_command_rejections(tmp_path: Path) -> None:
     session.close()
 
 
-def test_particle_fluid_is_explicitly_unsupported(tmp_path: Path) -> None:
+def test_particle_fluid_state_command_and_validation(tmp_path: Path) -> None:
+    del tmp_path
     runtime = FakeNativeRuntime()
     _, session = open_test_session(runtime)
     fluid = EntitySpec(
@@ -453,16 +459,10 @@ def test_particle_fluid_is_explicitly_unsupported(tmp_path: Path) -> None:
         particle_fluid=ParticleFluidSpec(ArrayValue.from_nested(((0.0, 0.0, 1.0), (0.1, 0.0, 1.0)))),
     )
     spec = WorldSpec("fluid", (fluid,), environments=EnvironmentSpec(1))
-    with pytest.raises(CapabilityNegotiationError):
-        session.build(spec)
-    with pytest.raises(UnsupportedCapabilityError):
-        IsaacLabWorld.validate_build_spec(spec, backend_id="nvidia.isaaclab")
-
-    native_world = FakeNativeWorld(spec)
-    direct = IsaacLabWorld(session, spec, 1, native_world)
-    handle = direct.resolve(EntityPath("/fluid"))
+    world = session.build(spec)
+    handle = world.resolve(EntityPath("/fluid"))
     with pytest.raises(CommandError):
-        direct.apply_particle_fluid_command("bad")  # type: ignore[arg-type]
+        world.apply_particle_fluid_command("bad")  # type: ignore[arg-type]
     command = ParticleFluidCommand(
         handle,
         PointCommandMode.POSITION,
@@ -470,9 +470,137 @@ def test_particle_fluid_is_explicitly_unsupported(tmp_path: Path) -> None:
         environment_indices=(0,),
         particle_indices=(0,),
     )
+    world.apply_particle_fluid_command(command)
+    assert runtime.worlds[0].calls[-1][0] == "fluid"
+    state = world.read_particle_fluid(handle)
+    assert state.particle_positions_m.shape == (1, 2, 3)
+    assert state.tick == world.tick
     with pytest.raises(UnsupportedCapabilityError):
-        direct.apply_particle_fluid_command(command)
-    with pytest.raises(UnsupportedCapabilityError):
-        direct.read_particle_fluid(handle)
-    direct.close()
+        world.apply_particle_fluid_command(
+            ParticleFluidCommand(
+                handle,
+                PointCommandMode.FORCE,
+                ArrayValue.from_nested((((0.0, 0.0, 0.0),),)),
+                environment_indices=(0,),
+                particle_indices=(0,),
+            )
+        )
+    with pytest.raises(CommandError):
+        world.apply_particle_fluid_command(
+            ParticleFluidCommand(
+                handle,
+                PointCommandMode.POSITION,
+                ArrayValue.from_nested((((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),)),
+                environment_indices=(0,),
+                particle_indices=(0,),
+            )
+        )
+    world.close()
+    session.close()
+
+
+def test_camera_and_debug_endpoints_are_strict_and_backend_neutral() -> None:
+    runtime = FakeNativeRuntime()
+    provider = IsaacLabProvider(
+        IsaacLabAdapterConfig(enable_cameras=True, render=True),
+        runtime_factory=lambda config: runtime,
+        probe_function=available_probe,
+    )
+    session = provider.open()
+    spec = WorldSpec(
+        "camera-debug",
+        (
+            EntitySpec(
+                EntityPath("/camera"),
+                EntityKind.CAMERA_SENSOR,
+                camera=CameraSpec(width_px=4, height_px=3),
+            ),
+            EntitySpec(
+                EntityPath("/fluid"),
+                EntityKind.PARTICLE_FLUID,
+                particle_fluid=ParticleFluidSpec(ArrayValue.from_nested(((0.0, 0.0, 1.0),))),
+            ),
+        ),
+        environments=EnvironmentSpec(2),
+    )
+    world = session.build(spec)
+    camera = world.resolve(EntityPath("/camera"))
+    fluid = world.resolve(EntityPath("/fluid"))
+    before = world.tick
+    sample = world.read_sensor(camera)
+    assert sample.tick == before and world.tick == before
+    assert sample.channel(CameraModality.RGB).shape == (2, 3, 4, 3)
+    assert sample.channel(CameraModality.DEPTH).shape == (2, 3, 4)
+    with pytest.raises(CommandError):
+        world.read_sensor(fluid)
+    with pytest.raises(CommandError):
+        world.read_particle_fluid(camera)
+    with pytest.raises(ValidationError):
+        world.apply_particle_fluid_command(
+            ParticleFluidCommand(
+                camera,
+                PointCommandMode.POSITION,
+                ArrayValue.from_nested((((0.0, 0.0, 0.0),),)),
+            )
+        )
+
+    primitive = DebugPrimitive(
+        "goal",
+        "planning",
+        DebugPrimitiveKind.POINT_SET,
+        ArrayValue.from_nested([[[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]]]),
+        (0, 1),
+    )
+    report = world.publish_debug(DebugBatch((primitive,)))
+    assert (report.accepted_count, report.dropped_count, report.active_count) == (1, 0, 1)
+    assert world.clear_debug(layer="planning", primitive_id="goal") == 1
+    with pytest.raises(ValidationError):
+        world.publish_debug(object())  # type: ignore[arg-type]
+    out_of_range = DebugPrimitive(
+        "bad",
+        "planning",
+        DebugPrimitiveKind.POINT_SET,
+        ArrayValue.from_nested([[[0.0, 0.0, 0.0]]]),
+        (2,),
+    )
+    with pytest.raises(ValidationError):
+        world.publish_debug(DebugBatch((out_of_range,)))
+    with pytest.raises(ValidationError):
+        world.clear_debug(layer="")
+    session.close()
+
+
+def test_camera_modality_order_from_native_is_verified() -> None:
+    class WrongOrderWorld(FakeNativeWorld):
+        def read_sensor(self, path: EntityPath):
+            channels = super().read_sensor(path)
+            return tuple(reversed(channels))
+
+    class WrongOrderRuntime(FakeNativeRuntime):
+        def build_world(self, spec: WorldSpec) -> FakeNativeWorld:
+            world = WrongOrderWorld(spec)
+            self.worlds.append(world)
+            return world
+
+    runtime = WrongOrderRuntime()
+    provider = IsaacLabProvider(
+        IsaacLabAdapterConfig(enable_cameras=True, render=True),
+        runtime_factory=lambda config: runtime,
+        probe_function=available_probe,
+    )
+    session = provider.open()
+    world = session.build(
+        WorldSpec(
+            "bad-camera-order",
+            (
+                EntitySpec(
+                    EntityPath("/camera"),
+                    EntityKind.CAMERA_SENSOR,
+                    camera=CameraSpec(width_px=2, height_px=2),
+                ),
+            ),
+        )
+    )
+    with pytest.raises(UniRoboSimError, match="invalid order"):
+        world.read_sensor(world.resolve(EntityPath("/camera")))
     session.close()

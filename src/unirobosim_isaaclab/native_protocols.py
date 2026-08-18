@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from unirobosim import CommandMode, EntityPath, WorldSpec
+from unirobosim import CameraModality, CommandMode, DebugBatch, EntityPath, PointCommandMode, WorldSpec
 
 Matrix = tuple[tuple[float, ...], ...]
 Vector3 = tuple[float, float, float]
 PointBatch = tuple[tuple[Vector3, ...], ...]
+NativeSensorChannel = tuple[CameraModality, tuple[int, ...], tuple[float | int, ...]]
+NativeSensorSample = tuple[NativeSensorChannel, ...]
+NativeDebugReport = tuple[int, int, int]
 
 
 class NativeWorldDriver(Protocol):
@@ -46,6 +49,23 @@ class NativeWorldDriver(Protocol):
     ) -> None: ...
 
     def read_deformable(self, path: EntityPath) -> tuple[PointBatch, PointBatch]: ...
+
+    def apply_particle_fluid(
+        self,
+        path: EntityPath,
+        mode: PointCommandMode,
+        targets: PointBatch,
+        environment_indices: tuple[int, ...],
+        particle_indices: tuple[int, ...],
+    ) -> None: ...
+
+    def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]: ...
+
+    def read_sensor(self, path: EntityPath) -> NativeSensorSample: ...
+
+    def publish_debug(self, batch: DebugBatch) -> NativeDebugReport: ...
+
+    def clear_debug(self, layer: str | None, primitive_id: str | None) -> int: ...
 
     def step(self, count: int) -> None: ...
 

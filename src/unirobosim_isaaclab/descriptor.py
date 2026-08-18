@@ -1,4 +1,4 @@
-"""Static backend identity and capabilities."""
+"""Backend identity and launch-profile-aware capabilities."""
 
 from unirobosim import (
     CapabilityDeclaration,
@@ -42,11 +42,15 @@ CAPABILITIES = CapabilitySet(
         CapabilityDeclaration(
             CapabilityId("contact.binary@1"),
             FrozenMap({"source": "net-normal-force-threshold"}),
+            limitations=("unavailable for USD-bridged rigid bodies in particle-fluid worlds",),
         ),
         CapabilityDeclaration(
             CapabilityId("contact.net_normal_force@1"),
             FrozenMap({"aggregation": "all-partners", "frame": "environment-local-world"}),
-            limitations=("friction, torque, impulses, contact points, and partner attribution are not included",),
+            limitations=(
+                "friction, torque, impulses, contact points, and partner attribution are not included",
+                "unavailable for USD-bridged rigid bodies in particle-fluid worlds",
+            ),
         ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
         CapabilityDeclaration(CapabilityId("control.articulation.position@1")),
@@ -78,14 +82,60 @@ CAPABILITIES = CapabilitySet(
                 "surface position, point velocity, and point force commands are unsupported",
             ),
         ),
+        CapabilityDeclaration(
+            CapabilityId("state.fluid.particles@1"),
+            FrozenMap(
+                {
+                    "physics": "physx-pbd",
+                    "representation": "particles",
+                    "point_count": "fixed",
+                    "state_layout": "batch-point-xyz",
+                }
+            ),
+            limitations=(
+                "dynamic particle count and surface reconstruction are unsupported",
+                "particle-fluid worlds cannot contain tensor-backed articulations or deformables in this profile",
+            ),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("control.fluid.particles@1"),
+            FrozenMap({"frame": "environment-local-world", "modes": ["position", "velocity"]}),
+            limitations=("commands synchronize through native USD particle state; force mode is unsupported",),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("debug.sink.native_overlay@1"),
+            FrozenMap(
+                {
+                    "frame": "environment-local-world",
+                    "primitives": ["point_set", "line_list"],
+                    "stable_ids": True,
+                }
+            ),
+        ),
     )
+)
+
+CAMERA_CAPABILITIES = (
+    CapabilityDeclaration(
+        CapabilityId("sensor.camera@1"),
+        FrozenMap({"schedule": "synchronous", "pose_frame": "environment-local-world"}),
+        limitations=("link attachment and asynchronous schedules are unsupported",),
+    ),
+    CapabilityDeclaration(
+        CapabilityId("sensor.camera.rgb@1"),
+        FrozenMap({"dtype": "uint8", "layout": "environment-height-width-rgb", "renderer": "isaac-rtx"}),
+    ),
+    CapabilityDeclaration(
+        CapabilityId("sensor.camera.depth@1"),
+        FrozenMap({"dtype": "float32", "unit": "metre", "no_hit": 0.0, "metric": "distance-to-camera"}),
+    ),
 )
 
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.2.0a0",
-    contract_version="v0alpha3",
+    version="0.3.0a0",
+    contract_version="v0alpha4",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(
         {
@@ -97,3 +147,19 @@ DESCRIPTOR = ProviderDescriptor(
         }
     ),
 )
+
+
+def descriptor_for_config(config: object) -> ProviderDescriptor:
+    """Expose camera capabilities only for a launch profile that can render them."""
+
+    if bool(getattr(config, "enable_cameras", False)) and bool(getattr(config, "render", False)):
+        capabilities = CapabilitySet((*CAPABILITIES, *CAMERA_CAPABILITIES))
+        return ProviderDescriptor(
+            provider_id=DESCRIPTOR.provider_id,
+            display_name=DESCRIPTOR.display_name,
+            version=DESCRIPTOR.version,
+            contract_version=DESCRIPTOR.contract_version,
+            capabilities=capabilities,
+            metadata=DESCRIPTOR.metadata,
+        )
+    return DESCRIPTOR
