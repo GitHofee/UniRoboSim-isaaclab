@@ -104,6 +104,29 @@ class FakeNativeWorld:
         count = self.spec.environments.count
         return tuple((0.2, -0.1) for _ in range(count)), tuple((0.0, 0.0) for _ in range(count))
 
+    def apply_rigid_body_wrench(
+        self,
+        path: EntityPath,
+        forces_n: Matrix,
+        torques_n_m: Matrix,
+        environment_indices: tuple[int, ...],
+    ) -> None:
+        self.calls.append(("rigid_wrench", (path, forces_n, torques_n_m, environment_indices)))
+
+    def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]:
+        self.calls.append(("read_rigid_body", path))
+        count = self.spec.environments.count
+        return (
+            tuple((0.0, 0.0, 1.0) for _ in range(count)),
+            tuple((0.0, 0.0, 0.0, 1.0) for _ in range(count)),
+            tuple((0.0, 0.0, 0.0) for _ in range(count)),
+            tuple((0.0, 0.0, 0.0) for _ in range(count)),
+        )
+
+    def read_contact(self, path: EntityPath) -> Matrix:
+        self.calls.append(("read_contact", path))
+        return tuple((0.0, 0.0, 9.81) for _ in range(self.spec.environments.count))
+
     def apply_deformable_position(
         self,
         path: EntityPath,

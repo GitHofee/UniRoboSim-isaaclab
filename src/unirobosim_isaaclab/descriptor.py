@@ -25,6 +25,29 @@ CAPABILITIES = CapabilitySet(
             CapabilityId("world.multi-environment@1"),
             FrozenMap({"isolation": "physx-environment-origins"}),
         ),
+        CapabilityDeclaration(
+            CapabilityId("state.rigid_body@1"),
+            FrozenMap({"frame": "environment-local-world", "pose_origin": "root-link"}),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("control.rigid_body.wrench@1"),
+            FrozenMap(
+                {
+                    "application_point": "center-of-mass",
+                    "frame": "environment-local-world",
+                    "persistence": "until-overwrite-or-reset",
+                }
+            ),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("contact.binary@1"),
+            FrozenMap({"source": "net-normal-force-threshold"}),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("contact.net_normal_force@1"),
+            FrozenMap({"aggregation": "all-partners", "frame": "environment-local-world"}),
+            limitations=("friction, torque, impulses, contact points, and partner attribution are not included",),
+        ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
         CapabilityDeclaration(CapabilityId("control.articulation.position@1")),
         CapabilityDeclaration(CapabilityId("control.articulation.velocity@1")),
@@ -61,8 +84,8 @@ CAPABILITIES = CapabilitySet(
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.1.0a0",
-    contract_version="v0alpha2",
+    version="0.2.0a0",
+    contract_version="v0alpha3",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(
         {

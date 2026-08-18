@@ -23,6 +23,7 @@ from unirobosim import (
     ParticleFluidSpec,
     PointCommandMode,
     ProviderSelectionError,
+    RigidBodyCommand,
     SessionState,
     StaleHandleError,
     UniRoboSimError,
@@ -317,6 +318,65 @@ def test_articulation_validation(tmp_path: Path) -> None:
         )
     with pytest.raises(CommandError):
         world.read_articulation(cloth)
+    world.close()
+    session.close()
+
+
+def test_rigid_body_state_wrench_and_contact(tmp_path: Path) -> None:
+    runtime = FakeNativeRuntime()
+    _, session = open_test_session(runtime)
+    world = session.build(make_world(make_articulation_asset(tmp_path / "arm.usd")))
+    handle = world.resolve(EntityPath("/props/marker"))
+
+    initial = world.read_rigid_body(handle)
+    assert initial.positions_m.shape == (2, 3)
+    assert initial.orientations_xyzw.rows() == ((0.0, 0.0, 0.0, 1.0),) * 2
+    assert initial.tick == world.tick
+
+    world.apply_rigid_body_command(
+        RigidBodyCommand(
+            handle,
+            ArrayValue.from_nested(((2.0, 0.0, 0.0),)),
+            ArrayValue.from_nested(((0.0, 0.0, 0.5),)),
+            environment_indices=(1,),
+        )
+    )
+    name, payload = runtime.worlds[0].calls[-1]
+    assert name == "rigid_wrench"
+    assert payload[1:] == (((2.0, 0.0, 0.0),), ((0.0, 0.0, 0.5),), (1,))
+
+    contact = world.read_contact(handle)
+    assert contact.net_normal_forces_n.shape == (2, 3)
+    assert contact.in_contact.values == (True, True)
+    assert world.read_contact(handle, force_threshold_n=10.0).in_contact.values == (False, False)
+
+    world.close()
+    session.close()
+
+
+def test_rigid_body_validation(tmp_path: Path) -> None:
+    _, session = open_test_session(FakeNativeRuntime())
+    world = session.build(make_world(make_articulation_asset(tmp_path / "arm.usd")))
+    rigid = world.resolve(EntityPath("/props/marker"))
+    arm = world.resolve(EntityPath("/robots/arm"))
+    with pytest.raises(CommandError):
+        world.apply_rigid_body_command("bad")  # type: ignore[arg-type]
+    with pytest.raises(CommandError):
+        world.apply_rigid_body_command(
+            RigidBodyCommand(
+                rigid,
+                ArrayValue.from_nested(((1.0, 0.0, 0.0), (1.0, 0.0, 0.0))),
+                ArrayValue.from_nested(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))),
+                environment_indices=(0,),
+            )
+        )
+    with pytest.raises(CommandError):
+        world.read_rigid_body(arm)
+    with pytest.raises(CommandError):
+        world.read_contact(arm)
+    for threshold in (-1.0, float("inf"), True, "bad"):
+        with pytest.raises(ValidationError):
+            world.read_contact(rigid, threshold)  # type: ignore[arg-type]
     world.close()
     session.close()
 

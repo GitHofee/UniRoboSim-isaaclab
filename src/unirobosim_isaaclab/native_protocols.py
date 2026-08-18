@@ -25,6 +25,18 @@ class NativeWorldDriver(Protocol):
 
     def read_articulation(self, path: EntityPath) -> tuple[Matrix, Matrix]: ...
 
+    def apply_rigid_body_wrench(
+        self,
+        path: EntityPath,
+        forces_n: Matrix,
+        torques_n_m: Matrix,
+        environment_indices: tuple[int, ...],
+    ) -> None: ...
+
+    def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]: ...
+
+    def read_contact(self, path: EntityPath) -> Matrix: ...
+
     def apply_deformable_position(
         self,
         path: EntityPath,

@@ -86,8 +86,14 @@ class IsaacLabNativeRuntime:
             Articulation,
             DeformableObject,
             DeformableObjectCfg,
+            RigidObject,
         )
         from isaaclab.assets.articulation import ArticulationCfg  # type: ignore[import-not-found]
+        from isaaclab.assets.rigid_object import RigidObjectCfg  # type: ignore[import-not-found]
+        from isaaclab.sensors.contact_sensor import (  # type: ignore[import-not-found]
+            ContactSensor,
+            ContactSensorCfg,
+        )
         from isaaclab.sim.schemas import define_deformable_body_properties  # type: ignore[import-not-found]
         from isaaclab_physx.physics import PhysxCfg  # type: ignore[import-not-found]
         from isaaclab_physx.sim.schemas import (  # type: ignore[import-not-found]
@@ -100,6 +106,10 @@ class IsaacLabNativeRuntime:
             ArticulationCfg=ArticulationCfg,
             DeformableObject=DeformableObject,
             DeformableObjectCfg=DeformableObjectCfg,
+            RigidObject=RigidObject,
+            RigidObjectCfg=RigidObjectCfg,
+            ContactSensor=ContactSensor,
+            ContactSensorCfg=ContactSensorCfg,
             ImplicitActuatorCfg=ImplicitActuatorCfg,
             PhysxCfg=PhysxCfg,
             PhysxDeformableBodyPropertiesCfg=PhysxDeformableBodyPropertiesCfg,
@@ -163,9 +173,12 @@ class IsaacLabNativeWorld:
         self._closed = False
         self._sim: Any | None = None
         self._articulations: dict[EntityPath, Any] = {}
+        self._rigids: dict[EntityPath, Any] = {}
+        self._contacts: dict[EntityPath, Any] = {}
         self._deformables: dict[EntityPath, Any] = {}
         self._joint_maps: dict[EntityPath, tuple[int, ...]] = {}
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
+        self._initial_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._initial_deformable: dict[EntityPath, tuple[Any, Any | None]] = {}
         self._origins_cpu = _environment_origins(spec.environments.count, config.environment_spacing_m)
         self._origins: Any | None = None
@@ -201,6 +214,7 @@ class IsaacLabNativeWorld:
         self._sim.reset()
         self._origins = self._m.torch.tensor(self._origins_cpu, device=self._sim.device, dtype=self._m.torch.float32)
         self._initialize_articulations()
+        self._initialize_rigids()
         self._initialize_deformables()
         self.reset(tuple(range(self._spec.environments.count)))
 
@@ -227,15 +241,22 @@ class IsaacLabNativeWorld:
 
     def _author_rigid(self, entity: EntitySpec) -> None:
         assert entity.asset_uri is not None
-        for index in range(self._spec.environments.count):
-            root = f"/World/env_{index}/{_native_name(entity.path)}"
-            self._m.sim_utils.create_prim(
-                root,
-                "Xform",
-                translation=entity.pose.position,
-                orientation=entity.pose.orientation_xyzw,
+        name = _native_name(entity.path)
+        cfg = self._m.RigidObjectCfg(
+            prim_path=f"/World/env_.*/{name}",
+            spawn=self._m.sim_utils.UsdFileCfg(
                 usd_path=str(entity.asset_uri).removeprefix("file://"),
-            )
+                activate_contact_sensors=True,
+            ),
+            init_state=self._m.RigidObjectCfg.InitialStateCfg(
+                pos=entity.pose.position,
+                rot=entity.pose.orientation_xyzw,
+            ),
+        )
+        self._rigids[entity.path] = self._m.RigidObject(cfg)
+        body_suffix: str | None = None
+        for index in range(self._spec.environments.count):
+            root = f"/World/env_{index}/{name}"
             rigid_prims = self._m.sim_utils.get_all_matching_child_prims(
                 root,
                 lambda prim: prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI),
@@ -244,6 +265,26 @@ class IsaacLabNativeWorld:
                 raise ValueError(
                     f"rigid asset must contain exactly one UsdPhysics.RigidBodyAPI prim; found {len(rigid_prims)}"
                 )
+            rigid_prim = rigid_prims[0]
+            if "PhysxContactReportAPI" not in rigid_prim.GetAppliedSchemas():
+                rigid_prim.AddAppliedSchema("PhysxContactReportAPI")
+            suffix = rigid_prim.GetPath().pathString.removeprefix(root)
+            if body_suffix is None:
+                body_suffix = suffix
+            elif suffix != body_suffix:
+                raise ValueError("rigid body prim must have the same relative path in every environment")
+        assert body_suffix is not None
+        contact_cfg = self._m.ContactSensorCfg(
+            prim_path=f"/World/env_.*/{name}{body_suffix}",
+            update_period=0.0,
+            track_pose=False,
+            track_air_time=False,
+            track_contact_points=False,
+            track_friction_forces=False,
+            history_length=0,
+            debug_vis=False,
+        )
+        self._contacts[entity.path] = self._m.ContactSensor(contact_cfg)
 
     def _author_deformable(self, entity: EntitySpec) -> None:
         assert entity.deformable is not None
@@ -318,6 +359,15 @@ class IsaacLabNativeWorld:
             velocities = torch.zeros_like(positions)
             self._initial_articulation[path] = (root_pose, positions, velocities)
 
+    def _initialize_rigids(self) -> None:
+        assert self._sim is not None
+        for path, asset in self._rigids.items():
+            root_pose = asset.data.default_root_pose.torch.clone()
+            assert self._origins is not None
+            root_pose[:, :3] += self._origins
+            root_velocity = asset.data.default_root_vel.torch.clone()
+            self._initial_rigid[path] = (root_pose, root_velocity)
+
     def _initialize_deformables(self) -> None:
         torch = self._m.torch
         assert self._sim is not None
@@ -355,6 +405,12 @@ class IsaacLabNativeWorld:
             asset.set_joint_velocity_target_index(target=velocities[env_ids], env_ids=env_ids)
             asset.set_joint_effort_target_index(target=self._m.torch.zeros_like(positions[env_ids]), env_ids=env_ids)
             asset.reset(env_ids=env_ids)
+        for path, asset in self._rigids.items():
+            root_pose, root_velocity = self._initial_rigid[path]
+            asset.reset(env_ids=env_ids)
+            asset.write_root_pose_to_sim_index(root_pose=root_pose[env_ids], env_ids=env_ids)
+            asset.write_root_link_velocity_to_sim_index(root_velocity=root_velocity[env_ids], env_ids=env_ids)
+            self._contacts[path].reset(env_ids=env_ids)
         for path, asset in self._deformables.items():
             state, target = self._initial_deformable[path]
             asset.write_nodal_state_to_sim_index(state[env_ids], env_ids=env_ids)
@@ -412,6 +468,47 @@ class IsaacLabNativeWorld:
             tuple(tuple(float(value) for value in row) for row in velocities),
         )
 
+    def apply_rigid_body_wrench(
+        self,
+        path: EntityPath,
+        forces_n: Matrix,
+        torques_n_m: Matrix,
+        environment_indices: tuple[int, ...],
+    ) -> None:
+        asset = self._rigids[path]
+        assert self._sim is not None
+        env_ids = self._m.torch.tensor(environment_indices, device=self._sim.device, dtype=self._m.torch.int64)
+        forces = self._m.torch.tensor(forces_n, device=self._sim.device, dtype=self._m.torch.float32).unsqueeze(1)
+        torques = self._m.torch.tensor(torques_n_m, device=self._sim.device, dtype=self._m.torch.float32).unsqueeze(1)
+        asset.permanent_wrench_composer.set_forces_and_torques_index(
+            forces=forces,
+            torques=torques,
+            env_ids=env_ids,
+            is_global=True,
+        )
+
+    def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]:
+        asset = self._rigids[path]
+        assert self._origins is not None
+        pose = asset.data.root_link_pose_w.torch.clone()
+        pose[:, :3] -= self._origins
+        velocity = asset.data.root_link_vel_w.torch
+        positions = pose[:, :3].detach().cpu().tolist()
+        orientations = pose[:, 3:].detach().cpu().tolist()
+        linear_velocities = velocity[:, :3].detach().cpu().tolist()
+        angular_velocities = velocity[:, 3:].detach().cpu().tolist()
+        return tuple(
+            tuple(tuple(float(value) for value in row) for row in values)
+            for values in (positions, orientations, linear_velocities, angular_velocities)
+        )  # type: ignore[return-value]
+
+    def read_contact(self, path: EntityPath) -> Matrix:
+        net_forces = self._contacts[path].data.net_forces_w
+        if net_forces is None:
+            raise RuntimeError(f"contact sensor for {path.value} did not expose net force data")
+        values = net_forces.torch[:, 0, :].detach().cpu().tolist()
+        return tuple(tuple(float(value) for value in row) for row in values)
+
     def apply_deformable_position(
         self,
         path: EntityPath,
@@ -452,6 +549,8 @@ class IsaacLabNativeWorld:
             for _ in range(self._spec.physics.substeps):
                 for asset in self._articulations.values():
                     asset.write_data_to_sim()
+                for asset in self._rigids.values():
+                    asset.write_data_to_sim()
                 for asset in self._deformables.values():
                     asset.write_data_to_sim()
                 self._sim.step(render=self._config.render)
@@ -460,6 +559,10 @@ class IsaacLabNativeWorld:
     def _update_assets(self, dt: float) -> None:
         for asset in self._articulations.values():
             asset.update(dt)
+        for asset in self._rigids.values():
+            asset.update(dt)
+        for sensor in self._contacts.values():
+            sensor.update(dt)
         for asset in self._deformables.values():
             asset.update(dt)
 
@@ -470,8 +573,11 @@ class IsaacLabNativeWorld:
         sim = self._sim
         self._sim = None
         self._articulations.clear()
+        self._rigids.clear()
+        self._contacts.clear()
         self._deformables.clear()
         self._initial_articulation.clear()
+        self._initial_rigid.clear()
         self._initial_deformable.clear()
         try:
             if sim is not None:

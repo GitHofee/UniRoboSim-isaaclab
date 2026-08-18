@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from types import TracebackType
@@ -16,6 +17,7 @@ from unirobosim import (
     BuildFingerprint,
     BuildReport,
     CommandError,
+    ContactState,
     DeformableCommand,
     DeformableState,
     EntityHandle,
@@ -28,6 +30,8 @@ from unirobosim import (
     ParticleFluidState,
     PointCommandMode,
     ResetResult,
+    RigidBodyCommand,
+    RigidBodyState,
     StaleHandleError,
     Tick,
     UniRoboSimError,
@@ -315,6 +319,84 @@ class IsaacLabWorld:
             operation, lambda: self._native.read_articulation(entity.path), entity_path=entity.path.value
         )
         return ArticulationState(ArrayValue.from_rows(position), ArrayValue.from_rows(velocity), self.tick)
+
+    def apply_rigid_body_command(self, command: RigidBodyCommand) -> None:
+        operation = "world.apply_rigid_body_command"
+        self._ensure_ready(operation)
+        if not isinstance(command, RigidBodyCommand):
+            raise CommandError("operation requires a RigidBodyCommand", operation=operation)
+        entity = self._validate_handle(command.handle, operation)
+        if entity.kind is not EntityKind.RIGID_BODY:
+            raise CommandError("entity is not a rigid body", operation=operation, entity_path=entity.path.value)
+        environments = self._indices(
+            command.environment_indices, self._spec.environments.count, "environment_indices", operation=operation
+        )
+        expected = (len(environments), 3)
+        if command.forces_n.shape != expected or command.torques_n_m.shape != expected:
+            raise CommandError(
+                "force and torque shapes must exactly match selected environments and xyz",
+                operation=operation,
+                backend_id=self._session.descriptor.provider_id,
+                world_id=self.world_id,
+                entity_path=entity.path.value,
+                details={
+                    "expected_shape": list(expected),
+                    "force_shape": list(command.forces_n.shape),
+                    "torque_shape": list(command.torques_n_m.shape),
+                },
+            )
+        forces = tuple(tuple(float(value) for value in row) for row in command.forces_n.rows())
+        torques = tuple(tuple(float(value) for value in row) for row in command.torques_n_m.rows())
+        self._native_call(
+            operation,
+            lambda: self._native.apply_rigid_body_wrench(entity.path, forces, torques, environments),
+            entity_path=entity.path.value,
+        )
+
+    def read_rigid_body(self, handle: EntityHandle) -> RigidBodyState:
+        operation = "world.read_rigid_body"
+        self._ensure_ready(operation)
+        entity = self._validate_handle(handle, operation)
+        if entity.kind is not EntityKind.RIGID_BODY:
+            raise CommandError("entity is not a rigid body", operation=operation, entity_path=entity.path.value)
+        positions, orientations, linear_velocities, angular_velocities = self._native_call(
+            operation,
+            lambda: self._native.read_rigid_body(entity.path),
+            entity_path=entity.path.value,
+        )
+        return RigidBodyState(
+            positions_m=ArrayValue.from_rows(positions),
+            orientations_xyzw=ArrayValue.from_rows(orientations),
+            linear_velocities_m_s=ArrayValue.from_rows(linear_velocities),
+            angular_velocities_rad_s=ArrayValue.from_rows(angular_velocities),
+            tick=self.tick,
+        )
+
+    def read_contact(self, handle: EntityHandle, force_threshold_n: float = 1.0e-6) -> ContactState:
+        operation = "world.read_contact"
+        self._ensure_ready(operation)
+        entity = self._validate_handle(handle, operation)
+        if entity.kind is not EntityKind.RIGID_BODY:
+            raise CommandError("entity is not a rigid body", operation=operation, entity_path=entity.path.value)
+        if (
+            isinstance(force_threshold_n, bool)
+            or not isinstance(force_threshold_n, (int, float))
+            or not math.isfinite(float(force_threshold_n))
+            or force_threshold_n < 0.0
+        ):
+            raise ValidationError("force_threshold_n must be a finite non-negative number", operation=operation)
+        forces = self._native_call(
+            operation,
+            lambda: self._native.read_contact(entity.path),
+            entity_path=entity.path.value,
+        )
+        threshold_squared = float(force_threshold_n) ** 2
+        in_contact = tuple(sum(float(value) ** 2 for value in row) > threshold_squared for row in forces)
+        return ContactState(
+            net_normal_forces_n=ArrayValue.from_rows(forces),
+            in_contact=ArrayValue((len(in_contact),), in_contact, dtype="bool"),
+            tick=self.tick,
+        )
 
     def apply_deformable_command(self, command: DeformableCommand) -> None:
         operation = "world.apply_deformable_command"

@@ -94,6 +94,18 @@ def _dispatch(
         return active, None, False
     if operation == "read_articulation":
         return active, active.read_articulation(cast(EntityPath, args[0])), False
+    if operation == "apply_rigid_body_wrench":
+        active.apply_rigid_body_wrench(
+            cast(EntityPath, args[0]),
+            cast(Matrix, args[1]),
+            cast(Matrix, args[2]),
+            cast(tuple[int, ...], args[3]),
+        )
+        return active, None, False
+    if operation == "read_rigid_body":
+        return active, active.read_rigid_body(cast(EntityPath, args[0])), False
+    if operation == "read_contact":
+        return active, active.read_contact(cast(EntityPath, args[0])), False
     if operation == "apply_deformable_position":
         active.apply_deformable_position(
             cast(EntityPath, args[0]),
@@ -267,9 +279,7 @@ class IsaacLabWorkerRuntime:
         if self._closed:
             raise NativeWorkerError(f"native worker is closed during {operation}")
         if not self._process.is_alive():
-            raise NativeWorkerError(
-                f"native worker exited before {operation}; exitcode={self._process.exitcode}"
-            )
+            raise NativeWorkerError(f"native worker exited before {operation}; exitcode={self._process.exitcode}")
         try:
             self._connection.send((operation, args))
         except (BrokenPipeError, EOFError, OSError) as exc:
@@ -366,6 +376,33 @@ class IsaacLabWorkerWorld:
     def read_articulation(self, path: EntityPath) -> tuple[Matrix, Matrix]:
         self._ensure_open("read_articulation")
         return cast(tuple[Matrix, Matrix], self._runtime._request("read_articulation", path))
+
+    def apply_rigid_body_wrench(
+        self,
+        path: EntityPath,
+        forces_n: Matrix,
+        torques_n_m: Matrix,
+        environment_indices: tuple[int, ...],
+    ) -> None:
+        self._ensure_open("apply_rigid_body_wrench")
+        self._runtime._request(
+            "apply_rigid_body_wrench",
+            path,
+            forces_n,
+            torques_n_m,
+            environment_indices,
+        )
+
+    def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]:
+        self._ensure_open("read_rigid_body")
+        return cast(
+            tuple[Matrix, Matrix, Matrix, Matrix],
+            self._runtime._request("read_rigid_body", path),
+        )
+
+    def read_contact(self, path: EntityPath) -> Matrix:
+        self._ensure_open("read_contact")
+        return cast(Matrix, self._runtime._request("read_contact", path))
 
     def apply_deformable_position(
         self,

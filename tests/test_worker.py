@@ -113,10 +113,20 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
             (EntityPath("/robots/arm"), CommandMode.POSITION, ((0.1, 0.2),), (0,), (0, 1)),
         ),
     )
-    world, articulation, _ = _dispatch(
-        runtime, world, ("read_articulation", (EntityPath("/robots/arm"),))
-    )
+    world, articulation, _ = _dispatch(runtime, world, ("read_articulation", (EntityPath("/robots/arm"),)))
     assert articulation[0] == ((0.2, -0.1), (0.2, -0.1))
+
+    forces = ((1.0, 0.0, 0.0),)
+    torques = ((0.0, 0.0, 0.5),)
+    world, _, _ = _dispatch(
+        runtime,
+        world,
+        ("apply_rigid_body_wrench", (EntityPath("/props/marker"), forces, torques, (1,))),
+    )
+    world, rigid, _ = _dispatch(runtime, world, ("read_rigid_body", (EntityPath("/props/marker"),)))
+    assert rigid[0] == ((0.0, 0.0, 1.0), (0.0, 0.0, 1.0))
+    world, contact, _ = _dispatch(runtime, world, ("read_contact", (EntityPath("/props/marker"),)))
+    assert contact == ((0.0, 0.0, 9.81), (0.0, 0.0, 9.81))
 
     targets = (((0.0, 0.0, 1.0),),)
     world, _, _ = _dispatch(
@@ -178,6 +188,10 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     velocities = ((0.0, 0.0), (0.0, 0.0))
     points = (((0.0, 0.0, 1.0),), ((0.0, 0.0, 1.0),))
     zeros = (((0.0, 0.0, 0.0),), ((0.0, 0.0, 0.0),))
+    rigid_positions = ((0.0, 0.0, 1.0), (0.0, 0.0, 1.0))
+    orientations = ((0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, 1.0))
+    rigid_zeros = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    contacts = ((0.0, 0.0, 9.81), (0.0, 0.0, 9.81))
     factory, connection, process = fake_worker_factory(
         [
             ("ok", None),
@@ -185,6 +199,9 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
             ("ok", None),
             ("ok", None),
             ("ok", (positions, velocities)),
+            ("ok", None),
+            ("ok", (rigid_positions, orientations, rigid_zeros, rigid_zeros)),
+            ("ok", contacts),
             ("ok", None),
             ("ok", (points, zeros)),
             ("ok", None),
@@ -201,6 +218,19 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     world.reset((0, 1))
     world.apply_articulation(EntityPath("/robots/arm"), CommandMode.POSITION, ((0.1,),), (0,), (0,))
     assert world.read_articulation(EntityPath("/robots/arm")) == (positions, velocities)
+    world.apply_rigid_body_wrench(
+        EntityPath("/props/marker"),
+        ((1.0, 0.0, 0.0),),
+        ((0.0, 0.0, 0.5),),
+        (1,),
+    )
+    assert world.read_rigid_body(EntityPath("/props/marker")) == (
+        rigid_positions,
+        orientations,
+        rigid_zeros,
+        rigid_zeros,
+    )
+    assert world.read_contact(EntityPath("/props/marker")) == contacts
     world.apply_deformable_position(EntityPath("/soft/jelly"), (((0.0, 0.0, 1.0),),), (0,), (0,))
     assert world.read_deformable(EntityPath("/soft/jelly")) == (points, zeros)
     world.step(2)
@@ -221,6 +251,9 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         "reset",
         "apply_articulation",
         "read_articulation",
+        "apply_rigid_body_wrench",
+        "read_rigid_body",
+        "read_contact",
         "apply_deformable_position",
         "read_deformable",
         "step",

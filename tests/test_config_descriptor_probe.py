@@ -30,8 +30,12 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.1.0a0"
+    assert unirobosim_isaaclab.__version__ == "0.2.0a0"
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
+    assert DESCRIPTOR.contract_version == "v0alpha3"
+    assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("control.rigid_body.wrench@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None
     assert CAPABILITIES.get(CapabilityId("state.fluid.particles@1")) is None
     control = CAPABILITIES.get(CapabilityId("control.deformable.points@1"))
     assert control is not None
@@ -102,9 +106,7 @@ def test_probe_cpu_success_and_version_failures() -> None:
     assert "torch==2.10.0" in (report.reason or "")
 
     versions.update({"isaacsim": "6.0.1.0", "isaaclab_physx": "1.1.3", "torch": "2.10.0+cu128"})
-    assert probe_environment(
-        IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get
-    ).available
+    assert probe_environment(IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get).available
 
 
 def test_probe_rejects_other_python(monkeypatch: pytest.MonkeyPatch) -> None:

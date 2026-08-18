@@ -14,6 +14,8 @@ from typing import Any
 from unirobosim import (
     ArrayValue,
     ArticulationCommand,
+    CapabilityId,
+    CapabilityRequirement,
     CommandMode,
     DeformableBodySpec,
     DeformableCommand,
@@ -25,6 +27,7 @@ from unirobosim import (
     PhysicsSpec,
     PointCommandMode,
     Pose,
+    RigidBodyCommand,
     WorldBuildError,
     WorldSpec,
 )
@@ -39,32 +42,32 @@ def _versions() -> dict[str, str]:
     }
 
 
-def _create_articulation_usd(path: Path) -> None:
+def _create_articulated_appliance_usd(path: Path) -> None:
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics  # type: ignore[import-not-found]
 
     stage = Usd.Stage.CreateNew(str(path))
-    root = UsdGeom.Xform.Define(stage, "/Robot")
+    root = UsdGeom.Xform.Define(stage, "/Appliance")
     UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
 
-    base = UsdGeom.Cube.Define(stage, "/Robot/base")
+    base = UsdGeom.Cube.Define(stage, "/Appliance/base")
     base.CreateSizeAttr(0.2)
     UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
     UsdPhysics.CollisionAPI.Apply(base.GetPrim())
     UsdPhysics.MassAPI.Apply(base.GetPrim()).CreateMassAttr(1.0)
 
-    link = UsdGeom.Cube.Define(stage, "/Robot/link")
-    link.CreateSizeAttr(0.2)
-    link.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.4))
-    UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
-    UsdPhysics.CollisionAPI.Apply(link.GetPrim())
-    UsdPhysics.MassAPI.Apply(link.GetPrim()).CreateMassAttr(1.0)
+    door = UsdGeom.Cube.Define(stage, "/Appliance/door")
+    door.CreateSizeAttr(0.2)
+    door.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.4))
+    UsdPhysics.RigidBodyAPI.Apply(door.GetPrim())
+    UsdPhysics.CollisionAPI.Apply(door.GetPrim())
+    UsdPhysics.MassAPI.Apply(door.GetPrim()).CreateMassAttr(1.0)
 
-    fixed = UsdPhysics.FixedJoint.Define(stage, "/Robot/fixed_base")
-    fixed.CreateBody1Rel().SetTargets([Sdf.Path("/Robot/base")])
+    fixed = UsdPhysics.FixedJoint.Define(stage, "/Appliance/fixed_base")
+    fixed.CreateBody1Rel().SetTargets([Sdf.Path("/Appliance/base")])
 
-    joint = UsdPhysics.RevoluteJoint.Define(stage, "/Robot/joint")
-    joint.CreateBody0Rel().SetTargets([Sdf.Path("/Robot/base")])
-    joint.CreateBody1Rel().SetTargets([Sdf.Path("/Robot/link")])
+    joint = UsdPhysics.RevoluteJoint.Define(stage, "/Appliance/joint")
+    joint.CreateBody0Rel().SetTargets([Sdf.Path("/Appliance/base")])
+    joint.CreateBody1Rel().SetTargets([Sdf.Path("/Appliance/door")])
     joint.CreateAxisAttr("Y")
     joint.CreateLowerLimitAttr(-90.0)
     joint.CreateUpperLimitAttr(90.0)
@@ -79,34 +82,51 @@ def _create_articulation_usd(path: Path) -> None:
     stage.GetRootLayer().Save()
 
 
-def _create_rigid_usd(path: Path) -> None:
-    from pxr import Usd, UsdGeom, UsdPhysics  # type: ignore[import-not-found]
+def _create_rigid_contact_usd(path: Path, *, initial_height_m: float) -> None:
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
     stage = Usd.Stage.CreateNew(str(path))
-    rigid = UsdGeom.Cube.Define(stage, "/Rigid")
+    root = UsdGeom.Xform.Define(stage, "/Asset")
+    rigid = UsdGeom.Cube.Define(stage, "/Asset/Rigid")
     rigid.CreateSizeAttr(0.2)
     UsdPhysics.RigidBodyAPI.Apply(rigid.GetPrim())
-    UsdPhysics.CollisionAPI.Apply(rigid.GetPrim())
+    UsdPhysics.CollisionAPI.Apply(rigid.GetPrim()).CreateCollisionEnabledAttr(True)
     UsdPhysics.MassAPI.Apply(rigid.GetPrim()).CreateMassAttr(1.0)
-    stage.SetDefaultPrim(rigid.GetPrim())
+    support = UsdGeom.Cube.Define(stage, "/Asset/Support")
+    support.CreateSizeAttr(1.0)
+    support.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -initial_height_m))
+    UsdPhysics.CollisionAPI.Apply(support.GetPrim()).CreateCollisionEnabledAttr(True)
+    stage.SetDefaultPrim(root.GetPrim())
     stage.GetRootLayer().Save()
 
 
-def _rigid_world(asset: Path, world_id: str = "native-rigid") -> WorldSpec:
-    return WorldSpec(
-        world_id,
-        (EntitySpec(EntityPath("/props/origin"), EntityKind.RIGID_BODY, asset_uri=str(asset)),),
-        environments=EnvironmentSpec(2),
-        physics=PhysicsSpec(time_step_seconds=1.0 / 120.0, substeps=2),
-    )
-
-
-def _articulation_world(asset: Path, joint_name: str, world_id: str) -> WorldSpec:
+def _rigid_world(dynamic_asset: Path, world_id: str = "native-rigid") -> WorldSpec:
     return WorldSpec(
         world_id,
         (
             EntitySpec(
-                EntityPath("/robots/test_arm"),
+                EntityPath("/props/cube"),
+                EntityKind.RIGID_BODY,
+                pose=Pose(position=(0.0, 0.0, 0.8)),
+                asset_uri=str(dynamic_asset),
+            ),
+        ),
+        environments=EnvironmentSpec(2),
+        physics=PhysicsSpec(time_step_seconds=1.0 / 120.0, substeps=2),
+        requirements=(
+            CapabilityRequirement(CapabilityId("control.rigid_body.wrench@1")),
+            CapabilityRequirement(CapabilityId("contact.binary@1")),
+            CapabilityRequirement(CapabilityId("contact.net_normal_force@1")),
+        ),
+    )
+
+
+def _articulated_object_world(asset: Path, joint_name: str, world_id: str) -> WorldSpec:
+    return WorldSpec(
+        world_id,
+        (
+            EntitySpec(
+                EntityPath("/articulated/microwave"),
                 EntityKind.ARTICULATION,
                 pose=Pose(position=(0.0, 0.0, 0.5)),
                 joint_names=(joint_name,),
@@ -126,9 +146,7 @@ def _soft_world() -> WorldSpec:
         pose=Pose(position=(0.0, 0.0, 1.5)),
         deformable=DeformableBodySpec(
             DeformableTopology.SURFACE,
-            ArrayValue.from_nested(
-                ((0.0, 0.0, 0.0), (0.3, 0.0, 0.0), (0.3, 0.3, 0.0), (0.0, 0.3, 0.0))
-            ),
+            ArrayValue.from_nested(((0.0, 0.0, 0.0), (0.3, 0.0, 0.0), (0.3, 0.3, 0.0), (0.0, 0.3, 0.0))),
             surface_triangles=ArrayValue.from_nested(((0, 1, 2), (0, 2, 3)), dtype="int64"),
             node_mass_kg=0.01,
             linear_damping_per_s=0.1,
@@ -176,24 +194,92 @@ def run() -> dict[str, Any]:
     session = provider.open()
     try:
         with tempfile.TemporaryDirectory(prefix="unirobosim-isaaclab-") as directory:
-            articulation_usd = Path(directory) / "minimal_articulation.usda"
+            articulation_usd = Path(directory) / "minimal_articulated_appliance.usda"
             rigid_usd = Path(directory) / "minimal_rigid.usda"
-            _create_articulation_usd(articulation_usd)
-            _create_rigid_usd(rigid_usd)
+            _create_articulated_appliance_usd(articulation_usd)
+            _create_rigid_contact_usd(rigid_usd, initial_height_m=0.8)
 
             try:
-                session.build(_articulation_world(articulation_usd, "wrong_joint", "expected-failure"))
+                session.build(_articulated_object_world(articulation_usd, "wrong_joint", "expected-failure"))
             except WorldBuildError as exc:
                 result["checks"].append({"name": "transactional_build_failure", "passed": True, "error_code": exc.code})
             else:
                 raise AssertionError("joint mismatch build unexpectedly succeeded")
 
+            print("[CONFORMANCE] building rigid/contact world", flush=True)
             rigid = session.build(_rigid_world(rigid_usd))
-            assert rigid.resolve(EntityPath("/props/origin")).entity_kind is EntityKind.RIGID_BODY
-            assert rigid.step(3).step_index == 3
-            rigid.close()
-            result["checks"].append({"name": "rigid_lifecycle", "passed": True})
+            cube = rigid.resolve(EntityPath("/props/cube"))
+            assert cube.entity_kind is EntityKind.RIGID_BODY
+            initial = rigid.read_rigid_body(cube)
+            assert initial.positions_m.shape == (2, 3)
+            assert initial.orientations_xyzw.shape == (2, 4)
+            assert _finite(initial.positions_m.values)
+            initial_positions = initial.positions_m.nested()
+            rigid_origin_parity = max(
+                abs(float(initial_positions[0][axis]) - float(initial_positions[1][axis])) for axis in range(3)
+            )
+            assert rigid_origin_parity <= 1.0e-5
 
+            rigid.apply_rigid_body_command(
+                RigidBodyCommand(
+                    cube,
+                    ArrayValue.from_nested(((5.0, 0.0, 0.0),)),
+                    ArrayValue.from_nested(((0.0, 0.0, 1.0),)),
+                    environment_indices=(0,),
+                )
+            )
+            rigid.step(4)
+            first_wrench_state = rigid.read_rigid_body(cube)
+            rigid.step(4)
+            second_wrench_state = rigid.read_rigid_body(cube)
+            first_velocity = first_wrench_state.linear_velocities_m_s.nested()
+            second_velocity = second_wrench_state.linear_velocities_m_s.nested()
+            angular_velocity = second_wrench_state.angular_velocities_rad_s.nested()
+            assert float(first_velocity[0][0]) > float(first_velocity[1][0]) + 0.05
+            assert float(second_velocity[0][0]) > float(first_velocity[0][0]) + 0.05
+            assert abs(float(angular_velocity[0][2])) > abs(float(angular_velocity[1][2])) + 0.05
+            selected_environment_velocity_delta = float(second_velocity[0][0]) - float(second_velocity[1][0])
+
+            rigid.apply_rigid_body_command(
+                RigidBodyCommand(
+                    cube,
+                    ArrayValue.from_nested(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))),
+                    ArrayValue.from_nested(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))),
+                )
+            )
+            rigid.reset((0, 1))
+            rigid.step(80)
+            settled = rigid.read_rigid_body(cube)
+            contact = rigid.read_contact(cube, force_threshold_n=0.1)
+            assert contact.net_normal_forces_n.shape == (2, 3)
+            assert contact.in_contact.values == (True, True), (
+                f"expected contact in both environments; flags={contact.in_contact.values}, "
+                f"forces={contact.net_normal_forces_n.rows()}, positions={settled.positions_m.rows()}"
+            )
+            contact_norms = tuple(
+                math.sqrt(sum(float(component) ** 2 for component in row)) for row in contact.net_normal_forces_n.rows()
+            )
+            assert min(contact_norms) > 0.1
+            settled_positions = settled.positions_m.nested()
+            assert all(0.55 <= float(position[2]) <= 0.7 for position in settled_positions)
+
+            rigid.reset((0,))
+            partially_reset = rigid.read_rigid_body(cube).positions_m.nested()
+            partial_reset_height_delta = float(partially_reset[0][2]) - float(partially_reset[1][2])
+            assert partial_reset_height_delta > 0.1
+            rigid.close()
+            result["rigid_environment_origin_parity_max_abs_m"] = rigid_origin_parity
+            result["rigid_selected_environment_velocity_delta_m_s"] = selected_environment_velocity_delta
+            result["rigid_contact_force_norms_n"] = contact_norms
+            result["rigid_partial_reset_height_delta_m"] = partial_reset_height_delta
+            result["checks"].append(
+                {
+                    "name": "rigid_state_persistent_wrench_contact_and_partial_reset",
+                    "passed": True,
+                }
+            )
+
+            print("[CONFORMANCE] building soft-body world", flush=True)
             soft = session.build(_soft_world())
             cloth = soft.read_deformable(soft.resolve(EntityPath("/soft/cloth")))
             jelly_handle = soft.resolve(EntityPath("/soft/jelly"))
@@ -248,8 +334,11 @@ def run() -> dict[str, Any]:
             soft.close()
             result["checks"].append({"name": "surface_volume_state_and_kinematic_control", "passed": True})
 
-            articulation = session.build(_articulation_world(articulation_usd, "joint", "native-articulation"))
-            handle = articulation.resolve(EntityPath("/robots/test_arm"))
+            print("[CONFORMANCE] building articulated-object world", flush=True)
+            articulation = session.build(
+                _articulated_object_world(articulation_usd, "joint", "native-articulated-appliance")
+            )
+            handle = articulation.resolve(EntityPath("/articulated/microwave"))
             before = articulation.read_articulation(handle)
             assert before.joint_positions.shape == (2, 1)
             for mode, value in (
@@ -266,15 +355,16 @@ def run() -> dict[str, Any]:
                 assert _finite(state.joint_velocities.values)
             articulation.reset((0, 1))
             articulation.close()
-            result["checks"].append({"name": "articulation_state_and_three_control_modes", "passed": True})
+            result["checks"].append({"name": "non_robot_articulation_state_and_three_control_modes", "passed": True})
     finally:
         session.close()
 
     with tempfile.TemporaryDirectory(prefix="unirobosim-isaaclab-reopen-") as directory:
         rigid_usd = Path(directory) / "minimal_rigid.usda"
-        _create_rigid_usd(rigid_usd)
+        _create_rigid_contact_usd(rigid_usd, initial_height_m=0.8)
         reopened_session = provider.open()
         try:
+            print("[CONFORMANCE] verifying provider reopen", flush=True)
             reopened_world = reopened_session.build(_rigid_world(rigid_usd, "native-rigid-reopened"))
             assert reopened_world.step(1).step_index == 1
             reopened_world.close()
