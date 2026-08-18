@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import os
+import signal
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from unirobosim import CommandMode, EntityPath
+
+from unirobosim_isaaclab import worker as worker_module
+from unirobosim_isaaclab.config import IsaacLabAdapterConfig
+from unirobosim_isaaclab.worker import (
+    IsaacLabWorkerRuntime,
+    NativeWorkerError,
+    WorkerFactory,
+    _dispatch,
+    _error_reply,
+    _proc_stat_session,
+    _session_member_pids,
+    _terminate_worker_tree,
+)
+
+from .helpers import FakeNativeRuntime, FakeNativeWorld, make_articulation_asset, make_world
+
+
+class FakeProcess:
+    def __init__(self, *, alive: bool = True, exitcode: int | None = 0, pid: int | None = None) -> None:
+        self.alive = alive
+        self._exitcode = exitcode
+        self._pid = pid
+        self.join_calls: list[float | None] = []
+        self.terminate_calls = 0
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
+
+    @property
+    def exitcode(self) -> int | None:
+        return self._exitcode
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(timeout)
+        self.alive = False
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.alive = False
+
+
+class FakeConnection:
+    def __init__(self, replies: list[object], process: FakeProcess, *, poll_result: bool = True) -> None:
+        self.replies = replies
+        self.process = process
+        self.poll_result = poll_result
+        self.sent: list[object] = []
+        self.closed = False
+        self.send_error: OSError | None = None
+
+    def poll(self, timeout: float) -> bool:
+        del timeout
+        return self.poll_result
+
+    def recv(self) -> object:
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    def send(self, value: object) -> None:
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent.append(value)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def fake_worker_factory(
+    replies: list[object], *, process: FakeProcess | None = None, poll_result: bool = True
+) -> tuple[WorkerFactory, FakeConnection, FakeProcess]:
+    handle = process if process is not None else FakeProcess()
+    connection = FakeConnection(replies, handle, poll_result=poll_result)
+
+    def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
+        del config
+        return connection, handle
+
+    return cast(WorkerFactory, factory), connection, handle
+
+
+def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
+    runtime = FakeNativeRuntime()
+    spec = make_world(make_articulation_asset(tmp_path / "robot.usda"))
+
+    world, result, stop = _dispatch(runtime, None, ("build_world", (spec,)))
+    assert result is None and not stop and world is runtime.worlds[0]
+    assert isinstance(world, FakeNativeWorld)
+
+    world, result, stop = _dispatch(runtime, world, ("reset", ((0, 1),)))
+    assert result is None and not stop
+    assert runtime.worlds[0].calls[-1] == ("reset", (0, 1))
+
+    world, _, _ = _dispatch(
+        runtime,
+        world,
+        (
+            "apply_articulation",
+            (EntityPath("/robots/arm"), CommandMode.POSITION, ((0.1, 0.2),), (0,), (0, 1)),
+        ),
+    )
+    world, articulation, _ = _dispatch(
+        runtime, world, ("read_articulation", (EntityPath("/robots/arm"),))
+    )
+    assert articulation[0] == ((0.2, -0.1), (0.2, -0.1))
+
+    targets = (((0.0, 0.0, 1.0),),)
+    world, _, _ = _dispatch(
+        runtime,
+        world,
+        ("apply_deformable_position", (EntityPath("/soft/jelly"), targets, (0,), (0,))),
+    )
+    world, deformable, _ = _dispatch(runtime, world, ("read_deformable", (EntityPath("/soft/jelly"),)))
+    assert len(deformable[0]) == 2
+
+    world, _, _ = _dispatch(runtime, world, ("step", (3,)))
+    last_call: Any = runtime.worlds[0].calls[-1]
+    assert last_call == ("step", 3)
+    world, _, _ = _dispatch(runtime, world, ("close_world", ()))
+    assert world is None and runtime.worlds[0].closed
+
+    world, _, stop = _dispatch(runtime, world, ("close_runtime", ()))
+    assert world is None and stop
+
+
+def test_dispatch_rejects_invalid_state_and_operation(tmp_path: Path) -> None:
+    runtime = FakeNativeRuntime()
+    with pytest.raises(RuntimeError, match="has no world"):
+        _dispatch(runtime, None, ("step", (1,)))
+    world = runtime.build_world(make_world(make_articulation_asset(tmp_path / "robot.usda")))
+    with pytest.raises(RuntimeError, match="already owns"):
+        _dispatch(runtime, world, ("build_world", (world.spec,)))
+    with pytest.raises(RuntimeError, match="unknown"):
+        _dispatch(runtime, world, ("bad", ()))
+    closed, _, stop = _dispatch(runtime, world, ("close_runtime", ()))
+    assert closed is None and stop and world.closed
+
+
+def test_error_reply_preserves_remote_diagnostics() -> None:
+    try:
+        raise ValueError("bad native state")
+    except ValueError as exc:
+        status, payload = _error_reply(exc)
+    assert status == "error"
+    assert payload["type"] == "ValueError"
+    assert payload["message"] == "bad native state"
+    assert "ValueError: bad native state" in payload["traceback"]
+    assert issubclass(NativeWorkerError, RuntimeError)
+
+
+def test_proc_stat_session_parser_handles_spaces_and_invalid_input() -> None:
+    assert _proc_stat_session("447389 (omni telemetry) S 1 447389 447342 0 -1") == 447342
+    assert _proc_stat_session("invalid") is None
+    assert _proc_stat_session("1 (x) S") is None
+    assert _proc_stat_session("1 (x) S 0 1 nope") is None
+
+
+def test_session_member_scan_finds_current_process() -> None:
+    assert os.getpid() in _session_member_pids(os.getsid(0))
+
+
+def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> None:
+    positions = ((0.2, -0.1), (0.2, -0.1))
+    velocities = ((0.0, 0.0), (0.0, 0.0))
+    points = (((0.0, 0.0, 1.0),), ((0.0, 0.0, 1.0),))
+    zeros = (((0.0, 0.0, 0.0),), ((0.0, 0.0, 0.0),))
+    factory, connection, process = fake_worker_factory(
+        [
+            ("ok", None),
+            ("ok", None),
+            ("ok", None),
+            ("ok", None),
+            ("ok", (positions, velocities)),
+            ("ok", None),
+            ("ok", (points, zeros)),
+            ("ok", None),
+            ("ok", None),
+            ("ok", None),
+        ]
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    spec = make_world(make_articulation_asset(tmp_path / "robot.usda"))
+    world = runtime.build_world(spec)
+    with pytest.raises(NativeWorkerError, match="already owns"):
+        runtime.build_world(spec)
+
+    world.reset((0, 1))
+    world.apply_articulation(EntityPath("/robots/arm"), CommandMode.POSITION, ((0.1,),), (0,), (0,))
+    assert world.read_articulation(EntityPath("/robots/arm")) == (positions, velocities)
+    world.apply_deformable_position(EntityPath("/soft/jelly"), (((0.0, 0.0, 1.0),),), (0,), (0,))
+    assert world.read_deformable(EntityPath("/soft/jelly")) == (points, zeros)
+    world.step(2)
+    world.close()
+    world.close()
+    assert world.closed
+    with pytest.raises(NativeWorkerError, match="closed"):
+        world.step(1)
+
+    runtime.close()
+    runtime.close()
+    assert connection.closed and not process.alive
+    with pytest.raises(NativeWorkerError, match="closed"):
+        runtime._request("step", 1)
+    operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
+    assert operations == [
+        "build_world",
+        "reset",
+        "apply_articulation",
+        "read_articulation",
+        "apply_deformable_position",
+        "read_deformable",
+        "step",
+        "close_world",
+        "close_runtime",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("startup_reply", "message"),
+    [
+        (("error", {"type": "ValueError", "message": "boom", "traceback": "remote trace"}), "ValueError"),
+        (("unexpected", None), "invalid native worker reply"),
+        (EOFError(), "disconnected"),
+    ],
+)
+def test_worker_startup_failures_abort(startup_reply: object, message: str) -> None:
+    factory, connection, process = fake_worker_factory([startup_reply])
+    with pytest.raises(NativeWorkerError, match=message):
+        IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert connection.closed and not process.alive
+
+
+def test_worker_startup_timeout_aborts() -> None:
+    factory, connection, process = fake_worker_factory([], poll_result=False)
+    with pytest.raises(NativeWorkerError, match="timed out"):
+        IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert connection.closed and not process.alive
+
+
+def test_worker_request_transport_failures(tmp_path: Path) -> None:
+    spec = make_world(make_articulation_asset(tmp_path / "robot.usda"))
+
+    dead_process = FakeProcess(alive=False, exitcode=9)
+    factory, _, _ = fake_worker_factory([("ok", None)], process=dead_process)
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    with pytest.raises(NativeWorkerError, match="exited before"):
+        runtime.build_world(spec)
+
+    factory, connection, _ = fake_worker_factory([("ok", None)])
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    connection.send_error = BrokenPipeError("gone")
+    with pytest.raises(NativeWorkerError, match="failed to contact"):
+        runtime.build_world(spec)
+
+
+def test_worker_remote_world_error_and_close_error(tmp_path: Path) -> None:
+    spec = make_world(make_articulation_asset(tmp_path / "robot.usda"))
+    remote_error = ("error", {"type": "RuntimeError", "message": "bad build", "traceback": "trace"})
+    factory, _, _ = fake_worker_factory([("ok", None), remote_error])
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    with pytest.raises(NativeWorkerError, match="bad build"):
+        runtime.build_world(spec)
+
+    factory, _, _ = fake_worker_factory([("ok", None), remote_error])
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    with pytest.raises(NativeWorkerError, match="bad build"):
+        runtime.close()
+
+
+def test_worker_reports_nonzero_exit_after_close() -> None:
+    process = FakeProcess(exitcode=7)
+    factory, _, _ = fake_worker_factory([("ok", None), ("ok", None)], process=process)
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    with pytest.raises(NativeWorkerError, match="status 7"):
+        runtime.close()
+
+
+def test_worker_close_marks_active_world_and_terminates_stubborn_process(tmp_path: Path) -> None:
+    class StubbornProcess(FakeProcess):
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+            if len(self.join_calls) > 1:
+                self.alive = False
+
+    process = StubbornProcess(pid=None)
+    factory, _, _ = fake_worker_factory(
+        [("ok", None), ("ok", None), ("ok", None)],
+        process=process,
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    world = runtime.build_world(make_world(make_articulation_asset(tmp_path / "robot.usda")))
+    runtime.close()
+    assert world.closed
+    assert process.terminate_calls == 1
+    assert len(process.join_calls) == 2
+
+
+def test_worker_tree_cleanup_targets_only_owned_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeProcess(pid=900_001)
+    killed: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(os, "getsid", lambda pid: 100)
+    monkeypatch.setattr(worker_module, "_session_member_pids", lambda session_id: (os.getpid(), 900_002, 900_001))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    _terminate_worker_tree(process)
+
+    assert killed == [(900_002, signal.SIGKILL), (900_001, signal.SIGKILL)]
+    assert process.terminate_calls == 0
+
+
+def test_worker_tree_cleanup_falls_back_to_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeProcess(pid=900_003)
+    killed_groups: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(os, "getsid", lambda pid: 100)
+    monkeypatch.setattr(worker_module, "_session_member_pids", lambda session_id: ())
+    monkeypatch.setattr(os, "getpgrp", lambda: 100)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed_groups.append((pid, sig)))
+
+    _terminate_worker_tree(process)
+
+    assert killed_groups == [(900_003, signal.SIGKILL)]
+
+
+def test_worker_tree_cleanup_without_pid_terminates_live_process() -> None:
+    process = FakeProcess(pid=None)
+    _terminate_worker_tree(process)
+    assert process.terminate_calls == 1
