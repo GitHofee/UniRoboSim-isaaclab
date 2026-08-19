@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0a0
+
+- Declare the provider-owned `isaaclab.dynamic-rigid-usd@1` semantic normalization target for rigid USD.
+- Keep adapter preflight strict while allowing the optional asset normalizer to prepare visual-only USD
+  before native build.
+- Use neutral package authorship and UniRoboSim core `0.7.0a0`.
+
 ## 0.3.0a0
 
 - Add real fixed-count PhysX PBD particle-fluid authoring, position/velocity commands, state readback,

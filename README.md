@@ -28,6 +28,12 @@ position/velocity/effort control, volume-deformable kinematic-node position cont
 particle fluid position/velocity state and commands, RTX RGB/depth cameras, and native USD debug overlays.
 Camera capabilities are advertised only when both `enable_cameras=True` and `render=True` are selected.
 
+The adapter declares the semantic target `isaaclab.dynamic-rigid-usd@1`. With the optional
+`unirobosim-usd-converter` package installed, EasyAPI inspects a visual-only rigid USD and derives a
+physics-ready USD before the adapter build. The derived stage keeps the source USD visual/material
+composition by reference and adds normalized Z-up metre units, mass, inertia, collision and physics
+material. Articulations, skinned meshes and empty stages are rejected by this rigid-only profile.
+
 Isaac Sim 6.0.1 does not expose a public particle tensor view in this profile. A world containing particle
 fluid therefore uses PhysX-to-USD particle readback and a USD rigid-body bridge. Rigid + fluid + camera +
 debug is verified together; contact-force readback for bridged rigid bodies and a same-world combination of

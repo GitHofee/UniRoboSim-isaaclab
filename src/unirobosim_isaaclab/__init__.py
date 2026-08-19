@@ -6,7 +6,7 @@ from .probe import probe_environment
 from .provider import IsaacLabProvider, IsaacLabSession
 from .world import IsaacLabWorld
 
-__version__ = "0.4.0a0"
+__version__ = "0.6.0a0"
 
 
 def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProvider:

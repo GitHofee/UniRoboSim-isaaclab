@@ -31,6 +31,21 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(
+            CapabilityId("asset.normalization@1"),
+            FrozenMap(
+                {
+                    "rigid_body": {
+                        "media_type": "model/vnd.usd",
+                        "profile": "isaaclab.dynamic-rigid-usd@1",
+                    }
+                }
+            ),
+            limitations=(
+                "rigid normalization rejects articulations and skinned meshes",
+                "functional cavities require convex decomposition or SDF collision",
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("world.multi-environment@1"),
             FrozenMap({"isolation": "physx-environment-origins"}),
         ),
@@ -163,7 +178,7 @@ CAMERA_CAPABILITIES = (
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.5.0a0",
+    version="0.6.0a0",
     contract_version="v0alpha4",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(
