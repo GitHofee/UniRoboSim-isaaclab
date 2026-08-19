@@ -1,47 +1,125 @@
 # UniRoboSim Isaac Lab adapter
 
-The optional Isaac Lab 3.0 / Isaac Sim 6.0.1 backend for UniRoboSim. Import and `probe()` are
-side-effect free; `open()` launches Kit in an adapter-owned worker process so Isaac Sim shutdown
-cannot terminate or corrupt the caller.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-```python
-from unirobosim_isaaclab import IsaacLabAdapterConfig, create_provider
+`unirobosim-isaaclab` connects UniRoboSim `0.7.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
 
-provider = create_provider(IsaacLabAdapterConfig(headless=True, device="cuda:0"))
-report = provider.probe()
-if report.available:
-    session = provider.open()
-    try:
-        # world = session.build(...)
-        ...
-    finally:
-        session.close()
+## Compatibility
+
+| Item | Verified version |
+| --- | --- |
+| Python | `>=3.12,<3.13` |
+| UniRoboSim | `>=0.7.0,<0.8` |
+| Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
+| Isaac Lab PhysX | `1.1.3` |
+| Isaac Sim | `6.0.1.0` |
+| PyTorch | `2.10.0+cu128` |
+| Runtime contract | `v0alpha4` |
+
+## Installation
+
+Install the verified NVIDIA Isaac Sim/Isaac Lab stack in a dedicated Python 3.12 Conda environment first. Confirm that `import isaaclab` and `import isaacsim` work in that environment, then install Core, the adapter, and the optional USD converter:
+
+```bash
+conda create -n unirobosim-isaaclab3 python=3.12 pip -y
+conda activate unirobosim-isaaclab3
+
+git clone https://github.com/GitHofee/UniRoboSim.git
+git clone https://github.com/GitHofee/UniRoboSim-isaaclab.git
+git clone https://github.com/GitHofee/UniRoboSim-usd-converter.git
+
+python -m pip install ./UniRoboSim
+python -m pip install ./UniRoboSim-isaaclab
+python -m pip install ./UniRoboSim-usd-converter
 ```
 
-This alpha profile targets Python 3.12, Isaac Lab `release/3.0.0-beta2`
-(`isaaclab==6.1.17`, `isaaclab_physx==1.1.3`), Isaac Sim `6.0.1.0`, and the
-officially pinned PyTorch `2.10.0` profile.
+Validate the environment without launching Kit:
 
-Supported native paths are USD articulations, rigid-body state and persistent wrench control, aggregated
-normal-contact state, rigid-body USD assets, fixed-topology triangle/tetrahedral deformables, articulation
-position/velocity/effort control, volume-deformable kinematic-node position control, fixed-count PhysX PBD
-particle fluid position/velocity state and commands, RTX RGB/depth cameras, and native USD debug overlays.
-Camera capabilities are advertised only when both `enable_cameras=True` and `render=True` are selected.
-The EasyAPI camera profile defaults to explicit FXAA with texture streaming disabled. This keeps
-full-resolution source textures resident for sensor fidelity and avoids Isaac Lab's headless rendering
-preset silently restoring DLSS. Large multi-environment workloads may trade fidelity for memory by using
-`IsaacLabAdapterConfig(texture_streaming=True)`; `anti_aliasing` accepts `off`, `taa`, `fxaa`, `dlss`, or
-`dlaa`. The native worker reapplies these settings after rendering presets load and rejects a silent
-anti-aliasing or texture-streaming mismatch.
+```bash
+python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
+```
 
-The adapter declares the semantic target `isaaclab.dynamic-rigid-usd@1`. With the optional
-`unirobosim-usd-converter` package installed, EasyAPI inspects a visual-only rigid USD and derives a
-physics-ready USD before the adapter build. The derived stage keeps the source USD visual/material
-composition by reference and adds normalized Z-up metre units, mass, inertia, collision and physics
-material. Articulations, skinned meshes and empty stages are rejected by this rigid-only profile.
+## EasyAPI
 
-Isaac Sim 6.0.1 does not expose a public particle tensor view in this profile. A world containing particle
-fluid therefore uses PhysX-to-USD particle readback and a USD rigid-body bridge. Rigid + fluid + camera +
-debug is verified together; contact-force readback for bridged rigid bodies and a same-world combination of
-particle fluid with tensor-backed articulations or deformables fail explicitly. Rigid assets must contain
-exactly one `UsdPhysics.RigidBodyAPI` prim.
+The installed entry point makes switching explicit and minimal:
+
+```python
+from unirobosim import Sim
+
+with Sim(backend="isaaclab", world_id="isaac-demo") as sim:
+    box = sim.add_box(
+        "red_box",
+        size_m=0.1,
+        color_rgba=(1.0, 0.0, 0.0, 1.0),
+        position_m=(0.0, 0.0, 0.5),
+    )
+    camera = sim.add_camera("camera", resolution=(640, 360), outputs=("rgb", "depth"))
+    sim.start()
+    sim.step(30)
+    print(box.state)
+    print(camera.read("rgb").shape)
+```
+
+Use provider injection for launch settings that do not belong in the portable world:
+
+```python
+from unirobosim import Sim
+from unirobosim_isaaclab import IsaacLabAdapterConfig, create_provider
+
+provider = create_provider(
+    IsaacLabAdapterConfig(
+        headless=True,
+        device="cuda:0",
+        enable_cameras=True,
+        render=True,
+        anti_aliasing="fxaa",
+        texture_streaming=False,
+    )
+)
+
+with Sim(provider=provider) as sim:
+    sim.add_camera("camera", resolution=(1920, 1080), outputs=("rgb",))
+    sim.start()
+```
+
+## Implemented native features
+
+- USD articulations, including robots and non-robot articulated objects;
+- joint position, velocity, and effort control;
+- rigid-body pose/twist, persistent wrench, aggregated normal contact, reset, and scene pose writes;
+- triangle surface deformables and tetrahedral volume deformables;
+- volume-deformable kinematic-node position control;
+- fixed-count PhysX PBD particle-fluid state and commands;
+- RTX RGB/depth camera sensors;
+- native point/line/axes/text/bounding-box/trajectory debug overlays;
+- scene snapshots, scene deltas, and idempotent browser drag transactions;
+- multi-environment batching and restartable process-isolated lifecycle.
+
+## Assets and rendering fidelity
+
+Native rigid USD must contain exactly one `UsdPhysics.RigidBodyAPI` prim. With `unirobosim-usd-converter` installed, visual-only rigid USD is normalized to `isaaclab.dynamic-rigid-usd@1`: the derived layer references the original visual/material composition and adds Z-up metre units, mass, inertia, collision, and physics material.
+
+Articulations, skinned meshes, and empty stages are rejected by the rigid normalizer. Concave containers such as cups and bowls require an authored collision representation or an intentional convex-decomposition policy; a single convex hull will close the cavity.
+
+The EasyAPI profile defaults to FXAA and disables texture streaming so camera sensors keep full-resolution textures. `anti_aliasing` accepts `off`, `taa`, `fxaa`, `dlss`, or `dlaa`. Enable `texture_streaming=True` only when the memory saving is worth reduced texture fidelity.
+
+## Explicit limitations
+
+In this Isaac Sim profile, particle state is read through PhysX/USD rather than a public particle tensor API. Rigid + fluid + camera + debug is verified together. Contact-force readback for bridged rigid bodies, and a same-world mix of particle fluid with tensor-backed articulations or deformables, fail explicitly instead of returning misleading data.
+
+## Verification
+
+```bash
+python -m pip install -e '.[dev]'
+ruff format --check src tests
+ruff check src tests
+mypy src
+pytest -q
+python scripts/native_conformance.py --output result.json
+```
+
+The 0.7.0 wheel passed 82 adapter tests and real RTX 5090 native conformance for rigid/contact, surface/volume deformables, non-robot articulations, particle fluid, RGB/depth, native debug, provider reopen, and MCP-owned clean-interpreter startup.
+
+## Repository relationship
+
+This package contains only the Isaac Lab adapter. Portable contracts and EasyAPI live in [UniRoboSim Core](https://github.com/GitHofee/UniRoboSim.git); browser and MCP interfaces remain separate packages.

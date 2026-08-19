@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 from pathlib import Path
 from typing import Any, cast
 
@@ -32,6 +33,7 @@ from unirobosim_isaaclab.worker import (
     _error_reply,
     _proc_stat_session,
     _session_member_pids,
+    _SubprocessHandle,
     _terminate_worker_tree,
 )
 
@@ -127,6 +129,29 @@ class FakeConnection:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakePopen:
+    def __init__(self) -> None:
+        self.pid = 1234
+        self.returncode: int | None = None
+        self.wait_calls: list[float | None] = []
+        self.terminate_calls = 0
+        self.timeout = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if self.timeout:
+            raise subprocess.TimeoutExpired("worker", timeout)
+        self.returncode = 0
+        return 0
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.returncode = -15
 
 
 def fake_worker_factory(
@@ -249,6 +274,21 @@ def test_proc_stat_session_parser_handles_spaces_and_invalid_input() -> None:
     assert _proc_stat_session("invalid") is None
     assert _proc_stat_session("1 (x) S") is None
     assert _proc_stat_session("1 (x) S 0 1 nope") is None
+
+
+def test_subprocess_handle_adapts_lifecycle_and_timeout() -> None:
+    process = FakePopen()
+    handle = _SubprocessHandle(cast(Any, process))
+    assert handle.pid == 1234 and handle.exitcode is None and handle.is_alive()
+    process.timeout = True
+    handle.join(0.25)
+    assert process.wait_calls == [0.25] and handle.is_alive()
+    process.timeout = False
+    handle.join()
+    assert handle.exitcode == 0 and not handle.is_alive()
+    process.returncode = None
+    handle.terminate()
+    assert process.terminate_calls == 1 and handle.exitcode == -15
 
 
 def test_session_member_scan_finds_current_process() -> None:

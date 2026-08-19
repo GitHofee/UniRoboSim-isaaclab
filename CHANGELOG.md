@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0
+
+- Join the coordinated UniRoboSim 0.7 release train.
+- Accept released Core versions `>=0.7.0,<0.8` and align package/provider identity.
+- Retain the verified Isaac Lab 3.0 / Isaac Sim 6.0.1 feature and fidelity profile.
+- Launch Kit through a clean interpreter bootstrap so MCP and other dependency-heavy
+  parent processes cannot preload libraries into the Isaac runtime.
+
 ## 0.6.1a0
 
 - Default camera capture to explicit FXAA and verify the effective RTX anti-aliasing mode after

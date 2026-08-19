@@ -1,0 +1,125 @@
+# UniRoboSim Isaac Lab Adapter
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+`unirobosim-isaaclab` 将 UniRoboSim `0.7.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
+
+## 兼容矩阵
+
+| 项目 | 已验证版本 |
+| --- | --- |
+| Python | `>=3.12,<3.13` |
+| UniRoboSim | `>=0.7.0,<0.8` |
+| Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
+| Isaac Lab PhysX | `1.1.3` |
+| Isaac Sim | `6.0.1.0` |
+| PyTorch | `2.10.0+cu128` |
+| Runtime contract | `v0alpha4` |
+
+## 安装
+
+先在独立 Python 3.12 Conda 环境中安装已验证的 NVIDIA Isaac Sim/Isaac Lab 运行栈，并确认 `import isaaclab` 和 `import isaacsim` 成功，再安装 Core、Adapter 和可选 USD 转换器：
+
+```bash
+conda create -n unirobosim-isaaclab3 python=3.12 pip -y
+conda activate unirobosim-isaaclab3
+
+git clone https://github.com/GitHofee/UniRoboSim.git
+git clone https://github.com/GitHofee/UniRoboSim-isaaclab.git
+git clone https://github.com/GitHofee/UniRoboSim-usd-converter.git
+
+python -m pip install ./UniRoboSim
+python -m pip install ./UniRoboSim-isaaclab
+python -m pip install ./UniRoboSim-usd-converter
+```
+
+不启动 Kit 检查环境：
+
+```bash
+python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
+```
+
+## EasyAPI
+
+安装入口点后只需指定后端：
+
+```python
+from unirobosim import Sim
+
+with Sim(backend="isaaclab", world_id="isaac-demo") as sim:
+    box = sim.add_box(
+        "red_box",
+        size_m=0.1,
+        color_rgba=(1.0, 0.0, 0.0, 1.0),
+        position_m=(0.0, 0.0, 0.5),
+    )
+    camera = sim.add_camera("camera", resolution=(640, 360), outputs=("rgb", "depth"))
+    sim.start()
+    sim.step(30)
+    print(box.state)
+    print(camera.read("rgb").shape)
+```
+
+需要定制非可移植启动参数时注入 Provider：
+
+```python
+from unirobosim import Sim
+from unirobosim_isaaclab import IsaacLabAdapterConfig, create_provider
+
+provider = create_provider(
+    IsaacLabAdapterConfig(
+        headless=True,
+        device="cuda:0",
+        enable_cameras=True,
+        render=True,
+        anti_aliasing="fxaa",
+        texture_streaming=False,
+    )
+)
+
+with Sim(provider=provider) as sim:
+    sim.add_camera("camera", resolution=(1920, 1080), outputs=("rgb",))
+    sim.start()
+```
+
+## 已实现原生能力
+
+- USD 机器人及非机器人铰接物体；
+- 关节位置、速度和力矩控制；
+- 刚体位姿/速度、持续 wrench、聚合接触、reset 和场景位姿写入；
+- 三角形表面柔性体和四面体体积柔性体；
+- 体积柔性体运动学节点位置控制；
+- 固定粒子数 PhysX PBD 流体状态与控制；
+- RTX RGB/深度相机；
+- Native 点、线、坐标轴、文本、包围盒和轨迹调试覆盖层；
+- 场景快照、增量和幂等浏览器拖拽事务；
+- 多环境 batch 和可重启进程隔离生命周期。
+
+## 资产与渲染质量
+
+原生刚体 USD 必须且只能包含一个 `UsdPhysics.RigidBodyAPI` prim。安装 `unirobosim-usd-converter` 后，可将纯视觉刚体 USD 规范化为 `isaaclab.dynamic-rigid-usd@1`：派生层引用原始视觉/材质组合，并补充 Z-up 米制单位、质量、惯量、碰撞和物理材质。
+
+刚体规范化器会拒绝铰接体、蒙皮网格和空 Stage。杯子、碗等凹结构需要手工碰撞体或明确的凸分解策略；单个 convex hull 会封住内部空腔。
+
+EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分辨率纹理。`anti_aliasing` 支持 `off`、`taa`、`fxaa`、`dlss`、`dlaa`。只有在显存收益高于材质清晰度时才应启用 `texture_streaming=True`。
+
+## 明确限制
+
+此 Isaac Sim profile 的粒子状态通过 PhysX/USD 读取，而不是公开粒子 Tensor API。刚体 + 流体 + 相机 + Debug 已完成混合验证。桥接刚体的接触力，以及粒子流体与 Tensor 铰接体/柔性体同场景组合，会明确失败，不返回误导性结果。
+
+## 验证
+
+```bash
+python -m pip install -e '.[dev]'
+ruff format --check src tests
+ruff check src tests
+mypy src
+pytest -q
+python scripts/native_conformance.py --output result.json
+```
+
+0.7.0 wheel 已通过 82 项 Adapter 测试和 RTX 5090 原生验收，覆盖刚体/接触、表面/体积柔性体、非机器人铰接体、粒子流体、RGB/深度、Native Debug、Provider 重启以及 MCP 所有会话的纯净解释器启动。
+
+## 仓库关系
+
+本包只包含 Isaac Lab Adapter。可移植合同与 EasyAPI 位于 [UniRoboSim Core](https://github.com/GitHofee/UniRoboSim.git)，浏览器和 MCP 接口保持为独立包。

@@ -328,14 +328,18 @@ def test_scene_snapshot_delta_and_transactional_rigid_drag(tmp_path: Path) -> No
     assert world.apply_scene_command(set_pose).status is SceneCommandStatus.APPLIED
     repeated_begin = command("begin-again", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.KINEMATIC)
     assert world.apply_scene_command(repeated_begin).status is SceneCommandStatus.APPLIED
-    assert world.apply_scene_command(
-        command("begin-conflict", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.KINEMATIC)
-    ).error_code == "drag_exists"
+    assert (
+        world.apply_scene_command(
+            command("begin-conflict", SceneCommandKind.DRAG_BEGIN, drag_mode=SceneDragMode.KINEMATIC)
+        ).error_code
+        == "drag_exists"
+    )
     cancel = command("cancel", SceneCommandKind.DRAG_CANCEL)
     assert world.apply_scene_command(cancel).status is SceneCommandStatus.APPLIED
-    assert world.apply_scene_command(
-        command("inactive-update", SceneCommandKind.DRAG_UPDATE, target=Pose())
-    ).error_code == "drag_not_active"
+    assert (
+        world.apply_scene_command(command("inactive-update", SceneCommandKind.DRAG_UPDATE, target=Pose())).error_code
+        == "drag_not_active"
+    )
     with pytest.raises(ValidationError):
         world.scene_delta(999)
     sequence_before_reset = world.scene_snapshot().sequence

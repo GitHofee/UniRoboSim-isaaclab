@@ -385,9 +385,7 @@ class IsaacLabNativeRuntime:
                 config.texture_streaming,
             )
             actual_anti_aliasing = render_settings.get("/rtx/post/aa/op")
-            actual_texture_streaming = render_settings.get(
-                "/rtx-transient/resourcemanager/enableTextureStreaming"
-            )
+            actual_texture_streaming = render_settings.get("/rtx-transient/resourcemanager/enableTextureStreaming")
             if actual_anti_aliasing != expected_anti_aliasing:
                 raise RuntimeError(
                     "Isaac Sim did not apply the requested camera anti-aliasing mode: "

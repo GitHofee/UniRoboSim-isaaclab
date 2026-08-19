@@ -6,6 +6,7 @@ import faulthandler
 import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import traceback
 from collections.abc import Callable
@@ -53,6 +54,33 @@ class _ProcessHandle(Protocol):
 
 
 WorkerFactory = Callable[[IsaacLabAdapterConfig], tuple[Connection, _ProcessHandle]]
+
+
+class _SubprocessHandle:
+    """Adapt ``subprocess.Popen`` to the small worker process protocol."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self._process = process
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def exitcode(self) -> int | None:
+        return self._process.poll()
+
+    def is_alive(self) -> bool:
+        return self._process.poll() is None
+
+    def join(self, timeout: float | None = None) -> None:
+        try:
+            self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def terminate(self) -> None:
+        self._process.terminate()
 
 
 def _error_reply(exc: Exception) -> Reply:
@@ -171,7 +199,10 @@ def _dispatch(
 def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:  # pragma: no cover
     """Own AppLauncher and every native simulator import inside one child process."""
 
-    if hasattr(os, "setsid"):
+    if hasattr(os, "setsid") and os.getsid(0) != os.getpid():
+        # ``subprocess.Popen(start_new_session=True)`` already made the clean
+        # bootstrap process a session leader. The multiprocessing fallback has
+        # not, so only that path still needs ``setsid`` here.
         os.setsid()
     if hasattr(signal, "SIGUSR1"):
         # A stalled native SDK call can otherwise leave only the parent IPC wait
@@ -210,17 +241,39 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
 
 
 def _spawn_worker(config: IsaacLabAdapterConfig) -> tuple[Connection, _ProcessHandle]:  # pragma: no cover
+    if os.name == "posix":
+        # A multiprocessing "spawn" child imports the parent's __main__ module
+        # before calling the target. For an MCP/FastSim parent that can preload
+        # libraries which conflict with Kit. A clean interpreter bootstrap keeps
+        # the native worker import boundary real while retaining the same Pipe.
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=True)
+        bootstrap_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "unirobosim_isaaclab.worker_bootstrap",
+                str(child.fileno()),
+            ],
+            close_fds=True,
+            pass_fds=(child.fileno(),),
+            start_new_session=True,
+        )
+        child.close()
+        parent.send(config)
+        return parent, _SubprocessHandle(bootstrap_process)
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=True)
-    process: BaseProcess = context.Process(
+    spawned_process: BaseProcess = context.Process(
         target=_worker_main,
         args=(child, config),
         name="unirobosim-isaaclab",
         daemon=False,
     )
-    process.start()
+    spawned_process.start()
     child.close()
-    return parent, process
+    return parent, spawned_process
 
 
 def _proc_stat_session(stat: str) -> int | None:

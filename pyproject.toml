@@ -4,19 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unirobosim-isaaclab"
-version = "0.6.1a0"
+version = "0.7.0"
 description = "Isaac Lab 3.0 and Isaac Sim 6.0 adapter for UniRoboSim"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 authors = [{name = "UniRoboSim Contributors"}]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering",
 ]
-dependencies = ["unirobosim==0.7.0a0"]
+dependencies = ["unirobosim>=0.7.0,<0.8"]
 
 [project.entry-points."unirobosim.backends"]
 isaaclab = "unirobosim_isaaclab:create_easy_provider"

@@ -31,7 +31,8 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.6.1a0"
+    assert unirobosim_isaaclab.__version__ == "0.7.0"
+    assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha4"
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
@@ -253,8 +254,6 @@ def test_camera_launcher_texture_residency_settings() -> None:
     assert "--/rtx-transient/resourcemanager/enableTextureStreaming=false" in fidelity
     assert "--/rtx-transient/resourcemanager/texturestreaming/async=false" in fidelity
 
-    streaming = _camera_launcher_settings(
-        IsaacLabAdapterConfig(enable_cameras=True, texture_streaming=True)
-    )
+    streaming = _camera_launcher_settings(IsaacLabAdapterConfig(enable_cameras=True, texture_streaming=True))
     assert "--/rtx-transient/resourcemanager/enableTextureStreaming=true" in streaming
     assert "--/rtx-transient/resourcemanager/texturestreaming/async=false" not in streaming
