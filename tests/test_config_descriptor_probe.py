@@ -15,6 +15,7 @@ import unirobosim_isaaclab
 from unirobosim_isaaclab import CAPABILITIES, DESCRIPTOR, IsaacLabAdapterConfig, IsaacLabProvider
 from unirobosim_isaaclab import probe as probe_module
 from unirobosim_isaaclab.native import (
+    _camera_launcher_settings,
     _environment_origins,
     _launcher_kwargs,
     _native_name,
@@ -30,7 +31,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.6.0a0"
+    assert unirobosim_isaaclab.__version__ == "0.6.1a0"
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha4"
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
@@ -51,6 +52,8 @@ def test_public_identity_and_protocol() -> None:
     )
     assert camera_provider.descriptor is not DESCRIPTOR
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.rgb@1")) is not None
+    assert camera_provider.descriptor.metadata["camera_anti_aliasing"] == "fxaa"
+    assert camera_provider.descriptor.metadata["camera_texture_streaming"] is False
     control = CAPABILITIES.get(CapabilityId("control.deformable.points@1"))
     assert control is not None
     assert control.properties == FrozenMap(
@@ -63,6 +66,7 @@ def test_valid_config(device: str) -> None:
     config = IsaacLabAdapterConfig(device=device, environment_spacing_m=2, position_stiffness=2)
     assert config.environment_spacing_m == 2.0
     assert config.position_stiffness == 2.0
+    assert config.anti_aliasing == "fxaa"
 
 
 @pytest.mark.parametrize("device", ["", "gpu", "cuda:-1", "CUDA:0", 7])
@@ -77,7 +81,7 @@ def test_invalid_spacing(spacing: object) -> None:
         IsaacLabAdapterConfig(environment_spacing_m=spacing)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("field", ["headless", "enable_cameras", "render"])
+@pytest.mark.parametrize("field", ["headless", "enable_cameras", "render", "texture_streaming"])
 def test_invalid_boolean_flags(field: str) -> None:
     values = {field: 1}
     with pytest.raises(ValidationError):
@@ -99,6 +103,10 @@ def test_render_and_experience_validation() -> None:
         with pytest.raises(ValidationError):
             IsaacLabAdapterConfig(max_cached_scene_commands=invalid)  # type: ignore[arg-type]
     assert IsaacLabAdapterConfig(render=True, enable_cameras=True).render
+    assert IsaacLabAdapterConfig(anti_aliasing="FXAA").anti_aliasing == "fxaa"
+    for invalid in ("", "msaa", 2):
+        with pytest.raises(ValidationError):
+            IsaacLabAdapterConfig(anti_aliasing=invalid)  # type: ignore[arg-type]
 
 
 def test_probe_cpu_success_and_version_failures() -> None:
@@ -232,8 +240,21 @@ def test_launcher_disables_process_terminating_fast_shutdown() -> None:
         "device": "cuda:0",
         "enable_cameras": True,
         "fast_shutdown": False,
+        "anti_aliasing": 2,
     }
 
     configured = IsaacLabAdapterConfig(experience="/tmp/custom.kit")
     assert _launcher_kwargs(configured)["experience"] == "/tmp/custom.kit"
     assert _launcher_kwargs(config, process_isolated=True)["fast_shutdown"] is True
+
+
+def test_camera_launcher_texture_residency_settings() -> None:
+    fidelity = _camera_launcher_settings(IsaacLabAdapterConfig(enable_cameras=True))
+    assert "--/rtx-transient/resourcemanager/enableTextureStreaming=false" in fidelity
+    assert "--/rtx-transient/resourcemanager/texturestreaming/async=false" in fidelity
+
+    streaming = _camera_launcher_settings(
+        IsaacLabAdapterConfig(enable_cameras=True, texture_streaming=True)
+    )
+    assert "--/rtx-transient/resourcemanager/enableTextureStreaming=true" in streaming
+    assert "--/rtx-transient/resourcemanager/texturestreaming/async=false" not in streaming

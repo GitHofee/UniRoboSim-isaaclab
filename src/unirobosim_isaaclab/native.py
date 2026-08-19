@@ -29,7 +29,7 @@ from unirobosim import (
     WorldSpec,
 )
 
-from .config import IsaacLabAdapterConfig
+from .config import _ANTI_ALIASING_MODES, IsaacLabAdapterConfig
 from .native_debug import NativeDebugOverlay, NativeDebugPayload
 from .native_protocols import Matrix, NativeDebugReport, NativeSensorSample, PointBatch
 
@@ -336,9 +336,25 @@ def _launcher_kwargs(config: IsaacLabAdapterConfig, *, process_isolated: bool = 
         # teardown. It is enabled only inside the adapter-owned worker process.
         "fast_shutdown": process_isolated,
     }
+    if config.enable_cameras:
+        launcher_args["anti_aliasing"] = _ANTI_ALIASING_MODES[config.anti_aliasing]
     if config.experience is not None:
         launcher_args["experience"] = config.experience
     return launcher_args
+
+
+def _camera_launcher_settings(config: IsaacLabAdapterConfig) -> tuple[str, ...]:
+    """Return pre-launch RTX settings for the requested texture residency profile."""
+
+    texture_streaming = "true" if config.texture_streaming else "false"
+    settings = [
+        "--/renderer/multiGpu/enabled=false",
+        "--/rtx-transient/dlssg/enabled=false",
+        f"--/rtx-transient/resourcemanager/enableTextureStreaming={texture_streaming}",
+    ]
+    if not config.texture_streaming:
+        settings.append("--/rtx-transient/resourcemanager/texturestreaming/async=false")
+    return tuple(settings)
 
 
 class IsaacLabNativeRuntime:
@@ -347,15 +363,42 @@ class IsaacLabNativeRuntime:
     def __init__(self, config: IsaacLabAdapterConfig, *, process_isolated: bool = False) -> None:
         if config.enable_cameras:
             # The installed RTX 5090 profile is stable with one renderer device and no frame generation.
-            _ensure_launcher_setting("--/renderer/multiGpu/enabled=false")
-            _ensure_launcher_setting("--/rtx-transient/dlssg/enabled=false")
-            _ensure_launcher_setting("--/rtx-transient/dlss/enabled=false")
+            for setting in _camera_launcher_settings(config):
+                _ensure_launcher_setting(setting)
         from isaaclab.app import AppLauncher  # type: ignore[import-not-found]
 
         self._launcher = AppLauncher(**_launcher_kwargs(config, process_isolated=process_isolated))
         self._app = self._launcher.app
 
         import carb  # type: ignore[import-not-found]
+
+        if config.enable_cameras:
+            expected_anti_aliasing = _ANTI_ALIASING_MODES[config.anti_aliasing]
+            # Isaac Lab applies its rendering-mode preset after constructing SimulationApp,
+            # which currently overwrites SimulationApp's ``anti_aliasing`` launch value.
+            # Re-apply the caller's mode after AppLauncher has completed, before any render
+            # products exist, then read it back so a silent preset override cannot pass.
+            render_settings = carb.settings.get_settings()
+            render_settings.set("/rtx/post/aa/op", expected_anti_aliasing)
+            render_settings.set(
+                "/rtx-transient/resourcemanager/enableTextureStreaming",
+                config.texture_streaming,
+            )
+            actual_anti_aliasing = render_settings.get("/rtx/post/aa/op")
+            actual_texture_streaming = render_settings.get(
+                "/rtx-transient/resourcemanager/enableTextureStreaming"
+            )
+            if actual_anti_aliasing != expected_anti_aliasing:
+                raise RuntimeError(
+                    "Isaac Sim did not apply the requested camera anti-aliasing mode: "
+                    f"requested={config.anti_aliasing!r} expected={expected_anti_aliasing} "
+                    f"actual={actual_anti_aliasing!r}"
+                )
+            if actual_texture_streaming != config.texture_streaming:
+                raise RuntimeError(
+                    "Isaac Sim did not apply the requested texture-streaming mode: "
+                    f"requested={config.texture_streaming!r} actual={actual_texture_streaming!r}"
+                )
         import isaaclab.sim as sim_utils  # type: ignore[import-not-found]
         import isaacsim  # type: ignore[import-not-found]
         import omni.physics.tensors as physics_tensors  # type: ignore[import-not-found]

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1a0
+
+- Default camera capture to explicit FXAA and verify the effective RTX anti-aliasing mode after
+  Isaac Lab rendering presets have loaded.
+- Disable headless texture streaming by default so sensor frames use full-resolution source textures;
+  retain an opt-in streaming mode for memory-constrained workloads.
+- Expose the effective camera fidelity profile in provider metadata.
+
 ## 0.6.0a0
 
 - Declare the provider-owned `isaaclab.dynamic-rigid-usd@1` semantic normalization target for rigid USD.

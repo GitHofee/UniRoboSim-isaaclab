@@ -178,7 +178,7 @@ CAMERA_CAPABILITIES = (
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.6.0a0",
+    version="0.6.1a0",
     contract_version="v0alpha4",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(
@@ -198,12 +198,20 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
 
     if bool(getattr(config, "enable_cameras", False)) and bool(getattr(config, "render", False)):
         capabilities = CapabilitySet((*CAPABILITIES, *CAMERA_CAPABILITIES))
+        anti_aliasing = str(getattr(config, "anti_aliasing", "fxaa"))
+        texture_streaming = bool(getattr(config, "texture_streaming", False))
         return ProviderDescriptor(
             provider_id=DESCRIPTOR.provider_id,
             display_name=DESCRIPTOR.display_name,
             version=DESCRIPTOR.version,
             contract_version=DESCRIPTOR.contract_version,
             capabilities=capabilities,
-            metadata=DESCRIPTOR.metadata,
+            metadata=FrozenMap(
+                {
+                    **DESCRIPTOR.metadata.to_dict(),
+                    "camera_anti_aliasing": anti_aliasing,
+                    "camera_texture_streaming": texture_streaming,
+                }
+            ),
         )
     return DESCRIPTOR

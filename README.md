@@ -27,6 +27,12 @@ normal-contact state, rigid-body USD assets, fixed-topology triangle/tetrahedral
 position/velocity/effort control, volume-deformable kinematic-node position control, fixed-count PhysX PBD
 particle fluid position/velocity state and commands, RTX RGB/depth cameras, and native USD debug overlays.
 Camera capabilities are advertised only when both `enable_cameras=True` and `render=True` are selected.
+The EasyAPI camera profile defaults to explicit FXAA with texture streaming disabled. This keeps
+full-resolution source textures resident for sensor fidelity and avoids Isaac Lab's headless rendering
+preset silently restoring DLSS. Large multi-environment workloads may trade fidelity for memory by using
+`IsaacLabAdapterConfig(texture_streaming=True)`; `anti_aliasing` accepts `off`, `taa`, `fxaa`, `dlss`, or
+`dlaa`. The native worker reapplies these settings after rendering presets load and rejects a silent
+anti-aliasing or texture-streaming mismatch.
 
 The adapter declares the semantic target `isaaclab.dynamic-rigid-usd@1`. With the optional
 `unirobosim-usd-converter` package installed, EasyAPI inspects a visual-only rigid USD and derives a
