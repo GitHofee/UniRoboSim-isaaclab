@@ -22,6 +22,15 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(
+            CapabilityId("asset.formats@1"),
+            FrozenMap(
+                {
+                    "rigid_body": ["model/vnd.usd"],
+                    "articulation": ["model/vnd.usd"],
+                }
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("world.multi-environment@1"),
             FrozenMap({"isolation": "physx-environment-origins"}),
         ),
@@ -154,7 +163,7 @@ CAMERA_CAPABILITIES = (
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.4.0a0",
+    version="0.5.0a0",
     contract_version="v0alpha4",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(
