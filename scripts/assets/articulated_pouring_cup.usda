@@ -1,0 +1,208 @@
+#usda 1.0
+(
+    defaultPrim = "PouringRig"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PouringRig" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{
+    def Xform "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 50
+
+        def Cube "ground" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.10, 0.13, 0.18)]
+            double size = 1
+            float3 xformOp:scale = (4.0, 3.0, 0.08)
+            double3 xformOp:translate = (0.20, 0, -0.04)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_bottom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.12, 0.16, 0.22)]
+            double size = 1
+            float3 xformOp:scale = (1.90, 1.20, 0.08)
+            double3 xformOp:translate = (0.55, 0, 0.04)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_marker_warm"
+        {
+            color3f[] primvars:displayColor = [(0.92, 0.26, 0.07)]
+            double size = 1
+            float3 xformOp:scale = (0.22, 1.02, 0.008)
+            double3 xformOp:translate = (-0.16, 0, 0.084)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_marker_light"
+        {
+            color3f[] primvars:displayColor = [(0.86, 0.90, 0.96)]
+            double size = 1
+            float3 xformOp:scale = (0.22, 1.02, 0.008)
+            double3 xformOp:translate = (0.10, 0, 0.084)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_marker_cool"
+        {
+            color3f[] primvars:displayColor = [(0.05, 0.23, 0.58)]
+            double size = 1
+            float3 xformOp:scale = (0.22, 1.02, 0.008)
+            double3 xformOp:translate = (0.36, 0, 0.084)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_front" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.12, 0.16, 0.22)]
+            double size = 1
+            token visibility = "invisible"
+            float3 xformOp:scale = (1.90, 0.07, 0.60)
+            double3 xformOp:translate = (0.55, -0.635, 0.34)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_back" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.12, 0.16, 0.22)]
+            double size = 1
+            float3 xformOp:scale = (1.90, 0.07, 0.60)
+            double3 xformOp:translate = (0.55, 0.635, 0.34)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_end" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.12, 0.16, 0.22)]
+            double size = 1
+            float3 xformOp:scale = (0.07, 1.20, 0.60)
+            double3 xformOp:translate = (1.535, 0, 0.34)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "receiver_lip" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.12, 0.16, 0.22)]
+            double size = 1
+            float3 xformOp:scale = (0.07, 1.20, 0.22)
+            double3 xformOp:translate = (-0.435, 0, 0.15)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def Xform "cup" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 1.5
+        double3 xformOp:translate = (-0.55, 0, 0.72)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "bottom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.92, 0.30, 0.08)]
+            double size = 1
+            float3 xformOp:scale = (0.62, 0.32, 0.05)
+            double3 xformOp:translate = (0, 0, -0.25)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "bottom_marker"
+        {
+            color3f[] primvars:displayColor = [(0.07, 0.28, 0.65)]
+            double size = 1
+            float3 xformOp:scale = (0.30, 0.22, 0.008)
+            double3 xformOp:translate = (0.08, 0, -0.221)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "left_wall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.96, 0.38, 0.10)]
+            double size = 1
+            float3 xformOp:scale = (0.05, 0.32, 0.55)
+            double3 xformOp:translate = (-0.285, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "right_wall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.96, 0.38, 0.10)]
+            double size = 1
+            float3 xformOp:scale = (0.05, 0.32, 0.55)
+            double3 xformOp:translate = (0.285, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "front_wall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.96, 0.38, 0.10)]
+            double size = 1
+            token visibility = "invisible"
+            float3 xformOp:scale = (0.62, 0.04, 0.55)
+            double3 xformOp:translate = (0, -0.14, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "back_wall" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.96, 0.38, 0.10)]
+            double size = 1
+            float3 xformOp:scale = (0.62, 0.04, 0.55)
+            double3 xformOp:translate = (0, 0.14, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def PhysicsFixedJoint "fixed_base"
+    {
+        rel physics:body1 = </PouringRig/base>
+    }
+
+    def PhysicsRevoluteJoint "cup_hinge" (
+        prepend apiSchemas = ["PhysicsDriveAPI:angular"]
+    )
+    {
+        float drive:angular:physics:damping = 120
+        float drive:angular:physics:maxForce = 800
+        float drive:angular:physics:stiffness = 1200
+        uniform token drive:angular:physics:type = "force"
+        uniform token physics:axis = "Y"
+        rel physics:body0 = </PouringRig/base>
+        rel physics:body1 = </PouringRig/cup>
+        point3f physics:localPos0 = (-0.55, 0, 0.72)
+        point3f physics:localPos1 = (0, 0, 0)
+        float physics:lowerLimit = -5
+        float physics:upperLimit = 125
+    }
+}

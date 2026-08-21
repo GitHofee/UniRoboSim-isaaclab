@@ -113,12 +113,17 @@ CAPABILITIES = CapabilitySet(
                     "physics": "physx-pbd",
                     "representation": "particles",
                     "point_count": "fixed",
+                    "render_modes": ["particles", "isosurface"],
                     "state_layout": "batch-point-xyz",
                 }
             ),
             limitations=(
-                "dynamic particle count and surface reconstruction are unsupported",
-                "particle-fluid worlds cannot contain tensor-backed articulations or deformables in this profile",
+                "dynamic particle count is unsupported",
+                "isosurface rendering is opt-in and consumes additional GPU memory and render time",
+                "particle-fluid worlds bridge articulations through raw USD/Omni Physics state and cannot contain "
+                "deformables in this profile",
+                "articulation collisions affect particles, but particle reaction loads on articulations are "
+                "unsupported",
             ),
         ),
         CapabilityDeclaration(
@@ -200,6 +205,8 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
         capabilities = CapabilitySet((*CAPABILITIES, *CAMERA_CAPABILITIES))
         anti_aliasing = str(getattr(config, "anti_aliasing", "fxaa"))
         texture_streaming = bool(getattr(config, "texture_streaming", False))
+        render_on_step = bool(getattr(config, "render_on_step", True))
+        fluid_render_mode = str(getattr(config, "fluid_render_mode", "particles"))
         return ProviderDescriptor(
             provider_id=DESCRIPTOR.provider_id,
             display_name=DESCRIPTOR.display_name,
@@ -211,6 +218,8 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
                     **DESCRIPTOR.metadata.to_dict(),
                     "camera_anti_aliasing": anti_aliasing,
                     "camera_texture_streaming": texture_streaming,
+                    "render_on_step": render_on_step,
+                    "fluid_render_mode": fluid_render_mode,
                 }
             ),
         )

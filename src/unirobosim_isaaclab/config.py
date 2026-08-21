@@ -10,6 +10,7 @@ from unirobosim import ValidationError
 
 _DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)$")
 _ANTI_ALIASING_MODES = {"off": 0, "taa": 1, "fxaa": 2, "dlss": 3, "dlaa": 4}
+_FLUID_RENDER_MODES = {"particles", "isosurface"}
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,8 @@ class IsaacLabAdapterConfig:
     render: bool = False
     anti_aliasing: str = "fxaa"
     texture_streaming: bool = False
+    render_on_step: bool = True
+    fluid_render_mode: str = "particles"
     experience: str | None = None
     position_stiffness: float = 1000.0
     position_damping: float = 100.0
@@ -35,6 +38,7 @@ class IsaacLabAdapterConfig:
             or not isinstance(self.enable_cameras, bool)
             or not isinstance(self.render, bool)
             or not isinstance(self.texture_streaming, bool)
+            or not isinstance(self.render_on_step, bool)
         ):
             raise ValidationError("launch flags must be boolean", operation="isaaclab.config.validate")
         if not isinstance(self.device, str) or not _DEVICE.fullmatch(self.device):
@@ -50,6 +54,13 @@ class IsaacLabAdapterConfig:
                 details={"anti_aliasing": self.anti_aliasing},
             )
         object.__setattr__(self, "anti_aliasing", self.anti_aliasing.lower())
+        if not isinstance(self.fluid_render_mode, str) or self.fluid_render_mode.lower() not in _FLUID_RENDER_MODES:
+            raise ValidationError(
+                "fluid_render_mode must be particles or isosurface",
+                operation="isaaclab.config.validate",
+                details={"fluid_render_mode": self.fluid_render_mode},
+            )
+        object.__setattr__(self, "fluid_render_mode", self.fluid_render_mode.lower())
         if isinstance(self.environment_spacing_m, bool):
             raise ValidationError("environment spacing must be numeric", operation="isaaclab.config.validate")
         try:

@@ -270,6 +270,11 @@ class _UsdRigid:
     rigid_prim: Any
 
 
+@dataclass
+class _UsdArticulation:
+    root_prim: Any
+
+
 def _ensure_launcher_setting(setting: str) -> None:
     if setting not in sys.argv:
         sys.argv.append(setting)
@@ -384,6 +389,13 @@ class IsaacLabNativeRuntime:
                 "/rtx-transient/resourcemanager/enableTextureStreaming",
                 config.texture_streaming,
             )
+            if config.fluid_render_mode == "isosurface":
+                render_settings.set("/rtx/rendermode", "RealTimePathTracing")
+                render_settings.set("/rtx/translucency/enabled", True)
+                render_settings.set("/rtx/translucency/maxRefractionBounces", 12)
+                render_settings.set("/rtx/rtpt/maxBounces", 6)
+                render_settings.set("/rtx/rtpt/maxSpecularAndTransmissionBounces", 6)
+                render_settings.set("/rtx/rtpt/maxVolumeBounces", 6)
             actual_anti_aliasing = render_settings.get("/rtx/post/aa/op")
             actual_texture_streaming = render_settings.get("/rtx-transient/resourcemanager/enableTextureStreaming")
             if actual_anti_aliasing != expected_anti_aliasing:
@@ -397,6 +409,13 @@ class IsaacLabNativeRuntime:
                     "Isaac Sim did not apply the requested texture-streaming mode: "
                     f"requested={config.texture_streaming!r} actual={actual_texture_streaming!r}"
                 )
+            if config.fluid_render_mode == "isosurface" and not render_settings.get("/rtx/translucency/enabled"):
+                raise RuntimeError("Isaac Sim did not enable RTX translucency for fluid isosurface rendering")
+            if (
+                config.fluid_render_mode == "isosurface"
+                and render_settings.get("/rtx/rendermode") != "RealTimePathTracing"
+            ):
+                raise RuntimeError("Isaac Sim did not enable real-time path tracing for fluid isosurface rendering")
         import isaaclab.sim as sim_utils  # type: ignore[import-not-found]
         import isaacsim  # type: ignore[import-not-found]
         import omni.physics.tensors as physics_tensors  # type: ignore[import-not-found]
@@ -514,6 +533,9 @@ class IsaacLabNativeWorld:
         self._closed = False
         self._sim: Any | None = None
         self._articulations: dict[EntityPath, Any] = {}
+        self._usd_articulations: dict[EntityPath, tuple[_UsdArticulation, ...]] = {}
+        self._usd_articulation_views: dict[EntityPath, Any] = {}
+        self._initial_usd_articulation: dict[EntityPath, tuple[Any, Any, Any, Any]] = {}
         self._rigids: dict[EntityPath, Any] = {}
         self._usd_rigids: dict[EntityPath, tuple[_UsdRigid, ...]] = {}
         self._usd_rigid_views: dict[EntityPath, Any] = {}
@@ -570,13 +592,12 @@ class IsaacLabNativeWorld:
         unsupported_mixed = tuple(
             entity.path.value
             for entity in self._spec.entities
-            if has_fluid
-            and entity.kind in {EntityKind.ARTICULATION, EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}
+            if has_fluid and entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}
         )
         if unsupported_mixed:
             raise RuntimeError(
-                "this Isaac Lab 3.0 profile cannot combine USD-readback particles with tensor-backed "
-                f"articulations/deformables in one native world: {unsupported_mixed}"
+                "this Isaac Lab 3.0 profile cannot combine USD-readback particles with "
+                f"tensor-backed deformables in one native world: {unsupported_mixed}"
             )
         sim_cfg = sim_utils.SimulationCfg(
             dt=self._native_dt,
@@ -592,12 +613,40 @@ class IsaacLabNativeWorld:
             # Headless RTX scenes have no viewport headlight. A renderer-neutral
             # camera contract must therefore provide deterministic environment
             # illumination or valid geometry can produce an all-black frame.
-            light = sim_utils.DomeLightCfg(intensity=2500.0, color=(1.0, 1.0, 1.0))
+            water_surface = self._config.fluid_render_mode == "isosurface"
+            light = sim_utils.DomeLightCfg(
+                intensity=650.0 if water_surface else 2500.0,
+                color=(0.55, 0.68, 0.90) if water_surface else (1.0, 1.0, 1.0),
+            )
             light.func("/World/unirobosimDefaultDomeLight", light)
+            if water_surface:
+                key_light = sim_utils.SphereLightCfg(
+                    intensity=5000.0,
+                    color=(1.0, 0.82, 0.62),
+                    radius=0.45,
+                    normalize=True,
+                )
+                key_light.func(
+                    "/World/unirobosimFluidKeyLight",
+                    key_light,
+                    translation=(-1.4, -2.0, 2.4),
+                )
+                rim_light = sim_utils.SphereLightCfg(
+                    intensity=2600.0,
+                    color=(0.42, 0.68, 1.0),
+                    radius=0.3,
+                    normalize=True,
+                )
+                rim_light.func(
+                    "/World/unirobosimFluidRimLight",
+                    rim_light,
+                    translation=(1.8, 0.8, 1.8),
+                )
         if has_fluid:
             # Isaac Sim 6.0 has no public particle tensor view. Particle state therefore uses
-            # PhysX-to-USD readback. Rigid bodies in such worlds use the USD bridge below so the
-            # normal Isaac Lab GPU tensor pipeline remains untouched in non-particle worlds.
+            # PhysX-to-USD readback. Articulations and rigid bodies in these worlds use the raw
+            # Omni Physics bridge below because Isaac Lab's high-level assets assume a CUDA tensor
+            # frontend while readback deliberately selects a CPU frontend.
             self._sim.set_setting("/physics/suppressReadback", False)
             self._sim.set_setting("/physics/updateToUsd", True)
             self._sim.set_setting("/physics/updateParticlesToUsd", True)
@@ -618,6 +667,7 @@ class IsaacLabNativeWorld:
             elif entity.kind is EntityKind.CAMERA_SENSOR:
                 self._author_camera(entity)
         self._sim.reset()
+        self._initialize_usd_articulations()
         self._initialize_usd_rigids()
         self._origins = self._m.torch.tensor(self._origins_cpu, device=self._sim.device, dtype=self._m.torch.float32)
         self._initialize_articulations()
@@ -631,6 +681,9 @@ class IsaacLabNativeWorld:
 
     def _author_articulation(self, entity: EntitySpec) -> None:
         assert entity.asset_uri is not None
+        if self._has_fluid:
+            self._author_usd_articulation(entity)
+            return
         cfg = self._m.ArticulationCfg(
             prim_path=f"/World/env_.*/{_native_name(entity.path)}",
             spawn=self._m.sim_utils.UsdFileCfg(usd_path=str(entity.asset_uri).removeprefix("file://")),
@@ -654,6 +707,33 @@ class IsaacLabNativeWorld:
             },
         )
         self._articulations[entity.path] = self._m.Articulation(cfg)
+
+    def _author_usd_articulation(self, entity: EntitySpec) -> None:
+        """Author an articulation through USD for particle-readback worlds."""
+
+        assert entity.asset_uri is not None
+        name = _native_name(entity.path)
+        articulations: list[_UsdArticulation] = []
+        for index in range(self._spec.environments.count):
+            root = f"/World/env_{index}/{name}"
+            cfg = self._m.sim_utils.UsdFileCfg(usd_path=str(entity.asset_uri).removeprefix("file://"))
+            cfg.func(
+                root,
+                cfg,
+                translation=entity.pose.position,
+                orientation=entity.pose.orientation_xyzw,
+            )
+            root_prims = self._m.sim_utils.get_all_matching_child_prims(
+                root,
+                lambda prim: prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI),
+                traverse_instance_prims=False,
+            )
+            if len(root_prims) != 1:
+                raise ValueError(
+                    f"articulation asset must contain exactly one ArticulationRootAPI prim; found {len(root_prims)}"
+                )
+            articulations.append(_UsdArticulation(root_prim=root_prims[0]))
+        self._usd_articulations[entity.path] = tuple(articulations)
 
     def _author_rigid(self, entity: EntitySpec) -> None:
         if entity.box is not None:
@@ -858,11 +938,11 @@ class IsaacLabNativeWorld:
             system.CreateGlobalSelfCollisionEnabledAttr().Set(True)
             system.CreateNonParticleCollisionEnabledAttr().Set(True)
 
-            material = self._m.UsdShade.Material.Define(stage, f"{root}/pbd_material")
-            material_api = self._m.PhysxSchema.PhysxPBDMaterialAPI.Apply(material.GetPrim())
-            material_api.CreateDensityAttr().Set(fluid.rest_density_kg_m3)
-            material_api.CreateViscosityAttr().Set(fluid.dynamic_viscosity_pa_s)
-            material_api.CreateSurfaceTensionAttr().Set(fluid.surface_tension_n_m)
+            if self._config.fluid_render_mode == "isosurface":
+                material = self._author_water_material(stage, root, fluid)
+            else:
+                material = self._m.UsdShade.Material.Define(stage, f"{root}/pbd_material")
+                self._apply_pbd_material(material, fluid)
             binding = self._m.UsdShade.MaterialBindingAPI.Apply(system.GetPrim())
             binding.Bind(
                 material,
@@ -876,9 +956,10 @@ class IsaacLabNativeWorld:
             points.CreateWidthsAttr().Set(
                 self._m.Vt.FloatArray((fluid.particle_radius_m * 2.0,) * fluid.particle_count)
             )
-            points.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
-                self._m.Vt.Vec3fArray(((0.1, 0.45, 1.0),))
-            )
+            if self._config.fluid_render_mode == "particles":
+                points.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+                    self._m.Vt.Vec3fArray(((0.1, 0.45, 1.0),))
+                )
             set_api = self._m.PhysxSchema.PhysxParticleSetAPI.Apply(points.GetPrim())
             # PhysxParticleSetAPI derives from PhysxParticleAPI; constructing the base view from
             # the applied set schema matches NVIDIA's particleUtils.configure_particle_set path.
@@ -890,8 +971,73 @@ class IsaacLabNativeWorld:
             mass_api = self._m.UsdPhysics.MassAPI.Apply(points.GetPrim())
             mass_api.CreateMassAttr().Set(fluid.resolved_particle_mass_kg * fluid.particle_count)
             mass_api.CreateDensityAttr().Set(fluid.rest_density_kg_m3)
+            if self._config.fluid_render_mode == "isosurface":
+                self._author_fluid_isosurface(system, material, fluid)
             sets.append(_FluidSet(points, local_positions, local_velocities))
         self._fluids[entity.path] = tuple(sets)
+
+    def _apply_pbd_material(self, material: Any, fluid: Any) -> None:
+        material_api = self._m.PhysxSchema.PhysxPBDMaterialAPI.Apply(material.GetPrim())
+        material_api.CreateDensityAttr().Set(fluid.rest_density_kg_m3)
+        material_api.CreateViscosityAttr().Set(fluid.dynamic_viscosity_pa_s)
+        material_api.CreateSurfaceTensionAttr().Set(fluid.surface_tension_n_m)
+
+    def _author_water_material(self, stage: Any, root: str, fluid: Any) -> Any:
+        """Create one material that carries both water rendering and PBD properties."""
+
+        from omni.usd.commands import CreateMdlMaterialPrimCommand  # type: ignore[import-not-found]
+
+        material_path = f"{root}/water_surface_material"
+        CreateMdlMaterialPrimCommand(
+            mtl_url="OmniSurfacePresets.mdl",
+            mtl_name="OmniSurface_DeepWater",
+            mtl_path=material_path,
+            stage=stage,
+            select_new_prim=False,
+        ).do()
+        water_material = self._m.UsdShade.Material.Get(stage, material_path)
+        if not water_material.GetPrim().IsValid():
+            raise RuntimeError(f"Isaac Sim did not create the clear-water MDL material at {material_path}")
+        self._apply_pbd_material(water_material, fluid)
+        return water_material
+
+    def _author_fluid_isosurface(self, system: Any, water_material: Any, fluid: Any) -> None:
+        """Add opt-in render-only surface reconstruction with inherited water rendering."""
+
+        system_prim = system.GetPrim()
+        smoothing = self._m.PhysxSchema.PhysxParticleSmoothingAPI.Apply(system_prim)
+        smoothing.CreateParticleSmoothingEnabledAttr().Set(True)
+        smoothing.CreateStrengthAttr().Set(0.5)
+
+        anisotropy = self._m.PhysxSchema.PhysxParticleAnisotropyAPI.Apply(system_prim)
+        anisotropy.CreateParticleAnisotropyEnabledAttr().Set(True)
+        anisotropy.CreateScaleAttr().Set(5.0)
+        anisotropy.CreateMinAttr().Set(1.0)
+        anisotropy.CreateMaxAttr().Set(2.0)
+
+        isosurface = self._m.PhysxSchema.PhysxParticleIsosurfaceAPI.Apply(system_prim)
+        isosurface.CreateIsosurfaceEnabledAttr().Set(True)
+        isosurface.CreateMaxVerticesAttr().Set(1_048_576)
+        isosurface.CreateMaxTrianglesAttr().Set(2_097_152)
+        isosurface.CreateMaxSubgridsAttr().Set(4_096)
+        fluid_rest_offset = fluid.particle_radius_m * 0.6
+        grid_spacing = fluid_rest_offset * 1.5
+        isosurface.CreateGridSpacingAttr().Set(grid_spacing)
+        isosurface.CreateSurfaceDistanceAttr().Set(fluid_rest_offset * 1.6)
+        isosurface.CreateGridFilteringPassesAttr().Set("")
+        isosurface.CreateGridSmoothingRadiusAttr().Set(fluid_rest_offset * 2.0)
+        isosurface.CreateNumMeshSmoothingPassesAttr().Set(2)
+        isosurface.CreateNumMeshNormalSmoothingPassesAttr().Set(4)
+        self._m.UsdGeom.PrimvarsAPI(system).CreatePrimvar(
+            "doNotCastShadows",
+            self._m.Sdf.ValueTypeNames.Bool,
+        ).Set(True)
+
+        binding = self._m.UsdShade.MaterialBindingAPI.Apply(system_prim)
+        binding.Bind(
+            water_material,
+            bindingStrength=self._m.UsdShade.Tokens.strongerThanDescendants,
+        )
 
     def _author_camera(self, entity: EntitySpec) -> None:
         assert entity.camera is not None
@@ -951,15 +1097,50 @@ class IsaacLabNativeWorld:
             velocities = torch.zeros_like(positions)
             self._initial_articulation[path] = (root_pose, positions, velocities)
 
+    def _usd_simulation_view(self) -> Any:
+        if self._usd_tensor_view is None:
+            self._usd_tensor_view = self._m.physics_tensors.create_simulation_view("torch")
+            self._usd_tensor_view.set_subspace_roots("/")
+        return self._usd_tensor_view
+
+    def _initialize_usd_articulations(self) -> None:
+        if not self._usd_articulations:
+            return
+        tensor_view = self._usd_simulation_view()
+        for path, articulations in self._usd_articulations.items():
+            entity = next(item for item in self._spec.entities if item.path == path)
+            expected_paths = tuple(item.root_prim.GetPath().pathString for item in articulations)
+            view = tensor_view.create_articulation_view(list(expected_paths))
+            if view.count != self._spec.environments.count or tuple(view.prim_paths) != expected_paths:
+                raise RuntimeError(
+                    f"USD articulation view for {path.value} did not preserve environment order; "
+                    f"expected={expected_paths}, actual={tuple(view.prim_paths)}"
+                )
+            native_names = tuple(view.shared_metatype.dof_names)
+            if set(native_names) != set(entity.joint_names) or len(native_names) != len(entity.joint_names):
+                raise ValueError(
+                    f"joint names for {path.value} do not exactly match the USD; "
+                    f"declared={entity.joint_names}, native={native_names}"
+                )
+            joint_map = tuple(native_names.index(name) for name in entity.joint_names)
+            self._joint_maps[path] = joint_map
+            root_pose = view.get_root_transforms().clone()
+            root_velocity = view.get_root_velocities().clone()
+            positions = view.get_dof_positions().clone()
+            for public_index, native_index in enumerate(joint_map):
+                positions[:, native_index] = entity.initial_joint_positions[public_index]
+            velocities = self._m.torch.zeros_like(positions)
+            self._initial_usd_articulation[path] = (root_pose, root_velocity, positions, velocities)
+            self._usd_articulation_views[path] = view
+
     def _initialize_usd_rigids(self) -> None:
         if not self._usd_rigids:
             return
         assert self._sim is not None
-        self._usd_tensor_view = self._m.physics_tensors.create_simulation_view("torch")
-        self._usd_tensor_view.set_subspace_roots("/")
+        tensor_view = self._usd_simulation_view()
         for path, bodies in self._usd_rigids.items():
             expected_paths = tuple(body.rigid_prim.GetPath().pathString for body in bodies)
-            view = self._usd_tensor_view.create_rigid_body_view(list(expected_paths))
+            view = tensor_view.create_rigid_body_view(list(expected_paths))
             if view.count != self._spec.environments.count or tuple(view.prim_paths) != expected_paths:
                 raise RuntimeError(
                     f"USD rigid view for {path.value} did not preserve environment order; "
@@ -1020,6 +1201,29 @@ class IsaacLabNativeWorld:
             asset.set_joint_velocity_target_index(target=velocities[env_ids], env_ids=env_ids)
             asset.set_joint_effort_target_index(target=self._m.torch.zeros_like(positions[env_ids]), env_ids=env_ids)
             asset.reset(env_ids=env_ids)
+        for path, view in self._usd_articulation_views.items():
+            root_pose, root_velocity, positions, velocities = self._initial_usd_articulation[path]
+            indices = self._m.torch.tensor(
+                environment_indices,
+                device=positions.device,
+                dtype=self._m.torch.int64,
+            )
+            zeros = self._m.torch.zeros_like(positions[indices])
+            view.set_root_transforms(root_pose[indices], indices)
+            view.set_root_velocities(root_velocity[indices], indices)
+            view.set_dof_positions(positions[indices], indices)
+            view.set_dof_velocities(velocities[indices], indices)
+            view.set_dof_position_targets(positions[indices], indices)
+            view.set_dof_velocity_targets(zeros, indices)
+            view.set_dof_actuation_forces(zeros, indices)
+            stiffness = view.get_dof_stiffnesses().clone()
+            damping = view.get_dof_dampings().clone()
+            joint_ids = self._joint_maps[path]
+            for environment in environment_indices:
+                stiffness[environment, list(joint_ids)] = self._config.position_stiffness
+                damping[environment, list(joint_ids)] = self._config.position_damping
+            view.set_dof_stiffnesses(stiffness[indices], indices)
+            view.set_dof_dampings(damping[indices], indices)
         for path, asset in self._rigids.items():
             root_pose, root_velocity = self._initial_rigid[path]
             asset.reset(env_ids=env_ids)
@@ -1068,6 +1272,9 @@ class IsaacLabNativeWorld:
         environment_indices: tuple[int, ...],
         degree_of_freedom_indices: tuple[int, ...],
     ) -> None:
+        if path in self._usd_articulation_views:
+            self._apply_usd_articulation(path, mode, targets, environment_indices, degree_of_freedom_indices)
+            return
         asset = self._articulations[path]
         assert self._sim is not None
         env_ids = list(environment_indices)
@@ -1097,7 +1304,60 @@ class IsaacLabNativeWorld:
         )
         asset.write_data_to_sim()
 
+    def _apply_usd_articulation(
+        self,
+        path: EntityPath,
+        mode: CommandMode,
+        targets: Matrix,
+        environment_indices: tuple[int, ...],
+        degree_of_freedom_indices: tuple[int, ...],
+    ) -> None:
+        view = self._usd_articulation_views[path]
+        joint_ids = tuple(self._joint_maps[path][index] for index in degree_of_freedom_indices)
+        positions = view.get_dof_position_targets().clone()
+        velocities = view.get_dof_velocity_targets().clone()
+        efforts = view.get_dof_actuation_forces().clone()
+        stiffness = view.get_dof_stiffnesses().clone()
+        damping = view.get_dof_dampings().clone()
+        for row_index, environment in enumerate(environment_indices):
+            for column_index, joint in enumerate(joint_ids):
+                target = float(targets[row_index][column_index])
+                if mode is CommandMode.POSITION:
+                    positions[environment, joint] = target
+                    velocities[environment, joint] = 0.0
+                    efforts[environment, joint] = 0.0
+                    stiffness[environment, joint] = self._config.position_stiffness
+                    damping[environment, joint] = self._config.position_damping
+                elif mode is CommandMode.VELOCITY:
+                    velocities[environment, joint] = target
+                    efforts[environment, joint] = 0.0
+                    stiffness[environment, joint] = 0.0
+                    damping[environment, joint] = self._config.velocity_damping
+                else:
+                    efforts[environment, joint] = target
+                    stiffness[environment, joint] = 0.0
+                    damping[environment, joint] = 0.0
+        indices = self._m.torch.tensor(
+            environment_indices,
+            device=positions.device,
+            dtype=self._m.torch.int64,
+        )
+        view.set_dof_position_targets(positions[indices], indices)
+        view.set_dof_velocity_targets(velocities[indices], indices)
+        view.set_dof_actuation_forces(efforts[indices], indices)
+        view.set_dof_stiffnesses(stiffness[indices], indices)
+        view.set_dof_dampings(damping[indices], indices)
+
     def read_articulation(self, path: EntityPath) -> tuple[Matrix, Matrix]:
+        if path in self._usd_articulation_views:
+            view = self._usd_articulation_views[path]
+            joint_map = list(self._joint_maps[path])
+            positions = view.get_dof_positions()[:, joint_map].detach().cpu().tolist()
+            velocities = view.get_dof_velocities()[:, joint_map].detach().cpu().tolist()
+            return (
+                tuple(tuple(float(value) for value in row) for row in positions),
+                tuple(tuple(float(value) for value in row) for row in velocities),
+            )
         asset = self._articulations[path]
         joint_map = list(self._joint_maps[path])
         positions = asset.data.joint_pos.torch[:, joint_map].detach().cpu().tolist()
@@ -1380,7 +1640,7 @@ class IsaacLabNativeWorld:
                     asset.write_data_to_sim()
                 for asset in self._deformables.values():
                     asset.write_data_to_sim()
-                self._sim.step(render=self._config.render)
+                self._sim.step(render=self._config.render and self._config.render_on_step)
                 self._update_assets(self._native_dt)
             self._step_index += 1
             expired = tuple(
@@ -1408,6 +1668,9 @@ class IsaacLabNativeWorld:
         sim = self._sim
         self._sim = None
         self._articulations.clear()
+        self._usd_articulations.clear()
+        self._usd_articulation_views.clear()
+        self._initial_usd_articulation.clear()
         self._rigids.clear()
         self._usd_rigids.clear()
         self._usd_rigid_views.clear()

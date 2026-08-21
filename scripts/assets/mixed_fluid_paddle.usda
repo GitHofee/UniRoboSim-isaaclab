@@ -1,0 +1,57 @@
+#usda 1.0
+(
+    defaultPrim = "PaddleRig"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PaddleRig" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{
+    def Cube "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 8
+        color3f[] primvars:displayColor = [(0.12, 0.16, 0.22)]
+        double size = 1
+        float3 xformOp:scale = (0.08, 0.12, 0.34)
+        double3 xformOp:translate = (0, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Cube "paddle" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 0.35
+        color3f[] primvars:displayColor = [(0.95, 0.28, 0.06)]
+        double size = 1
+        float3 xformOp:scale = (0.6, 0.04, 0.42)
+        double3 xformOp:translate = (0.3, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def PhysicsFixedJoint "fixed_base"
+    {
+        rel physics:body1 = </PaddleRig/base>
+    }
+
+    def PhysicsRevoluteJoint "paddle_hinge" (
+        prepend apiSchemas = ["PhysicsDriveAPI:angular"]
+    )
+    {
+        float drive:angular:physics:damping = 100
+        float drive:angular:physics:maxForce = 500
+        float drive:angular:physics:stiffness = 1000
+        uniform token drive:angular:physics:type = "force"
+        uniform token physics:axis = "Z"
+        rel physics:body0 = </PaddleRig/base>
+        rel physics:body1 = </PaddleRig/paddle>
+        point3f physics:localPos0 = (0, 0, 0)
+        point3f physics:localPos1 = (-0.3, 0, 0)
+        float physics:lowerLimit = -90
+        float physics:upperLimit = 90
+    }
+}

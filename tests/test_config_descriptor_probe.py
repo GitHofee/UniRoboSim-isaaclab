@@ -40,6 +40,10 @@ def test_public_identity_and_protocol() -> None:
     assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None
     assert CAPABILITIES.get(CapabilityId("state.fluid.particles@1")) is not None
     assert CAPABILITIES.get(CapabilityId("control.fluid.particles@1")) is not None
+    fluid_state = CAPABILITIES.get(CapabilityId("state.fluid.particles@1"))
+    assert fluid_state is not None
+    assert any("raw USD/Omni Physics" in limitation for limitation in fluid_state.limitations)
+    assert any("particle reaction loads" in limitation for limitation in fluid_state.limitations)
     assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is not None
     assert CAPABILITIES.get(CapabilityId("render.browser-scene@1")) is not None
     normalization = CAPABILITIES.get(CapabilityId("asset.normalization@1"))
@@ -55,6 +59,8 @@ def test_public_identity_and_protocol() -> None:
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.rgb@1")) is not None
     assert camera_provider.descriptor.metadata["camera_anti_aliasing"] == "fxaa"
     assert camera_provider.descriptor.metadata["camera_texture_streaming"] is False
+    assert camera_provider.descriptor.metadata["render_on_step"] is True
+    assert camera_provider.descriptor.metadata["fluid_render_mode"] == "particles"
     control = CAPABILITIES.get(CapabilityId("control.deformable.points@1"))
     assert control is not None
     assert control.properties == FrozenMap(
@@ -82,7 +88,7 @@ def test_invalid_spacing(spacing: object) -> None:
         IsaacLabAdapterConfig(environment_spacing_m=spacing)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("field", ["headless", "enable_cameras", "render", "texture_streaming"])
+@pytest.mark.parametrize("field", ["headless", "enable_cameras", "render", "texture_streaming", "render_on_step"])
 def test_invalid_boolean_flags(field: str) -> None:
     values = {field: 1}
     with pytest.raises(ValidationError):
@@ -108,6 +114,10 @@ def test_render_and_experience_validation() -> None:
     for invalid in ("", "msaa", 2):
         with pytest.raises(ValidationError):
             IsaacLabAdapterConfig(anti_aliasing=invalid)  # type: ignore[arg-type]
+    assert IsaacLabAdapterConfig(fluid_render_mode="ISOSURFACE").fluid_render_mode == "isosurface"
+    for invalid in ("", "mesh", 2):
+        with pytest.raises(ValidationError):
+            IsaacLabAdapterConfig(fluid_render_mode=invalid)  # type: ignore[arg-type]
 
 
 def test_probe_cpu_success_and_version_failures() -> None:
