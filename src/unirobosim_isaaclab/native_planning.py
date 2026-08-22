@@ -1029,7 +1029,7 @@ class _PlanningAdmission:
         for prim in self._walk(root):
             prims_by_name.setdefault(prim.GetName(), []).append(prim)
         for declaration in declarations.entries:
-            frame_id = _stable_id("frame.named", spec.path.value, declaration.semantic_key)
+            frame_id = _stable_id("frame.named", spec.path.value, declaration.name)
             source = declaration.source
             if source.kind is PlanningFrameSourceKind.LINK:
                 if source.name not in link_id_by_name:
@@ -1082,8 +1082,7 @@ class _PlanningAdmission:
                         parent_frame,
                         entity_id,
                         owner_link_id,
-                        declaration.role,
-                        declaration.semantic_key,
+                        declaration.name,
                     )
                 )
                 self._frames[frame_id] = _FrameBinding(
@@ -1101,8 +1100,7 @@ class _PlanningAdmission:
                     link_frame_by_name[owner_name],
                     entity_id,
                     link_id_by_name[owner_name],
-                    declaration.role,
-                    declaration.semantic_key,
+                    declaration.name,
                 )
             )
             self._frames[frame_id] = binding

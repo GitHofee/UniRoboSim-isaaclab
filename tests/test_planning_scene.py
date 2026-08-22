@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 from unirobosim import (
+    PLANNING_FRAME_DECLARATIONS_SCHEMA_VERSION,
     PLANNING_SYSTEM_ENTITY_PATH,
     ArrayValue,
     BoxGeometrySpec,
@@ -22,6 +23,7 @@ from unirobosim import (
     EnvironmentSpec,
     FrozenMap,
     PlanningEntityKind,
+    PlanningFrameKind,
     PlanningGeometryRepresentation,
     PlanningGeometryResourceRevokedError,
     PlanningSceneContractError,
@@ -70,6 +72,7 @@ class _PlanningFixture:
 def _make_planning_fixture(tmp_path: Path) -> _PlanningFixture:
     asset = tmp_path / "planning.usda"
     asset.write_text("#usda 1.0\n", encoding="utf-8")
+    asset_sha256 = hashlib.sha256(asset.read_bytes()).hexdigest()
     spec = WorldSpec(
         "isaaclab-planning-test",
         (
@@ -85,7 +88,22 @@ def _make_planning_fixture(tmp_path: Path) -> _PlanningFixture:
                 joint_names=("shoulder", "elbow"),
                 initial_joint_positions=(0.1, -0.2),
                 asset_uri=str(asset),
-                metadata=FrozenMap({"planning_entity_kind": "robot"}),
+                metadata=FrozenMap(
+                    {
+                        "planning_entity_kind": "robot",
+                        "planning_frame_declarations": {
+                            "schema": PLANNING_FRAME_DECLARATIONS_SCHEMA_VERSION,
+                            "component_sha256": asset_sha256,
+                            "entries": (
+                                {
+                                    "name": "wrist_mount",
+                                    "owner_link": "elbow child",
+                                    "source": {"kind": "link", "name": "elbow child"},
+                                },
+                            ),
+                        },
+                    }
+                ),
             ),
             EntitySpec(
                 EntityPath("/fixtures/door"),
@@ -234,6 +252,16 @@ def test_planning_demand_selects_only_public_subtype_and_validates_graph(tmp_pat
         robot_state = next(item for item in state.articulations if item.entity_id == robot.entity_id)
         assert robot_state.joint_ids == robot.joint_ids
         assert len(robot_state.positions) == len(robot_state.velocities) == len(robot_state.position_units) == 2
+        named = next(
+            item
+            for item in catalog.frames
+            if item.owner_entity_id == robot.entity_id and item.kind is PlanningFrameKind.NAMED
+        )
+        assert named.name == "wrist_mount"
+        assert named.owner_link_id is not None
+        assert named.parent_frame_id == next(
+            item.frame_id for item in catalog.links if item.link_id == named.owner_link_id
+        )
     finally:
         session.close()
 
