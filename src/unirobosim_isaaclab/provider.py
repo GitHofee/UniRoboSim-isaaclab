@@ -5,12 +5,14 @@ from __future__ import annotations
 import itertools
 from collections.abc import Callable, Iterable
 from types import TracebackType
+from typing import cast
 
 from unirobosim import (
     CapabilityNegotiationError,
     CapabilityRequirement,
     LifecycleError,
     NegotiationReport,
+    PlanningSceneIncompleteError,
     ProbeReport,
     ProviderDescriptor,
     ProviderSelectionError,
@@ -23,13 +25,23 @@ from unirobosim import (
 
 from .config import IsaacLabAdapterConfig
 from .descriptor import descriptor_for_config
-from .native_protocols import NativeRuntime
+from .native_protocols import NativePlanningError, NativePlanningWorldDriver, NativeRuntime
+from .planning_scene import IsaacLabPlanningWorld, planning_scene_demanded, validate_planning_build_spec
 from .probe import probe_environment
 from .world import IsaacLabWorld
 
 RuntimeFactory = Callable[[IsaacLabAdapterConfig], NativeRuntime]
 ProbeFunction = Callable[[IsaacLabAdapterConfig, ProviderDescriptor], ProbeReport]
 _SESSION_IDS = itertools.count(1)
+
+
+def _scrub_exception(error: BaseException) -> None:
+    try:
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+    except BaseException:
+        pass
 
 
 def _default_runtime_factory(config: IsaacLabAdapterConfig) -> NativeRuntime:
@@ -156,20 +168,60 @@ class IsaacLabSession:
                 details={"negotiation": negotiation.to_dict()},
             )
         IsaacLabWorld.validate_build_spec(spec, backend_id=self.descriptor.provider_id)
+        planning_demanded = planning_scene_demanded(spec)
+        if planning_demanded:
+            validate_planning_build_spec(spec, backend_id=self.descriptor.provider_id)
+        planning_admission_failed = False
+        native_world = None
         try:
             native_world = self._native.build_world(spec)
-        except UniRoboSimError:
-            raise
-        except Exception as exc:
+        except NativePlanningError as caught:
+            _scrub_exception(caught)
+            planning_admission_failed = True
+        except UniRoboSimError as caught:
+            if planning_demanded:
+                _scrub_exception(caught)
+                planning_admission_failed = True
+            else:
+                raise
+        except Exception as caught:
+            if planning_demanded:
+                _scrub_exception(caught)
+                planning_admission_failed = True
+            else:
+                raise WorldBuildError(
+                    "Isaac Lab world build failed",
+                    operation="session.build",
+                    backend_id=self.descriptor.provider_id,
+                    world_id=spec.world_id,
+                    cause=caught,
+                ) from caught
+        if planning_admission_failed:
+            raise PlanningSceneIncompleteError(
+                "Isaac Lab planning admission failed",
+                operation="planning_scene.preflight",
+                backend_id=self.descriptor.provider_id,
+                world_id=spec.world_id,
+            ) from None
+        if native_world is None:
             raise WorldBuildError(
-                "Isaac Lab world build failed",
+                "Isaac Lab world build produced no native world",
                 operation="session.build",
                 backend_id=self.descriptor.provider_id,
                 world_id=spec.world_id,
-                cause=exc,
-            ) from exc
-        self._generation += 1
-        world = IsaacLabWorld(self, spec, self._generation, native_world)
+            ) from None
+        generation = self._generation + 1
+        world: IsaacLabWorld
+        if planning_demanded:
+            world = IsaacLabPlanningWorld(
+                self,
+                spec,
+                generation,
+                cast(NativePlanningWorldDriver, native_world),
+            )
+        else:
+            world = IsaacLabWorld(self, spec, generation, native_world)
+        self._generation = generation
         self._active_world = world
         self._state = SessionState.READY
         return world

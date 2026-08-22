@@ -450,7 +450,7 @@ class IsaacLabNativeRuntime:
         if debug_python_root not in isaacsim.__path__:
             isaacsim.__path__.append(debug_python_root)
         from isaacsim.util.debug_draw import _debug_draw  # type: ignore[import-not-found]
-        from pxr import PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade, Vt  # type: ignore[import-not-found]
+        from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, Vt  # type: ignore[import-not-found]
 
         self._modules = SimpleNamespace(
             Articulation=Articulation,
@@ -473,6 +473,8 @@ class IsaacLabNativeRuntime:
             sim_utils=sim_utils,
             physics_tensors=physics_tensors,
             torch=torch,
+            Gf=Gf,
+            Usd=Usd,
             UsdGeom=UsdGeom,
             UsdPhysics=UsdPhysics,
             UsdShade=UsdShade,
@@ -491,7 +493,17 @@ class IsaacLabNativeRuntime:
             raise RuntimeError("native runtime already owns a world")
         world: IsaacLabNativeWorld | None = None
         try:
-            world = IsaacLabNativeWorld(self, spec, self._config, self._modules)
+            planning_demanded = any(
+                requirement.capability.value == "planning.scene@2" for requirement in spec.requirements
+            )
+            world_type: type[IsaacLabNativeWorld]
+            if planning_demanded:
+                from .native_planning import IsaacLabNativePlanningWorld
+
+                world_type = IsaacLabNativePlanningWorld
+            else:
+                world_type = IsaacLabNativeWorld
+            world = world_type(self, spec, self._config, self._modules)
         except Exception:
             if world is not None:
                 world.close()

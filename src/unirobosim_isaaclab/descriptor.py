@@ -161,6 +161,30 @@ CAPABILITIES = CapabilitySet(
             ),
             limitations=("browser visuals are portable proxies rather than streamed USD geometry",),
         ),
+        CapabilityDeclaration(
+            CapabilityId("planning.scene@2"),
+            FrozenMap(
+                {
+                    "authority_thread": "synchronous",
+                    "axis_convention": "right_handed_z_up",
+                    "collision_authority": "composed-usd-and-physx-effective",
+                    "geometry_read_limit_bytes": 64 * 1024 * 1024,
+                    "representation_fallback": False,
+                    "resource_layout": "catalog-pinned-v1",
+                    "single_representation_per_geometry": True,
+                }
+            ),
+            limitations=(
+                "the first admitted profile includes only rigid objects and articulations plus the provider ground",
+                "inline cube and sphere colliders and proven PhysX convexHull meshes are supported; any other "
+                "effective collider fails planning admission",
+                "collision groups, non-default filtering, authored collision margins, and persistent cross-entity "
+                "constraints fail planning admission",
+                "named frames are exposed only from locked planning-frame declarations",
+                "planning asset provenance currently requires a local file-backed asset or a procedural primitive",
+                "camera entities may coexist with planning but are not physical planning-scene entities",
+            ),
+        ),
     )
 )
 

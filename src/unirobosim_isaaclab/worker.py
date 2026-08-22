@@ -20,6 +20,11 @@ from unirobosim import CommandMode, DebugBatch, EntityPath, PointCommandMode, Wo
 from .config import IsaacLabAdapterConfig
 from .native_protocols import (
     Matrix,
+    NativePlanningCatalog,
+    NativePlanningError,
+    NativePlanningResource,
+    NativePlanningState,
+    NativePlanningWorldDriver,
     NativeRuntime,
     NativeSensorSample,
     NativeWorldDriver,
@@ -27,6 +32,7 @@ from .native_protocols import (
     Quaternion,
     Vector3,
 )
+from .planning_scene import planning_scene_demanded
 
 _CALL_TIMEOUT_SECONDS = 300.0
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
@@ -92,6 +98,19 @@ def _error_reply(exc: Exception) -> Reply:
             "traceback": traceback.format_exc(),
         },
     )
+
+
+def _planning_error_reply(exc: BaseException) -> Reply:
+    """Return the only failure envelope allowed across the planning IPC seam."""
+
+    code = exc.code if isinstance(exc, NativePlanningError) else "native_failure"
+    try:
+        exc.__traceback__ = None
+        exc.__cause__ = None
+        exc.__context__ = None
+    except BaseException:
+        pass
+    return "planning_error", {"code": code}
 
 
 def _require_world(world: NativeWorldDriver | None, operation: str) -> NativeWorldDriver:
@@ -175,6 +194,15 @@ def _dispatch(
         return active, active.read_particle_fluid(cast(EntityPath, args[0])), False
     if operation == "read_sensor":
         return active, active.read_sensor(cast(EntityPath, args[0])), False
+    if operation == "planning_catalog":
+        planning = cast(NativePlanningWorldDriver, active)
+        return active, planning.planning_catalog(cast(int, args[0])), False
+    if operation == "planning_state":
+        planning = cast(NativePlanningWorldDriver, active)
+        return active, planning.planning_state(cast(int, args[0])), False
+    if operation == "planning_resource":
+        planning = cast(NativePlanningWorldDriver, active)
+        return active, planning.planning_resource(cast(str, args[0]), cast(int, args[1])), False
     if operation == "publish_debug":
         return active, active.publish_debug(cast(DebugBatch, args[0])), False
     if operation == "clear_debug":
@@ -228,7 +256,17 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
             try:
                 world, payload, should_stop = _dispatch(runtime, world, request)
             except Exception as exc:
-                connection.send(_error_reply(exc))
+                operation, args = request
+                demanded_build = (
+                    operation == "build_world"
+                    and bool(args)
+                    and isinstance(args[0], WorldSpec)
+                    and planning_scene_demanded(args[0])
+                )
+                if operation.startswith("planning_") or demanded_build or isinstance(exc, NativePlanningError):
+                    connection.send(_planning_error_reply(exc))
+                else:
+                    connection.send(_error_reply(exc))
                 continue
             connection.send(("ok", payload))
             if should_stop:
@@ -369,6 +407,8 @@ class IsaacLabWorkerRuntime:
         status, payload = reply
         if status == "ok":
             return payload
+        if status == "planning_error" and isinstance(payload, dict):
+            raise NativePlanningError(cast(str, payload.get("code", "native_failure"))) from None
         if status != "error" or not isinstance(payload, dict):
             raise NativeWorkerError(f"invalid native worker reply during {operation}: {reply!r}")
         remote_type = payload.get("type", "Exception")
@@ -393,7 +433,7 @@ class IsaacLabWorkerRuntime:
         if self._active_world is not None and not self._active_world.closed:
             raise NativeWorkerError("native worker already owns a world")
         self._request("build_world", spec)
-        world = IsaacLabWorkerWorld(self)
+        world = IsaacLabWorkerPlanningWorld(self) if planning_scene_demanded(spec) else IsaacLabWorkerWorld(self)
         self._active_world = world
         return world
 
@@ -590,3 +630,22 @@ class IsaacLabWorkerWorld:
         finally:
             self._mark_closed()
             self._runtime._world_closed(self)
+
+
+class IsaacLabWorkerPlanningWorld(IsaacLabWorkerWorld):
+    """Planning-only native proxy; ordinary worker worlds have no such methods."""
+
+    def planning_catalog(self, environment_index: int = 0) -> NativePlanningCatalog:
+        self._ensure_open("planning_catalog")
+        return cast(NativePlanningCatalog, self._runtime._request("planning_catalog", environment_index))
+
+    def planning_state(self, environment_index: int = 0) -> NativePlanningState:
+        self._ensure_open("planning_state")
+        return cast(NativePlanningState, self._runtime._request("planning_state", environment_index))
+
+    def planning_resource(self, geometry_id: str, environment_index: int = 0) -> NativePlanningResource:
+        self._ensure_open("planning_resource")
+        return cast(
+            NativePlanningResource,
+            self._runtime._request("planning_resource", geometry_id, environment_index),
+        )

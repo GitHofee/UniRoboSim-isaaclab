@@ -25,12 +25,16 @@ from unirobosim import (
 
 from unirobosim_isaaclab import worker as worker_module
 from unirobosim_isaaclab.config import IsaacLabAdapterConfig
+from unirobosim_isaaclab.native_protocols import NativePlanningError
 from unirobosim_isaaclab.worker import (
+    IsaacLabWorkerPlanningWorld,
     IsaacLabWorkerRuntime,
+    IsaacLabWorkerWorld,
     NativeWorkerError,
     WorkerFactory,
     _dispatch,
     _error_reply,
+    _planning_error_reply,
     _proc_stat_session,
     _session_member_pids,
     _SubprocessHandle,
@@ -38,6 +42,7 @@ from unirobosim_isaaclab.worker import (
 )
 
 from .helpers import FakeNativeRuntime, FakeNativeWorld, make_articulation_asset, make_world
+from .test_planning_scene import _make_planning_fixture
 
 
 def extended_world(asset: Path) -> WorldSpec:
@@ -269,6 +274,17 @@ def test_error_reply_preserves_remote_diagnostics() -> None:
     assert issubclass(NativeWorkerError, RuntimeError)
 
 
+def test_planning_error_reply_is_bounded_and_contains_no_native_diagnostics() -> None:
+    status, payload = _planning_error_reply(RuntimeError("private native traceback detail"))
+    assert status == "planning_error"
+    assert payload == {"code": "native_failure"}
+    assert "private" not in repr((status, payload))
+
+    status, payload = _planning_error_reply(NativePlanningError("frame_missing"))
+    assert status == "planning_error"
+    assert payload == {"code": "frame_missing"}
+
+
 def test_proc_stat_session_parser_handles_spaces_and_invalid_input() -> None:
     assert _proc_stat_session("447389 (omni telemetry) S 1 447389 447342 0 -1") == 447342
     assert _proc_stat_session("invalid") is None
@@ -334,6 +350,9 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
     spec = extended_world(make_articulation_asset(tmp_path / "robot.usda"))
     world = runtime.build_world(spec)
+    assert type(world) is IsaacLabWorkerWorld
+    assert not isinstance(world, IsaacLabWorkerPlanningWorld)
+    assert "planning_catalog" not in dir(world)
     with pytest.raises(NativeWorkerError, match="already owns"):
         runtime.build_world(spec)
 
@@ -395,6 +414,58 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         "close_world",
         "close_runtime",
     ]
+
+
+def test_worker_planning_proxy_is_demand_only_and_complete(tmp_path: Path) -> None:
+    fixture = _make_planning_fixture(tmp_path)
+    resource = next(iter(fixture.resources.values()))
+    factory, connection, process = fake_worker_factory(
+        [
+            ("ok", None),
+            ("ok", None),
+            ("ok", fixture.catalog),
+            ("ok", fixture.state),
+            ("ok", resource),
+            ("ok", None),
+            ("ok", None),
+        ]
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    world = runtime.build_world(fixture.spec)
+    assert type(world) is IsaacLabWorkerPlanningWorld
+    assert world.planning_catalog() == fixture.catalog
+    assert world.planning_state() == fixture.state
+    assert world.planning_resource(resource.geometry_id) == resource
+    world.close()
+    runtime.close()
+    assert connection.closed and not process.alive
+    operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
+    assert operations == [
+        "build_world",
+        "planning_catalog",
+        "planning_state",
+        "planning_resource",
+        "close_world",
+        "close_runtime",
+    ]
+
+
+def test_worker_planning_failure_maps_only_bounded_code(tmp_path: Path) -> None:
+    fixture = _make_planning_fixture(tmp_path)
+    factory, connection, _ = fake_worker_factory(
+        [
+            ("ok", None),
+            ("planning_error", {"code": "frame_missing", "message": "must be ignored"}),
+            ("ok", None),
+        ]
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    with pytest.raises(NativePlanningError) as caught:
+        runtime.build_world(fixture.spec)
+    assert caught.value.code == "frame_missing"
+    assert "must be ignored" not in str(caught.value)
+    runtime.close()
+    assert [cast(tuple[Any, ...], request)[0] for request in connection.sent] == ["build_world", "close_runtime"]
 
 
 @pytest.mark.parametrize(

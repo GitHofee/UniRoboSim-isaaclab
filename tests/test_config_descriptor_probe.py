@@ -46,6 +46,12 @@ def test_public_identity_and_protocol() -> None:
     assert any("particle reaction loads" in limitation for limitation in fluid_state.limitations)
     assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is not None
     assert CAPABILITIES.get(CapabilityId("render.browser-scene@1")) is not None
+    planning = CAPABILITIES.get(CapabilityId("planning.scene@2"))
+    assert planning is not None
+    assert planning.properties["collision_authority"] == "composed-usd-and-physx-effective"
+    assert planning.properties["geometry_read_limit_bytes"] == 64 * 1024 * 1024
+    assert planning.properties["representation_fallback"] is False
+    assert planning.properties["single_representation_per_geometry"] is True
     normalization = CAPABILITIES.get(CapabilityId("asset.normalization@1"))
     assert normalization is not None
     assert normalization.properties["rigid_body"] == FrozenMap(
