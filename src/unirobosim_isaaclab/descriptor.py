@@ -8,6 +8,8 @@ from unirobosim import (
     ProviderDescriptor,
 )
 
+from ._version import DISTRIBUTION_VERSION
+
 CAPABILITIES = CapabilitySet(
     (
         CapabilityDeclaration(
@@ -207,7 +209,7 @@ CAMERA_CAPABILITIES = (
 DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
-    version="0.7.0",
+    version=DISTRIBUTION_VERSION,
     contract_version="v0alpha4",
     capabilities=CAPABILITIES,
     metadata=FrozenMap(

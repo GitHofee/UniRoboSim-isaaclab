@@ -19,6 +19,13 @@ classifiers = [
 ]
 dependencies = ["unirobosim>=0.7.1,<0.8"]
 
+[project.optional-dependencies]
+dev = [
+  "mypy==1.20.2",
+  "pytest==8.4.2",
+  "ruff==0.16.3",
+]
+
 [project.entry-points."unirobosim.backends"]
 isaaclab = "unirobosim_isaaclab:create_easy_provider"
 

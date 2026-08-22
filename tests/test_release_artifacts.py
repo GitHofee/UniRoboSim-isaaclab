@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gzip
 import io
+import stat
 import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 
 import build_backend
@@ -34,6 +36,15 @@ def _write_nondeterministic_sdist(path: Path, *, timestamp: int) -> None:
                 archive.addfile(member, io.BytesIO(payload))
 
 
+def _write_wheel_with_mode(path: Path, mode: int) -> None:
+    payload = b"portable wheel payload\n"
+    with zipfile.ZipFile(path, "w") as archive:
+        member = zipfile.ZipInfo("unirobosim_isaaclab/example.py")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | mode) << 16
+        archive.writestr(member, payload)
+
+
 def test_sdist_rewriter_normalizes_gzip_and_tar_metadata(tmp_path: Path) -> None:
     first = tmp_path / "first.tar.gz"
     second = tmp_path / "second.tar.gz"
@@ -49,6 +60,18 @@ def test_sdist_rewriter_normalizes_gzip_and_tar_metadata(tmp_path: Path) -> None
         members = archive.getmembers()
         assert all(member.mtime == epoch for member in members)
         assert all((member.uid, member.gid, member.uname, member.gname) == (0, 0, "", "") for member in members)
+        assert [member.mode for member in members] == [0o755, 0o644]
+
+    first_wheel = tmp_path / "first.whl"
+    second_wheel = tmp_path / "second.whl"
+    _write_wheel_with_mode(first_wheel, 0o664)
+    _write_wheel_with_mode(second_wheel, 0o644)
+    assert first_wheel.read_bytes() != second_wheel.read_bytes()
+    build_backend._rewrite_wheel(first_wheel)
+    build_backend._rewrite_wheel(second_wheel)
+    assert first_wheel.read_bytes() == second_wheel.read_bytes()
+    with zipfile.ZipFile(first_wheel) as archive:
+        assert archive.getinfo("unirobosim_isaaclab/example.py").external_attr >> 16 == stat.S_IFREG | 0o644
 
 
 def test_source_distribution_manifest_includes_complete_test_support() -> None:
@@ -66,5 +89,10 @@ def test_release_metadata_requires_the_matching_core_contract() -> None:
         project_file = tomllib.load(stream)
     assert project_file["project"]["version"] == "0.7.1"
     assert project_file["project"]["dependencies"] == ["unirobosim>=0.7.1,<0.8"]
+    assert project_file["project"]["optional-dependencies"]["dev"] == [
+        "mypy==1.20.2",
+        "pytest==8.4.2",
+        "ruff==0.16.3",
+    ]
     assert project_file["build-system"]["build-backend"] == "build_backend"
     assert project_file["build-system"]["backend-path"] == ["."]

@@ -1,11 +1,13 @@
-"""Setuptools hooks with deterministic source-distribution metadata."""
+"""Setuptools hooks with deterministic wheel and source-distribution metadata."""
 
 from __future__ import annotations
 
 import gzip
 import os
+import stat
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -47,7 +49,9 @@ def build_wheel(
     config_settings: dict[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
-    return cast(str, _backend().build_wheel(wheel_directory, config_settings, metadata_directory))
+    filename = cast(str, _backend().build_wheel(wheel_directory, config_settings, metadata_directory))
+    _rewrite_wheel(Path(wheel_directory, filename))
+    return filename
 
 
 def build_editable(
@@ -67,6 +71,51 @@ def _source_date_epoch() -> int:
     if not 0 <= value <= 0xFFFFFFFF:
         raise RuntimeError("SOURCE_DATE_EPOCH is outside the gzip timestamp range")
     return value
+
+
+def _normalized_permissions(mode: int, *, is_directory: bool, is_link: bool = False) -> int:
+    if is_link:
+        return 0o777
+    if is_directory:
+        return 0o755
+    return 0o755 if mode & 0o111 else 0o644
+
+
+def _rewrite_wheel(path: Path) -> None:
+    members: list[tuple[zipfile.ZipInfo, bytes]] = []
+    with zipfile.ZipFile(path, "r") as source:
+        archive_comment = source.comment
+        for member in source.infolist():
+            members.append((member, source.read(member)))
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with zipfile.ZipFile(temporary, "w", allowZip64=True) as archive:
+            archive.comment = archive_comment
+            for member, payload in members:
+                original_mode = member.external_attr >> 16
+                file_type = stat.S_IFMT(original_mode)
+                is_directory = member.is_dir()
+                is_link = file_type == stat.S_IFLNK
+                if is_directory:
+                    file_type = stat.S_IFDIR
+                elif not is_link:
+                    file_type = stat.S_IFREG
+                permissions = _normalized_permissions(
+                    original_mode,
+                    is_directory=is_directory,
+                    is_link=is_link,
+                )
+                member.create_system = 3
+                member.external_attr = (file_type | permissions) << 16
+                if is_directory:
+                    member.external_attr |= 0x10
+                archive.writestr(member, payload, compress_type=member.compress_type, compresslevel=9)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _rewrite_sdist(path: Path, epoch: int) -> None:
@@ -91,6 +140,11 @@ def _rewrite_sdist(path: Path, epoch: int) -> None:
                         member.gname = ""
                         member.mtime = epoch
                         member.pax_headers = {}
+                        member.mode = _normalized_permissions(
+                            member.mode,
+                            is_directory=member.isdir(),
+                            is_link=member.issym() or member.islnk(),
+                        )
                         archive.addfile(member, None if payload is None else _BytesReader(payload))
         os.replace(temporary, path)
     finally:

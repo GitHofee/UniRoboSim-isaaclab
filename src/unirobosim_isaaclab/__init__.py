@@ -1,12 +1,13 @@
 """Public lightweight entry point for the Isaac Lab adapter."""
 
+from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
 from .descriptor import CAMERA_CAPABILITIES, CAPABILITIES, DESCRIPTOR, descriptor_for_config
 from .probe import probe_environment
 from .provider import IsaacLabProvider, IsaacLabSession
 from .world import IsaacLabWorld
 
-__version__ = "0.7.0"
+__version__ = DISTRIBUTION_VERSION
 
 
 def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProvider:
@@ -23,6 +24,7 @@ __all__ = [
     "CAPABILITIES",
     "CAMERA_CAPABILITIES",
     "DESCRIPTOR",
+    "DISTRIBUTION_VERSION",
     "IsaacLabAdapterConfig",
     "IsaacLabProvider",
     "IsaacLabSession",
