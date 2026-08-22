@@ -9,7 +9,7 @@
 | 项目 | 已验证版本 |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.7.0,<0.8` |
+| UniRoboSim | `>=0.7.1,<0.8` |
 | Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
@@ -107,6 +107,10 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 此 Isaac Sim profile 的粒子状态通过 PhysX/USD 读取，而不是公开粒子 Tensor API。刚体 + 流体 + 相机 + Debug 已完成混合验证。桥接刚体的接触力，以及粒子流体与 Tensor 铰接体/柔性体同场景组合，会明确失败，不返回误导性结果。
 
+## Planning Scene 兼容性
+
+Adapter 0.7.1 要求 UniRoboSim Core 0.7.1，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
+
 ## 验证
 
 ```bash
@@ -118,7 +122,7 @@ pytest -q
 python scripts/native_conformance.py --output result.json
 ```
 
-0.7.0 wheel 已通过 82 项 Adapter 测试和 RTX 5090 原生验收，覆盖刚体/接触、表面/体积柔性体、非机器人铰接体、粒子流体、RGB/深度、Native Debug、Provider 重启以及 MCP 所有会话的纯净解释器启动。
+0.7.1 release 的源码与安装制品通过 102 项 Adapter 测试。原生验收覆盖刚体/接触、表面/体积柔性体、机器人与非机器人铰接体、粒子流体、RGB/深度、Native Debug、Provider 重启、planning-scene catalog/state/delta/resource 读取、多环境以及纯净解释器启动。
 
 ## 仓库关系
 

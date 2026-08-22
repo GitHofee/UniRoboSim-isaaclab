@@ -9,7 +9,7 @@
 | Item | Verified version |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.7.0,<0.8` |
+| UniRoboSim | `>=0.7.1,<0.8` |
 | Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
@@ -107,6 +107,10 @@ The EasyAPI profile defaults to FXAA and disables texture streaming so camera se
 
 In this Isaac Sim profile, particle state is read through PhysX/USD rather than a public particle tensor API. Rigid + fluid + camera + debug is verified together. Contact-force readback for bridged rigid bodies, and a same-world mix of particle fluid with tensor-backed articulations or deformables, fail explicitly instead of returning misleading data.
 
+## Planning-scene compatibility
+
+Adapter 0.7.1 requires UniRoboSim Core 0.7.1 and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
+
 ## Verification
 
 ```bash
@@ -118,7 +122,7 @@ pytest -q
 python scripts/native_conformance.py --output result.json
 ```
 
-The 0.7.0 wheel passed 82 adapter tests and real RTX 5090 native conformance for rigid/contact, surface/volume deformables, non-robot articulations, particle fluid, RGB/depth, native debug, provider reopen, and MCP-owned clean-interpreter startup.
+The 0.7.1 release source and installed artifacts pass 102 adapter tests. The native acceptance matrix covers rigid/contact, surface/volume deformables, robot and non-robot articulations, particle fluid, RGB/depth, native debug, provider reopen, planning-scene catalog/state/delta/resource reads, multiple environments, and clean-interpreter startup.
 
 ## Repository relationship
 
