@@ -521,6 +521,7 @@ def _acceptance_world_spec(
 def _entry_point(provider: IsaacLabProvider) -> object:
     return SimpleNamespace(
         name="isaaclab",
+        group="unirobosim.backends",
         value="unirobosim_isaaclab:create_easy_provider",
         dist=SimpleNamespace(name="unirobosim-isaaclab", version=DISTRIBUTION_VERSION),
         load=lambda: lambda: provider,

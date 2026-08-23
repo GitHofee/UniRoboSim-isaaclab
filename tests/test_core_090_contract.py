@@ -228,6 +228,65 @@ def test_droid_acceptance_world_pins_cross_backend_zero_gravity() -> None:
     assert effective.physics.time_step_seconds == 1.0 / 240.0
 
 
+def test_droid_acceptance_entry_point_closes_metadata_and_factory() -> None:
+    provider = object()
+    entry_point = droid_acceptance._entry_point(provider)
+    assert entry_point.name == "isaaclab"
+    assert entry_point.group == "unirobosim.backends"
+    assert entry_point.value == "unirobosim_isaaclab:create_easy_provider"
+    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.9.3")
+    factory = entry_point.load()
+    assert callable(factory)
+    assert factory() is provider
+
+
+def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None:
+    adapter_module = pytest.importorskip(
+        "fastsim.integrations.unirobosim.adapter",
+        reason="FastSim is an acceptance-only integration dependency",
+        exc_type=ImportError,
+    )
+    aliases_module = pytest.importorskip("fastsim.integrations.unirobosim.aliases", exc_type=ImportError)
+    projection_module = pytest.importorskip("fastsim.integrations.unirobosim.projection", exc_type=ImportError)
+    provider = object()
+    entry_point = droid_acceptance._entry_point(provider)
+    world = WorldSpec(
+        "entry-point-discovery",
+        (
+            EntitySpec(
+                EntityPath("/fixture"),
+                EntityKind.RIGID_BODY,
+                box=BoxGeometrySpec((0.1, 0.1, 0.1), 0.1),
+            ),
+        ),
+    )
+    projection = projection_module.UniRoboSimProjection(
+        plan_digest="a" * 64,
+        plan_content_digest="a" * 64,
+        backend=aliases_module.backend_alias("isaaclab"),
+        world_spec=world,
+        build_input=None,
+        entities=(),
+        articulations=(),
+        default_entity_id=None,
+        physics_dt_seconds=1.0 / 60.0,
+        control_hz=60.0,
+        rate_policy="exact",
+        initial_generation_seed=1,
+        planning_reads_demanded=False,
+    )
+    adapter = adapter_module._UniRoboSimAdapter(projection, entry_points=lambda: (entry_point,))
+    assert adapter._select_entry_point() is entry_point
+    assert adapter.diagnostics["selected_entry_point"] == {
+        "name": "isaaclab",
+        "group": "unirobosim.backends",
+        "value": "unirobosim_isaaclab:create_easy_provider",
+        "distribution": "unirobosim-isaaclab",
+        "version": "0.9.3",
+    }
+    assert entry_point.load()() is provider
+
+
 def test_droid_effective_camera_metadata_is_derived_from_native_calibration() -> None:
     eye = (2.2, -2.2, 1.6)
     look_at = (0.0, 0.0, 0.65)
