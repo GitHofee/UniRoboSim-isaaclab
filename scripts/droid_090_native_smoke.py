@@ -28,6 +28,7 @@ from unirobosim import (
 )
 
 from unirobosim_isaaclab import IsaacLabAdapterConfig, IsaacLabProvider
+from unirobosim_isaaclab._droid_asset import DROID_ASSET_ENV, resolve_droid_asset_path
 
 ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
 GRIPPER_JOINTS = (
@@ -210,16 +211,17 @@ def main() -> int:
     parser.add_argument(
         "--asset",
         type=Path,
-        default=Path("/home/ubuntu/projects/gen_data/data/robots/droid/droid.usd"),
+        help=f"DROID USD path; when omitted, read {DROID_ASSET_ENV}.",
     )
     parser.add_argument("--without-planning", action="store_true")
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=180)
     args = parser.parse_args()
+    asset = resolve_droid_asset_path(args.asset)
     print(
         json.dumps(
             run(
-                args.asset.resolve(),
+                asset,
                 planning=not args.without_planning,
                 width=args.width,
                 height=args.height,

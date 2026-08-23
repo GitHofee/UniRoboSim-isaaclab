@@ -9,7 +9,7 @@ version = "0.9.3"
 description = "Isaac Lab 3.0 and Isaac Sim 6.0 adapter for UniRoboSim"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-authors = [{name = "UniRoboSim Contributors"}]
+authors = [{name = "Hofee", email = "lexhofee@gmail.com"}]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",

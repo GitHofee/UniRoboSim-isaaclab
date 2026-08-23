@@ -37,11 +37,11 @@ from unirobosim import (
     WorldSpec,
 )
 
+from ._droid_asset import resolve_droid_asset_path
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
 from .provider import IsaacLabProvider
 
-_ASSET = Path("/home/ubuntu/projects/gen_data/data/robots/droid/droid.usd")
 _ASSET_SHA256 = "50265df8344bca0677dc76ffe3d08fe427bd69ab588213328c2973d86351d71c"
 _ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
 _GRIPPER_JOINTS = (
@@ -310,7 +310,7 @@ def _look_at_xyzw(
     return cast(tuple[float, float, float, float], _normalize(result))
 
 
-def _compile_plan(spec: Mapping[str, object], output_dir: Path) -> object:
+def _compile_plan(spec: Mapping[str, object], output_dir: Path, asset_path: Path) -> object:
     config = import_module("fastsim.config")
     assets = import_module("fastsim.assets")
     robot = _mapping(spec.get("robot"), "acceptance robot")
@@ -331,7 +331,7 @@ def _compile_plan(spec: Mapping[str, object], output_dir: Path) -> object:
                 "isaaclab": {
                     "resources": {
                         "model": {
-                            "uri": str(_ASSET),
+                            "uri": str(asset_path),
                             "sha256": _ASSET_SHA256,
                             "role": "simulation",
                             "format": "model/vnd.usd",
@@ -347,7 +347,7 @@ def _compile_plan(spec: Mapping[str, object], output_dir: Path) -> object:
     cache_dir = output_dir / ".fastsim-resource-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     resolver = assets.ResourceResolver(
-        trusted_roots=[_ASSET.parent],
+        trusted_roots=[asset_path.parent],
         cache_dir=cache_dir,
         offline=True,
     )
@@ -403,7 +403,7 @@ def _compile_plan(spec: Mapping[str, object], output_dir: Path) -> object:
     return compiled.execution_plan
 
 
-def _enriched_projection(plan: object, spec: Mapping[str, object]) -> Any:
+def _enriched_projection(plan: object, spec: Mapping[str, object], asset_sha256: str) -> Any:
     projection_module = import_module("fastsim.integrations.unirobosim.projection")
     projection = projection_module.project_execution_plan(plan)
     if len(projection.articulations) != 1 or len(projection.world_spec.entities) != 1:
@@ -418,7 +418,7 @@ def _enriched_projection(plan: object, spec: Mapping[str, object]) -> Any:
             "planning_entity_kind": "robot",
             "planning_frame_declarations": {
                 "schema": PLANNING_FRAME_DECLARATIONS_SCHEMA_VERSION,
-                "component_sha256": _ASSET_SHA256,
+                "component_sha256": asset_sha256,
                 "entries": (
                     {
                         "name": "gripper_center",
@@ -933,8 +933,14 @@ def create_backend_run(
     output_dir: str | Path,
     *,
     visible_window: bool = False,
+    asset_path: str | os.PathLike[str] | None = None,
 ) -> DroidAcceptanceBackendRun:
-    """Create the unprepared Isaac/FastSim bundle required by the shared runner."""
+    """Create the unprepared Isaac/FastSim bundle required by the shared runner.
+
+    ``asset_path`` has highest precedence.  When omitted, the hook reads
+    ``robot.asset_path`` from ``spec`` and then ``UNIROBOSIM_DROID_ASSET``.
+    There is intentionally no machine-local default.
+    """
 
     canonical = _mapping(spec, "acceptance spec")
     if canonical.get("schema_version") != _EXPECTED_SPEC_SCHEMA:
@@ -949,7 +955,13 @@ def create_backend_run(
     sample_hz = _integer(camera.get("fps", 0), "camera fps")
     if physics_hz != 240 or sample_hz != 30 or physics_hz % sample_hz:
         raise ValueError("Isaac hook requires the frozen 240 Hz / 30 Hz schedule")
-    if not _ASSET.is_file() or hashlib.sha256(_ASSET.read_bytes()).hexdigest() != _ASSET_SHA256:
+    robot = _mapping(canonical.get("robot"), "acceptance robot")
+    asset = resolve_droid_asset_path(
+        asset_path,
+        configured_asset_path=robot.get("asset_path"),
+    )
+    asset_sha256 = hashlib.sha256(asset.read_bytes()).hexdigest()
+    if asset_sha256 != _ASSET_SHA256:
         raise RuntimeError("pinned DROID Isaac USD is missing or changed")
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -957,8 +969,8 @@ def create_backend_run(
     if visible_window and (display is None or not display.strip()):
         raise RuntimeError("visible Isaac window requires a non-empty DISPLAY")
     baseline_window_ids = frozenset(_x11_window_snapshot(display)) if display is not None else frozenset()
-    plan = _compile_plan(canonical, destination)
-    projection = _enriched_projection(plan, canonical)
+    plan = _compile_plan(canonical, destination, asset)
+    projection = _enriched_projection(plan, canonical, asset_sha256)
     provider = IsaacLabProvider(
         IsaacLabAdapterConfig(
             headless=not visible_window,
