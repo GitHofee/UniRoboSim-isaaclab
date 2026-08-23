@@ -263,6 +263,10 @@ def test_launcher_disables_process_terminating_fast_shutdown() -> None:
     configured = IsaacLabAdapterConfig(experience="/tmp/custom.kit")
     assert _launcher_kwargs(configured)["experience"] == "/tmp/custom.kit"
     assert _launcher_kwargs(config, process_isolated=True)["fast_shutdown"] is True
+    visible = _launcher_kwargs(IsaacLabAdapterConfig(headless=False))
+    assert visible["headless"] is False
+    assert visible["visualizer"] == ["kit"]
+    assert visible["visualizer_explicit"] is True
 
 
 def test_camera_launcher_texture_residency_settings() -> None:

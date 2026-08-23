@@ -8,8 +8,13 @@ tickets, lifecycle events, traces, and video encoding.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
+import re
+import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from importlib import import_module
@@ -49,8 +54,87 @@ _GRIPPER_JOINTS = (
 )
 _JOINTS = _ARM_JOINTS + _GRIPPER_JOINTS
 _CAMERA_PATH = EntityPath("/camera")
-_EXPECTED_SPEC_SCHEMA = "fastsim-droid-three-backend-equivalence/3"
+_EXPECTED_SPEC_SCHEMA = "fastsim-droid-three-backend-equivalence/4"
 _RUN_KINDS = frozenset({"rulebased_blocking", "model_servo_preempt"})
+_XWININFO_WINDOW = re.compile(r'^\s*(0x[0-9a-fA-F]+)\s+(?:"([^"]*)"|\(has no name\)):', re.MULTILINE)
+_ISAAC_WINDOW_MARKERS = ("isaac", "omniverse", "kit")
+
+
+def _xwininfo(display: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run the fixed X11 observer without involving a shell."""
+
+    try:
+        return subprocess.run(
+            ("xwininfo", "-display", display, *arguments),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as caught:
+        raise RuntimeError("xwininfo is unavailable for visible Isaac window evidence") from caught
+
+
+def _x11_window_snapshot(display: str) -> dict[str, str]:
+    result = _xwininfo(display, "-root", "-tree")
+    if result.returncode != 0:
+        raise RuntimeError(f"xwininfo could not inspect DISPLAY={display!r}: {result.stderr.strip()}")
+    return {window_id.lower(): (title or "") for window_id, title in _XWININFO_WINDOW.findall(result.stdout)}
+
+
+def _x11_window_details(display: str, window_id: str) -> tuple[bool, str]:
+    result = _xwininfo(display, "-id", window_id)
+    details = result.stdout + result.stderr
+    return result.returncode == 0 and "Map State: IsViewable" in result.stdout, details
+
+
+def _wait_for_native_window(
+    display: str,
+    baseline_window_ids: frozenset[str],
+    *,
+    timeout_s: float = 15.0,
+) -> tuple[str, str, str]:
+    deadline = time.monotonic() + timeout_s
+    last_candidates: list[str] = []
+    while True:
+        snapshot = _x11_window_snapshot(display)
+        candidates: list[tuple[str, str, str]] = []
+        last_candidates.clear()
+        for window_id, title in snapshot.items():
+            if window_id in baseline_window_ids:
+                continue
+            viewable, details = _x11_window_details(display, window_id)
+            if not viewable:
+                continue
+            last_candidates.append(f"{window_id}={title!r}")
+            if title and any(marker in title.casefold() for marker in _ISAAC_WINDOW_MARKERS):
+                candidates.append((window_id, title, details))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            # Prefer the largest native application surface over helper windows.
+            def area(candidate: tuple[str, str, str]) -> int:
+                match = re.search(r"Width:\s*(\d+).*?Height:\s*(\d+)", candidate[2], re.DOTALL)
+                return 0 if match is None else int(match[1]) * int(match[2])
+
+            return max(candidates, key=area)
+        if time.monotonic() >= deadline:
+            observed = ", ".join(last_candidates) if last_candidates else "none"
+            raise RuntimeError(
+                f"no new viewable Isaac native window appeared on DISPLAY={display}; observed={observed}"
+            )
+        time.sleep(0.1)
+
+
+def _wait_for_window_close(display: str, window_id: str, *, timeout_s: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        result = _xwininfo(display, "-id", window_id)
+        if result.returncode != 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _number_tuple(value: object, count: int, label: str) -> tuple[float, ...]:
@@ -645,7 +729,14 @@ class DroidAcceptanceBackendRun:
     bundle: object
     _adapter: Any = field(repr=False)
     _gravity_m_s2: tuple[float, float, float] = field(repr=False)
+    _visible_window: bool = field(repr=False)
+    _display: str | None = field(repr=False)
+    _baseline_window_ids: frozenset[str] = field(repr=False)
+    _output_dir: Path = field(repr=False)
+    _run_kind: str = field(repr=False)
     _closed: bool = field(default=False, repr=False)
+    _window_evidence: Mapping[str, object] | None = field(default=None, repr=False)
+    _window_id: str | None = field(default=None, repr=False)
 
     def sample(self, tick: int) -> Mapping[str, object]:
         return cast(Mapping[str, object], self._adapter.droid_sample(tick))
@@ -663,7 +754,68 @@ class DroidAcceptanceBackendRun:
             }
         )
 
+    @property
+    def window_evidence(self) -> Mapping[str, object]:
+        if self._window_evidence is not None:
+            return self._window_evidence
+        if not self._visible_window:
+            self._window_evidence = MappingProxyType(
+                {
+                    "schema_version": "fastsim-visible-window-evidence/1",
+                    "requested": False,
+                    "headless": True,
+                    "observed": False,
+                    "display": "not requested",
+                    "native_window_id": "not requested",
+                    "window_title": "not requested",
+                    "source": "visible_window=False; xwininfo was not invoked",
+                }
+            )
+            return self._window_evidence
+        if self._display is None:
+            raise RuntimeError("visible Isaac window was requested without DISPLAY")
+        window_id, title, details = _wait_for_native_window(self._display, self._baseline_window_ids)
+        self._window_id = window_id
+        command = f"xwininfo -display {self._display} -id {window_id}"
+        evidence_path = self._output_dir / f"droid-{self._run_kind}-isaaclab.window-xwininfo.txt"
+        evidence_path.write_text(f"$ {command}\n{details}", encoding="utf-8")
+        self._window_evidence = MappingProxyType(
+            {
+                "schema_version": "fastsim-visible-window-evidence/1",
+                "requested": True,
+                "headless": False,
+                "observed": True,
+                "display": self._display,
+                "native_window_id": window_id,
+                "window_title": title,
+                "source": f"{command}: Map State: IsViewable",
+            }
+        )
+        return self._window_evidence
+
     def close(self) -> None:
+        if self._closed:
+            return
+        if self._visible_window and self._display is not None and self._window_id is not None:
+            observed_closed = _wait_for_window_close(self._display, self._window_id)
+            close_path = self._output_dir / f"droid-{self._run_kind}-isaaclab.window-close.json"
+            close_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "fastsim-visible-window-close-evidence/1",
+                        "display": self._display,
+                        "native_window_id": self._window_id,
+                        "observed_closed": observed_closed,
+                        "source": "xwininfo returned nonzero after native bundle close",
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            if not observed_closed:
+                raise RuntimeError(f"Isaac native window {self._window_id} remained after bundle close")
         self._closed = True
 
 
@@ -671,6 +823,8 @@ def create_backend_run(
     spec: Mapping[str, object],
     run_kind: str,
     output_dir: str | Path,
+    *,
+    visible_window: bool = False,
 ) -> DroidAcceptanceBackendRun:
     """Create the unprepared Isaac/FastSim bundle required by the shared runner."""
 
@@ -679,6 +833,8 @@ def create_backend_run(
         raise ValueError("unsupported DROID acceptance spec schema")
     if run_kind not in _RUN_KINDS:
         raise ValueError("unsupported DROID acceptance run kind")
+    if type(visible_window) is not bool:
+        raise TypeError("visible_window must be a bool")
     simulation = _mapping(canonical.get("simulation"), "acceptance simulation")
     physics_hz = _integer(simulation.get("physics_hz", 0), "physics_hz")
     camera = _mapping(canonical.get("camera"), "acceptance camera")
@@ -689,10 +845,15 @@ def create_backend_run(
         raise RuntimeError("pinned DROID Isaac USD is missing or changed")
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
+    display = os.environ.get("DISPLAY") if visible_window else None
+    if visible_window and (display is None or not display.strip()):
+        raise RuntimeError("visible Isaac window requires a non-empty DISPLAY")
+    baseline_window_ids = frozenset(_x11_window_snapshot(display)) if display is not None else frozenset()
     plan = _compile_plan(canonical, destination)
     projection = _enriched_projection(plan, canonical)
     provider = IsaacLabProvider(
         IsaacLabAdapterConfig(
+            headless=not visible_window,
             enable_cameras=True,
             render=True,
             render_on_step=False,
@@ -712,7 +873,16 @@ def create_backend_run(
         focus_distance_m,
         up_reference,
     )
-    return DroidAcceptanceBackendRun(bundle, adapter, projection.world_spec.physics.gravity_m_s2)
+    return DroidAcceptanceBackendRun(
+        bundle,
+        adapter,
+        projection.world_spec.physics.gravity_m_s2,
+        visible_window,
+        display,
+        baseline_window_ids,
+        destination,
+        run_kind,
+    )
 
 
 __all__ = ("DroidAcceptanceBackendRun", "create_backend_run")

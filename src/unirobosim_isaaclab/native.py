@@ -363,6 +363,12 @@ def _launcher_kwargs(config: IsaacLabAdapterConfig, *, process_isolated: bool = 
         # teardown. It is enabled only inside the adapter-owned worker process.
         "fast_shutdown": process_isolated,
     }
+    if not config.headless:
+        # Isaac Lab 3 defaults to headless when no visualizer is selected, even
+        # when SimulationApp receives headless=False. Select the native Kit
+        # visualizer explicitly so the caller's non-headless request is real.
+        launcher_args["visualizer"] = ["kit"]
+        launcher_args["visualizer_explicit"] = True
     if config.enable_cameras:
         launcher_args["anti_aliasing"] = _ANTI_ALIASING_MODES[config.anti_aliasing]
     if config.experience is not None:

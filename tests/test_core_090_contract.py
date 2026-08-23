@@ -30,11 +30,14 @@ from unirobosim import (
     WorldSpec,
 )
 
+import unirobosim_isaaclab.droid_acceptance as droid_acceptance
 from unirobosim_isaaclab.descriptor import DESCRIPTOR
 from unirobosim_isaaclab.droid_acceptance import (
+    DroidAcceptanceBackendRun,
     _acceptance_world_spec,
     _effective_camera_calibration,
     _look_at_xyzw,
+    create_backend_run,
 )
 from unirobosim_isaaclab.native import _declared_joint_map
 from unirobosim_isaaclab.native_protocols import NativeCameraCalibration
@@ -254,3 +257,79 @@ def test_droid_effective_camera_metadata_is_derived_from_native_calibration() ->
     assert extrinsics["eye_m"] == pytest.approx(eye)
     assert extrinsics["look_at_m"] == pytest.approx(look_at)
     assert extrinsics["up"] == up
+
+
+def test_droid_acceptance_visible_window_is_keyword_only_and_defaults_off() -> None:
+    parameter = inspect.signature(create_backend_run).parameters["visible_window"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+
+
+def test_droid_acceptance_default_window_evidence_does_not_query_x11(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        droid_acceptance,
+        "_wait_for_native_window",
+        lambda *_args, **_kwargs: pytest.fail("headless default must not query X11"),
+    )
+    run = DroidAcceptanceBackendRun(
+        object(),
+        object(),
+        (0.0, 0.0, 0.0),
+        False,
+        None,
+        frozenset(),
+        tmp_path,
+        "rulebased_blocking",
+    )
+    assert run.window_evidence == {
+        "schema_version": "fastsim-visible-window-evidence/1",
+        "requested": False,
+        "headless": True,
+        "observed": False,
+        "display": "not requested",
+        "native_window_id": "not requested",
+        "window_title": "not requested",
+        "source": "visible_window=False; xwininfo was not invoked",
+    }
+
+
+def test_droid_acceptance_records_viewable_window_and_clean_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    details = 'xwininfo: Window id: 0x123 "Isaac Sim"\n  Map State: IsViewable\n'
+    monkeypatch.setattr(
+        droid_acceptance,
+        "_wait_for_native_window",
+        lambda *_args, **_kwargs: ("0x123", "Isaac Sim", details),
+    )
+    monkeypatch.setattr(droid_acceptance, "_wait_for_window_close", lambda *_args, **_kwargs: True)
+    run = DroidAcceptanceBackendRun(
+        object(),
+        object(),
+        (0.0, 0.0, 0.0),
+        True,
+        ":1",
+        frozenset({"0x100"}),
+        tmp_path,
+        "model_servo_preempt",
+    )
+    assert run.window_evidence == {
+        "schema_version": "fastsim-visible-window-evidence/1",
+        "requested": True,
+        "headless": False,
+        "observed": True,
+        "display": ":1",
+        "native_window_id": "0x123",
+        "window_title": "Isaac Sim",
+        "source": "xwininfo -display :1 -id 0x123: Map State: IsViewable",
+    }
+    assert "Map State: IsViewable" in (tmp_path / "droid-model_servo_preempt-isaaclab.window-xwininfo.txt").read_text(
+        encoding="utf-8"
+    )
+    run.close()
+    close_evidence = (tmp_path / "droid-model_servo_preempt-isaaclab.window-close.json").read_text(encoding="utf-8")
+    assert '"observed_closed": true' in close_evidence
