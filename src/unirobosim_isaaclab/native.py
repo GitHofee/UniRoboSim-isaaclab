@@ -282,6 +282,42 @@ class _UsdArticulation:
     root_prim: Any
 
 
+def _is_kinematic_rigid(prim: Any, usd_physics: Any) -> bool:
+    """Read the authored rigid-body motion mode without importing USD at module load time."""
+
+    return bool(usd_physics.RigidBodyAPI(prim).GetKinematicEnabledAttr().Get())
+
+
+def _write_usd_rigid_state(
+    view: Any,
+    transforms: Any,
+    velocities: Any,
+    indices: Any,
+    *,
+    kinematic: bool,
+) -> None:
+    """Write a raw USD rigid state while respecting PhysX kinematic semantics."""
+
+    view.set_transforms(transforms, indices)
+    if not kinematic:
+        view.set_velocities(velocities, indices)
+
+
+def _write_high_level_rigid_state(
+    asset: Any,
+    root_pose: Any,
+    root_velocity: Any,
+    env_ids: Any,
+    *,
+    kinematic: bool,
+) -> None:
+    """Write an Isaac Lab rigid state while respecting PhysX kinematic semantics."""
+
+    asset.write_root_pose_to_sim_index(root_pose=root_pose, env_ids=env_ids)
+    if not kinematic:
+        asset.write_root_link_velocity_to_sim_index(root_velocity=root_velocity, env_ids=env_ids)
+
+
 def _ensure_launcher_setting(setting: str) -> None:
     if setting not in sys.argv:
         sys.argv.append(setting)
@@ -598,6 +634,7 @@ class IsaacLabNativeWorld:
         self._usd_rigid_views: dict[EntityPath, Any] = {}
         self._initial_usd_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._usd_rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
+        self._kinematic_rigids: dict[EntityPath, bool] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
         self._deformables: dict[EntityPath, Any] = {}
@@ -823,6 +860,7 @@ class IsaacLabNativeWorld:
                 ),
             )
             self._rigids[entity.path] = self._m.RigidObject(cfg)
+            self._kinematic_rigids[entity.path] = False
             contact_cfg = self._m.ContactSensorCfg(
                 prim_path=f"/World/env_.*/{_native_name(entity.path)}",
                 update_period=0.0,
@@ -853,6 +891,7 @@ class IsaacLabNativeWorld:
         )
         self._rigids[entity.path] = self._m.RigidObject(cfg)
         body_suffix: str | None = None
+        kinematic: bool | None = None
         for index in range(self._spec.environments.count):
             root = f"/World/env_{index}/{name}"
             rigid_prims = self._m.sim_utils.get_all_matching_child_prims(
@@ -864,6 +903,11 @@ class IsaacLabNativeWorld:
                     f"rigid asset must contain exactly one UsdPhysics.RigidBodyAPI prim; found {len(rigid_prims)}"
                 )
             rigid_prim = rigid_prims[0]
+            current_kinematic = _is_kinematic_rigid(rigid_prim, self._m.UsdPhysics)
+            if kinematic is None:
+                kinematic = current_kinematic
+            elif current_kinematic != kinematic:
+                raise ValueError("rigid body must have the same kinematic mode in every environment")
             if "PhysxContactReportAPI" not in rigid_prim.GetAppliedSchemas():
                 rigid_prim.AddAppliedSchema("PhysxContactReportAPI")
             suffix = rigid_prim.GetPath().pathString.removeprefix(root)
@@ -871,7 +915,8 @@ class IsaacLabNativeWorld:
                 body_suffix = suffix
             elif suffix != body_suffix:
                 raise ValueError("rigid body prim must have the same relative path in every environment")
-        assert body_suffix is not None
+        assert body_suffix is not None and kinematic is not None
+        self._kinematic_rigids[entity.path] = kinematic
         contact_cfg = self._m.ContactSensorCfg(
             prim_path=f"/World/env_.*/{name}{body_suffix}",
             update_period=0.0,
@@ -890,6 +935,7 @@ class IsaacLabNativeWorld:
         assert entity.asset_uri is not None
         name = _native_name(entity.path)
         bodies: list[_UsdRigid] = []
+        kinematic: bool | None = None
         for index in range(self._spec.environments.count):
             root = f"/World/env_{index}/{name}"
             cfg = self._m.sim_utils.UsdFileCfg(
@@ -911,10 +957,17 @@ class IsaacLabNativeWorld:
                     f"rigid asset must contain exactly one UsdPhysics.RigidBodyAPI prim; found {len(rigid_prims)}"
                 )
             rigid_prim = rigid_prims[0]
+            current_kinematic = _is_kinematic_rigid(rigid_prim, self._m.UsdPhysics)
+            if kinematic is None:
+                kinematic = current_kinematic
+            elif current_kinematic != kinematic:
+                raise ValueError("rigid body must have the same kinematic mode in every environment")
             if "PhysxContactReportAPI" not in rigid_prim.GetAppliedSchemas():
                 rigid_prim.AddAppliedSchema("PhysxContactReportAPI")
             bodies.append(_UsdRigid(rigid_prim=rigid_prim))
+        assert kinematic is not None
         self._usd_rigids[entity.path] = tuple(bodies)
+        self._kinematic_rigids[entity.path] = kinematic
 
     def _author_deformable(self, entity: EntitySpec) -> None:
         assert entity.deformable is not None
@@ -1278,8 +1331,13 @@ class IsaacLabNativeWorld:
         for path, asset in self._rigids.items():
             root_pose, root_velocity = self._initial_rigid[path]
             asset.reset(env_ids=env_ids)
-            asset.write_root_pose_to_sim_index(root_pose=root_pose[env_ids], env_ids=env_ids)
-            asset.write_root_link_velocity_to_sim_index(root_velocity=root_velocity[env_ids], env_ids=env_ids)
+            _write_high_level_rigid_state(
+                asset,
+                root_pose[env_ids],
+                root_velocity[env_ids],
+                env_ids,
+                kinematic=self._kinematic_rigids[path],
+            )
             self._contacts[path].reset(env_ids=env_ids)
         for path, view in self._usd_rigid_views.items():
             transforms, velocities = self._initial_usd_rigid[path]
@@ -1288,8 +1346,13 @@ class IsaacLabNativeWorld:
                 device=transforms.device,
                 dtype=self._m.torch.int64,
             )
-            view.set_transforms(transforms[indices], indices)
-            view.set_velocities(velocities[indices], indices)
+            _write_usd_rigid_state(
+                view,
+                transforms[indices],
+                velocities[indices],
+                indices,
+                kinematic=self._kinematic_rigids[path],
+            )
             forces, torques = self._usd_rigid_wrenches[path]
             forces[indices] = 0.0
             torques[indices] = 0.0
@@ -1538,8 +1601,13 @@ class IsaacLabNativeWorld:
                 orientation_xyzw, device=transforms.device, dtype=transforms.dtype
             )
             indices = self._m.torch.tensor((environment_index,), device=transforms.device, dtype=self._m.torch.int64)
-            view.set_transforms(transforms[indices], indices)
-            view.set_velocities(self._m.torch.zeros((1, 6), device=transforms.device, dtype=transforms.dtype), indices)
+            _write_usd_rigid_state(
+                view,
+                transforms[indices],
+                self._m.torch.zeros((1, 6), device=transforms.device, dtype=transforms.dtype),
+                indices,
+                kinematic=self._kinematic_rigids[path],
+            )
         else:
             asset = self._rigids[path]
             assert self._sim is not None and self._origins is not None
@@ -1548,10 +1616,12 @@ class IsaacLabNativeWorld:
             )
             pose[:, :3] += self._origins[environment_index : environment_index + 1]
             env_ids = self._m.torch.tensor((environment_index,), device=self._sim.device, dtype=self._m.torch.int64)
-            asset.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
-            asset.write_root_link_velocity_to_sim_index(
-                root_velocity=self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
-                env_ids=env_ids,
+            _write_high_level_rigid_state(
+                asset,
+                pose,
+                self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
+                env_ids,
+                kinematic=self._kinematic_rigids[path],
             )
         assert self._sim is not None
         self._sim.forward()
@@ -1810,6 +1880,7 @@ class IsaacLabNativeWorld:
         self._usd_rigid_views.clear()
         self._initial_usd_rigid.clear()
         self._usd_rigid_wrenches.clear()
+        self._kinematic_rigids.clear()
         self._usd_tensor_view = None
         self._contacts.clear()
         self._deformables.clear()
