@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.3
+
+- Keep RGB conversion and layout normalization on the GPU, then transfer one
+  contiguous packed byte buffer across the native worker boundary instead of
+  millions of Python integers.
+- Add explicit render cadence control and stop rendering every physics tick in the
+  headless camera profile; camera reads still render on demand.
+- Add the `headless-physics` launch profile for physics-only batch production and
+  cap the visible EasyAPI profile at 60 rendered frames per second.
+- Require UniRoboSim Core 0.9.1 for compatible packed RGB `ArrayValue` transport.
+
 ## 0.9.2
 
 - Anchor the clean native worker to the exact Core and adapter package roots loaded by

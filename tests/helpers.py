@@ -226,7 +226,7 @@ class FakeNativeWorld:
                     entity.camera.width_px,
                     3,
                 )
-                values: tuple[int | float, ...] = (17,) * math.prod(shape)
+                values: tuple[int | float, ...] | bytes = bytes((17,)) * math.prod(shape)
             else:
                 shape = (self.spec.environments.count, entity.camera.height_px, entity.camera.width_px)
                 values = (1.25,) * math.prod(shape)

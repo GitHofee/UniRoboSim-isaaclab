@@ -25,19 +25,35 @@ def create_easy_provider() -> IsaacLabProvider:
     launch_profile = os.getenv(ISAACLAB_LAUNCH_PROFILE_ENV)
     if launch_profile is None or launch_profile == "headless":
         headless = True
+        enable_cameras = True
+        render = True
+        render_on_step = False
+        max_render_hz = None
+    elif launch_profile == "headless-physics":
+        headless = True
+        enable_cameras = False
+        render = False
+        render_on_step = False
+        max_render_hz = None
     elif launch_profile == "visible":
         headless = False
+        enable_cameras = True
+        render = True
+        render_on_step = True
+        max_render_hz = 60.0
     else:
         raise ValidationError(
-            "Isaac Lab launch profile must be unset, 'headless', or 'visible'",
+            "Isaac Lab launch profile must be unset, 'headless', 'headless-physics', or 'visible'",
             operation="isaaclab.launch_profile.resolve",
         )
 
     return IsaacLabProvider(
         IsaacLabAdapterConfig(
             headless=headless,
-            enable_cameras=True,
-            render=True,
+            enable_cameras=enable_cameras,
+            render=render,
+            render_on_step=render_on_step,
+            max_render_hz=max_render_hz,
         )
     )
 

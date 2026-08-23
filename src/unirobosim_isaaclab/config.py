@@ -25,6 +25,7 @@ class IsaacLabAdapterConfig:
     anti_aliasing: str = "fxaa"
     texture_streaming: bool = False
     render_on_step: bool = True
+    max_render_hz: float | None = None
     fluid_render_mode: str = "particles"
     experience: str | None = None
     position_stiffness: float = 1000.0
@@ -98,6 +99,26 @@ class IsaacLabAdapterConfig:
                 raise ValidationError(f"{name} must be non-negative and finite", operation="isaaclab.config.validate")
             normalized[name] = gain
         object.__setattr__(self, "environment_spacing_m", spacing)
+        if self.max_render_hz is not None:
+            if isinstance(self.max_render_hz, bool):
+                raise ValidationError(
+                    "max render rate must be numeric",
+                    operation="isaaclab.config.validate",
+                )
+            try:
+                max_render_hz = float(self.max_render_hz)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    "max render rate must be numeric",
+                    operation="isaaclab.config.validate",
+                    cause=exc,
+                ) from exc
+            if not math.isfinite(max_render_hz) or max_render_hz <= 0.0:
+                raise ValidationError(
+                    "max render rate must be positive and finite",
+                    operation="isaaclab.config.validate",
+                )
+            object.__setattr__(self, "max_render_hz", max_render_hz)
         for name, value in normalized.items():
             object.__setattr__(self, name, value)
         if (

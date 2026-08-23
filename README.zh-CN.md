@@ -9,7 +9,7 @@
 | 项目 | 已验证版本 |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.9,<0.10` |
+| UniRoboSim | `>=0.9.1,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
@@ -73,6 +73,7 @@ UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE=visible python run_simulation.py
 | --- | --- |
 | 未设置 | 无头，相机开启，渲染开启 |
 | `headless` | 无头，相机开启，渲染开启 |
+| `headless-physics` | 无头，相机关闭，渲染关闭 |
 | `visible` | 显示 Kit 窗口，相机开启，渲染开启 |
 
 值区分大小写，其他值会在 Isaac SDK 加载前被拒绝。Adapter 不根据 `DISPLAY`
@@ -94,6 +95,7 @@ provider = create_provider(
         render=True,
         anti_aliasing="fxaa",
         texture_streaming=False,
+        render_on_step=False,
     )
 )
 
@@ -123,13 +125,15 @@ with Sim(provider=provider) as sim:
 
 EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分辨率纹理。`anti_aliasing` 支持 `off`、`taa`、`fxaa`、`dlss`、`dlaa`。只有在显存收益高于材质清晰度时才应启用 `texture_streaming=True`。
 
+无头相机档位只在读取传感器时渲染，不再每个物理 tick 都渲染。RGB 帧以连续 C-order NHWC 字节跨越 worker 边界；录制器应使用 `camera.read("rgb").to_bytes()`，避免把一帧展开成数百万个 Python 整数。程序化可视运行还可以通过 `max_render_hz` 独立限制视口渲染频率。
+
 ## 明确限制
 
 此 Isaac Sim profile 的粒子状态通过 PhysX/USD 读取，而不是公开粒子 Tensor API。刚体 + 流体 + 相机 + Debug 已完成混合验证。桥接刚体的接触力，以及粒子流体与 Tensor 铰接体/柔性体同场景组合，会明确失败，不返回误导性结果。
 
 ## Planning Scene 兼容性
 
-Adapter 0.9.2 要求 UniRoboSim Core `>=0.9,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
+Adapter 0.9.3 要求 UniRoboSim Core `>=0.9.1,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
 
 ## 验证
 

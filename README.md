@@ -9,7 +9,7 @@
 | Item | Verified version |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.9,<0.10` |
+| UniRoboSim | `>=0.9.1,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
@@ -74,6 +74,7 @@ The complete public profile contract is:
 | --- | --- |
 | unset | Headless, cameras enabled, rendering enabled |
 | `headless` | Headless, cameras enabled, rendering enabled |
+| `headless-physics` | Headless, cameras and rendering disabled |
 | `visible` | Visible Kit window, cameras enabled, rendering enabled |
 
 Values are case-sensitive. Any other value fails before the Isaac SDK is loaded.
@@ -95,6 +96,7 @@ provider = create_provider(
         render=True,
         anti_aliasing="fxaa",
         texture_streaming=False,
+        render_on_step=False,
     )
 )
 
@@ -124,13 +126,15 @@ Articulations, skinned meshes, and empty stages are rejected by the rigid normal
 
 The EasyAPI profile defaults to FXAA and disables texture streaming so camera sensors keep full-resolution textures. `anti_aliasing` accepts `off`, `taa`, `fxaa`, `dlss`, or `dlaa`. Enable `texture_streaming=True` only when the memory saving is worth reduced texture fidelity.
 
+The headless camera profile renders on sensor reads instead of every physics tick. RGB frames cross the worker boundary as compact C-order NHWC bytes; use `camera.read("rgb").to_bytes()` in recorders to avoid expanding a frame into Python integers. Programmatic visible runs can set `max_render_hz` to cap viewport rendering independently of physics frequency.
+
 ## Explicit limitations
 
 In this Isaac Sim profile, particle state is read through PhysX/USD rather than a public particle tensor API. Rigid + fluid + camera + debug is verified together. Contact-force readback for bridged rigid bodies, and a same-world mix of particle fluid with tensor-backed articulations or deformables, fail explicitly instead of returning misleading data.
 
 ## Planning-scene compatibility
 
-Adapter 0.9.2 requires UniRoboSim Core `>=0.9,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
+Adapter 0.9.3 requires UniRoboSim Core `>=0.9.1,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
 
 ## Verification
 

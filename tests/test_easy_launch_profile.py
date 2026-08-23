@@ -25,24 +25,34 @@ def test_easy_launch_profile_absent_preserves_batch_default(monkeypatch: pytest.
     assert config.headless is True
     assert config.enable_cameras is True
     assert config.render is True
+    assert config.render_on_step is False
+    assert config.max_render_hz is None
 
 
 @pytest.mark.parametrize(
-    ("profile", "expected_headless"),
-    [("headless", True), ("visible", False)],
+    ("profile", "expected"),
+    [
+        ("headless", (True, True, True, False, None)),
+        ("headless-physics", (True, False, False, False, None)),
+        ("visible", (False, True, True, True, 60.0)),
+    ],
 )
 def test_easy_launch_profile_exact_values(
     monkeypatch: pytest.MonkeyPatch,
     profile: str,
-    expected_headless: bool,
+    expected: tuple[bool, bool, bool, bool, float | None],
 ) -> None:
     monkeypatch.setenv(unirobosim_isaaclab.ISAACLAB_LAUNCH_PROFILE_ENV, profile)
 
     config = _easy_config()
 
-    assert config.headless is expected_headless
-    assert config.enable_cameras is True
-    assert config.render is True
+    assert (
+        config.headless,
+        config.enable_cameras,
+        config.render,
+        config.render_on_step,
+        config.max_render_hz,
+    ) == expected
 
 
 @pytest.mark.parametrize("profile", ["", "VISIBLE", " visible", "visible ", "auto", "1"])

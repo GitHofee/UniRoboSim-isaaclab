@@ -638,14 +638,22 @@ class IsaacLabWorld:
                 world_id=self.world_id,
                 entity_path=entity.path.value,
             )
-        channels = tuple(
-            SensorChannel(
-                modality,
-                ArrayValue(shape, values, dtype="uint8" if modality is CameraModality.RGB else "float32"),
-            )
-            for modality, shape, values in native_channels
-        )
-        return SensorSample(handle, channels, self.tick)
+        channels: list[SensorChannel] = []
+        for modality, shape, values in native_channels:
+            if modality is CameraModality.RGB and isinstance(values, bytes):
+                data = ArrayValue.from_uint8_bytes(shape, values)
+            elif isinstance(values, bytes):
+                raise UniRoboSimError(
+                    "Isaac Lab returned packed bytes for a non-RGB camera channel",
+                    operation=operation,
+                    backend_id=self._session.descriptor.provider_id,
+                    world_id=self.world_id,
+                    entity_path=entity.path.value,
+                )
+            else:
+                data = ArrayValue(shape, values, dtype="uint8" if modality is CameraModality.RGB else "float32")
+            channels.append(SensorChannel(modality, data))
+        return SensorSample(handle, tuple(channels), self.tick)
 
     def read_camera_calibration(self, handle: EntityHandle) -> NativeCameraCalibration:
         """Read effective native camera parameters without advancing physics."""

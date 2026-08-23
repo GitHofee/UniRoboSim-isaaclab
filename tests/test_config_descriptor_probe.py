@@ -19,6 +19,8 @@ from unirobosim_isaaclab.native import (
     _environment_origins,
     _launcher_kwargs,
     _native_name,
+    _render_interval_steps,
+    _render_step_enabled,
     _rotate_xyzw,
     _surface_from_tetrahedra,
 )
@@ -31,7 +33,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.9.2"
+    assert unirobosim_isaaclab.__version__ == "0.9.3"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha5"
@@ -66,6 +68,7 @@ def test_public_identity_and_protocol() -> None:
     assert camera_provider.descriptor.metadata["camera_anti_aliasing"] == "fxaa"
     assert camera_provider.descriptor.metadata["camera_texture_streaming"] is False
     assert camera_provider.descriptor.metadata["render_on_step"] is True
+    assert camera_provider.descriptor.metadata["max_render_hz"] is None
     assert camera_provider.descriptor.metadata["fluid_render_mode"] == "particles"
     control = CAPABILITIES.get(CapabilityId("control.deformable.points@1"))
     assert control is not None
@@ -116,6 +119,18 @@ def test_render_and_experience_validation() -> None:
         with pytest.raises(ValidationError):
             IsaacLabAdapterConfig(max_cached_scene_commands=invalid)  # type: ignore[arg-type]
     assert IsaacLabAdapterConfig(render=True, enable_cameras=True).render
+    assert IsaacLabAdapterConfig(max_render_hz=60).max_render_hz == 60.0
+    invalid_render_rates: tuple[object, ...] = (
+        0,
+        -1,
+        float("inf"),
+        float("nan"),
+        True,
+        "bad",
+    )
+    for invalid in invalid_render_rates:
+        with pytest.raises(ValidationError):
+            IsaacLabAdapterConfig(max_render_hz=invalid)  # type: ignore[arg-type]
     assert IsaacLabAdapterConfig(anti_aliasing="FXAA").anti_aliasing == "fxaa"
     for invalid in ("", "msaa", 2):
         with pytest.raises(ValidationError):
@@ -124,6 +139,38 @@ def test_render_and_experience_validation() -> None:
     for invalid in ("", "mesh", 2):
         with pytest.raises(ValidationError):
             IsaacLabAdapterConfig(fluid_render_mode=invalid)  # type: ignore[arg-type]
+
+
+def test_render_rate_cap_maps_to_native_step_interval_without_overspeed() -> None:
+    assert _render_interval_steps(1.0 / 240.0, None) == 1
+    assert _render_interval_steps(1.0 / 240.0, 240.0) == 1
+    assert _render_interval_steps(1.0 / 240.0, 60.0) == 4
+    assert _render_interval_steps(1.0 / 240.0, 59.0) == 5
+    assert _render_interval_steps(1.0 / 30.0, 60.0) == 1
+
+
+def test_native_step_render_schedule_preserves_full_physics_cadence() -> None:
+    config = IsaacLabAdapterConfig(
+        headless=False,
+        enable_cameras=True,
+        render=True,
+        max_render_hz=60.0,
+    )
+    assert [_render_step_enabled(config, native_step_index, 4) for native_step_index in range(1, 9)] == [
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert not _render_step_enabled(
+        IsaacLabAdapterConfig(headless=True, enable_cameras=False, render=False),
+        4,
+        4,
+    )
 
 
 def test_probe_cpu_success_and_version_failures() -> None:

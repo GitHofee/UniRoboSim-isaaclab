@@ -390,6 +390,23 @@ def _camera_launcher_settings(config: IsaacLabAdapterConfig) -> tuple[str, ...]:
     return tuple(settings)
 
 
+def _render_interval_steps(native_dt: float, max_render_hz: float | None) -> int:
+    """Return a deterministic physics-step interval that never exceeds the render cap."""
+
+    if max_render_hz is None:
+        return 1
+    native_hz = 1.0 / native_dt
+    return max(1, math.ceil(native_hz / max_render_hz - 1.0e-12))
+
+
+def _render_step_enabled(
+    config: IsaacLabAdapterConfig,
+    native_step_index: int,
+    interval_steps: int,
+) -> bool:
+    return config.render and config.render_on_step and native_step_index % interval_steps == 0
+
+
 class IsaacLabNativeRuntime:
     """Own exactly one Kit application and at most one native world."""
 
@@ -598,6 +615,10 @@ class IsaacLabNativeWorld:
         self._origins_cpu = _environment_origins(spec.environments.count, config.environment_spacing_m)
         self._origins: Any | None = None
         self._native_dt = spec.physics.time_step_seconds / spec.physics.substeps
+        self._render_interval_steps = _render_interval_steps(
+            self._native_dt,
+            config.max_render_hz,
+        )
         self._has_fluid = any(entity.kind is EntityKind.PARTICLE_FLUID for entity in spec.entities)
         try:
             self._build()
@@ -646,7 +667,7 @@ class IsaacLabNativeWorld:
             physics=self._m.PhysxCfg(),
             # PhysX 6 exposes particle state through USD sync, not the removed particle tensor view.
             use_fabric=not has_fluid,
-            render_interval=1,
+            render_interval=self._render_interval_steps,
         )
         self._sim = sim_utils.SimulationContext(sim_cfg)
         if any(entity.kind is EntityKind.CAMERA_SENSOR for entity in self._spec.entities):
@@ -1630,11 +1651,15 @@ class IsaacLabNativeWorld:
             native_name = "rgb" if modality is CameraModality.RGB else "distance_to_camera"
             value = camera.data.output[native_name]
             tensor = getattr(value, "torch", value)
-            channel_values: tuple[float | int, ...]
+            channel_values: tuple[float | int, ...] | bytes
             if modality is CameraModality.RGB:
-                tensor = tensor.to(dtype=self._m.torch.uint8)
+                # Keep conversion and layout normalization on the GPU, then cross
+                # the worker boundary as one compact CPU buffer.  Expanding a
+                # 1080p image into millions of Python integers dominated camera
+                # acquisition and doubled the multiprocessing payload.
+                tensor = tensor.to(dtype=self._m.torch.uint8).contiguous()
                 shape = tuple(int(size) for size in tensor.shape)
-                channel_values = tuple(int(item) for item in tensor.detach().cpu().reshape(-1).tolist())
+                channel_values = tensor.detach().cpu().numpy().tobytes(order="C")
             else:
                 tensor = tensor[..., 0]
                 valid = self._m.torch.isfinite(tensor)
@@ -1732,7 +1757,7 @@ class IsaacLabNativeWorld:
     def step(self, count: int) -> None:
         assert self._sim is not None
         for _ in range(count):
-            for _ in range(self._spec.physics.substeps):
+            for substep_index in range(self._spec.physics.substeps):
                 for path, view in self._usd_rigid_views.items():
                     forces, torques = self._usd_rigid_wrenches[path]
                     indices = self._m.torch.arange(view.count, device=forces.device, dtype=self._m.torch.int64)
@@ -1743,7 +1768,13 @@ class IsaacLabNativeWorld:
                     asset.write_data_to_sim()
                 for asset in self._deformables.values():
                     asset.write_data_to_sim()
-                self._sim.step(render=self._config.render and self._config.render_on_step)
+                native_step_index = self._step_index * self._spec.physics.substeps + substep_index + 1
+                render = _render_step_enabled(
+                    self._config,
+                    native_step_index,
+                    self._render_interval_steps,
+                )
+                self._sim.step(render=render)
                 self._update_assets(self._native_dt)
             self._step_index += 1
             expired = tuple(

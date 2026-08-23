@@ -656,7 +656,10 @@ def test_camera_and_debug_endpoints_are_strict_and_backend_neutral() -> None:
     before = world.tick
     sample = world.read_sensor(camera)
     assert sample.tick == before and world.tick == before
-    assert sample.channel(CameraModality.RGB).shape == (2, 3, 4, 3)
+    rgb = sample.channel(CameraModality.RGB)
+    assert rgb.shape == (2, 3, 4, 3)
+    assert rgb.is_packed
+    assert rgb.to_bytes() == bytes((17,)) * (2 * 3 * 4 * 3)
     assert sample.channel(CameraModality.DEPTH).shape == (2, 3, 4)
     with pytest.raises(CommandError):
         world.read_sensor(fluid)

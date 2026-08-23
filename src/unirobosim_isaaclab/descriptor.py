@@ -243,6 +243,7 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
         anti_aliasing = str(getattr(config, "anti_aliasing", "fxaa"))
         texture_streaming = bool(getattr(config, "texture_streaming", False))
         render_on_step = bool(getattr(config, "render_on_step", True))
+        max_render_hz = getattr(config, "max_render_hz", None)
         fluid_render_mode = str(getattr(config, "fluid_render_mode", "particles"))
         return ProviderDescriptor(
             provider_id=DESCRIPTOR.provider_id,
@@ -257,6 +258,7 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
                     "camera_anti_aliasing": anti_aliasing,
                     "camera_texture_streaming": texture_streaming,
                     "render_on_step": render_on_step,
+                    "max_render_hz": max_render_hz,
                     "fluid_render_mode": fluid_render_mode,
                 }
             ),

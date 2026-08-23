@@ -30,7 +30,8 @@ Matrix = tuple[tuple[float, ...], ...]
 Vector3 = tuple[float, float, float]
 Quaternion = tuple[float, float, float, float]
 PointBatch = tuple[tuple[Vector3, ...], ...]
-NativeSensorChannel = tuple[CameraModality, tuple[int, ...], tuple[float | int, ...]]
+NativeSensorValues = tuple[float | int, ...] | bytes
+NativeSensorChannel = tuple[CameraModality, tuple[int, ...], NativeSensorValues]
 NativeSensorSample = tuple[NativeSensorChannel, ...]
 NativeDebugReport = tuple[int, int, int]
 

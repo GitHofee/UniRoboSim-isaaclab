@@ -600,7 +600,7 @@ def _telemetry_adapter_type(base: type[Any]) -> type[Any]:
             if joint_state.joint_names != _JOINTS or len(positions) != len(_JOINTS):
                 raise RuntimeError("Isaac articulation state differs from the frozen DROID axis order")
             tick = int(self._local_tick)
-            rgb_bytes = bytes(cast(tuple[int, ...], rgb.values))
+            rgb_bytes = rgb.to_bytes()
             sample: Mapping[str, object] = MappingProxyType(
                 {
                     "simulation_tick": tick,
