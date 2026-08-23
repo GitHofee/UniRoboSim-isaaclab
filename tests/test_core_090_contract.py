@@ -441,6 +441,7 @@ def test_droid_compose_keeps_exact_adapter_and_planning_gate() -> None:
         assert planning_module._authority_adapter(adapter) is adapter
         assert type(adapter._droid_telemetry_probe) is _DroidTelemetryProbe
         assert bundle.planning_raw is not None
+        assert bundle._UniRoboSimRuntimeBundle__executor._plan_digest == projection.plan_digest
     finally:
         bundle.close(timeout=2.0)
 

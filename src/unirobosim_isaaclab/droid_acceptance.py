@@ -770,6 +770,7 @@ def _compose(
         dependency_provider=services.PlanWorldDependencies(projection, generation=lambda: adapter.generation),
         capability_provider=services.PlanControlCapabilities(projection),
         options=control.ControlChunkExecutorOptions(rate_policy=rate_policy),
+        plan_digest=projection.plan_digest,
     )
     driver = control.ControlAuthorityDriver(executor, adapter)
     planning_raw = planning_module._RawPlanningRoot(
