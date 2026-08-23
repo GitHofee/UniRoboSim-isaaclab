@@ -1,6 +1,8 @@
 """Backend identity and launch-profile-aware capabilities."""
 
 from unirobosim import (
+    PHYSICAL_WORLD_SCHEMA_VERSION,
+    WORLD_SCHEMA_VERSION,
     CapabilityDeclaration,
     CapabilityId,
     CapabilitySet,
@@ -79,7 +81,15 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
+        CapabilityDeclaration(
+            CapabilityId("state.articulation.axis-units@1"),
+            FrozenMap({"position_units": ["rad", "m"], "velocity_units": ["rad/s", "m/s"]}),
+        ),
         CapabilityDeclaration(CapabilityId("control.articulation.position@1")),
+        CapabilityDeclaration(
+            CapabilityId("control.articulation.position.axis-units@1"),
+            FrozenMap({"target_units": ["rad", "m"]}),
+        ),
         CapabilityDeclaration(CapabilityId("control.articulation.velocity@1")),
         CapabilityDeclaration(CapabilityId("control.articulation.effort@1")),
         CapabilityDeclaration(
@@ -210,8 +220,9 @@ DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
     version=DISTRIBUTION_VERSION,
-    contract_version="v0alpha4",
+    contract_version="v0alpha5",
     capabilities=CAPABILITIES,
+    supported_world_schema_versions=(WORLD_SCHEMA_VERSION, PHYSICAL_WORLD_SCHEMA_VERSION),
     metadata=FrozenMap(
         {
             "isaac_lab_release": "3.0.0-beta2",
@@ -239,6 +250,7 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
             version=DESCRIPTOR.version,
             contract_version=DESCRIPTOR.contract_version,
             capabilities=capabilities,
+            supported_world_schema_versions=DESCRIPTOR.supported_world_schema_versions,
             metadata=FrozenMap(
                 {
                     **DESCRIPTOR.metadata.to_dict(),

@@ -11,12 +11,16 @@ from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import unquote, urlparse
 
 from unirobosim import (
+    ARTICULATION_AXIS_UNITS_MISMATCH,
+    ARTICULATION_POSITION_AXIS_UNITS_UNSUPPORTED,
+    PHYSICAL_WORLD_SCHEMA_VERSION,
     ArrayValue,
     ArticulationCommand,
     ArticulationState,
     BuildFingerprint,
     BuildReport,
     CameraModality,
+    CapabilityId,
     CommandError,
     ContactState,
     DebugBatch,
@@ -59,7 +63,7 @@ from unirobosim import (
     WorldState,
 )
 
-from .native_protocols import NativeWorldDriver, PointBatch
+from .native_protocols import NativeArticulationCommand, NativeCameraCalibration, NativeWorldDriver, PointBatch
 
 if TYPE_CHECKING:
     from .provider import IsaacLabSession
@@ -86,6 +90,7 @@ class IsaacLabWorld:
     ) -> None:
         self._session = session
         self._spec = spec
+        self._descriptor = session.descriptor
         self._generation = generation
         self._native = native
         self._state = WorldState.READY
@@ -94,6 +99,7 @@ class IsaacLabWorld:
         self._scene_sequence = 0
         self._scene_results: dict[str, SceneCommandResult] = {}
         self._drags: dict[str, tuple[EntityPath, int, Pose]] = {}
+        self._pending_articulation_commands: list[NativeArticulationCommand] = []
         self._entities = {entity.path: entity for entity in spec.entities}
         self._build_report = BuildReport(
             fingerprint=BuildFingerprint(
@@ -288,6 +294,7 @@ class IsaacLabWorld:
         environments = self._indices(
             environment_indices, self._spec.environments.count, "environment_indices", operation=operation
         )
+        self._pending_articulation_commands.clear()
         self._native_call(operation, lambda: self._native.reset(environments))
         self._reset_count += 1
         self._scene_sequence += 1
@@ -297,33 +304,95 @@ class IsaacLabWorld:
     def apply_articulation_command(self, command: ArticulationCommand) -> None:
         operation = "world.apply_articulation_command"
         self._ensure_ready(operation)
-        if not isinstance(command, ArticulationCommand):
-            raise CommandError("operation requires an ArticulationCommand", operation=operation)
-        entity = self._validate_handle(command.handle, operation)
-        if entity.kind is not EntityKind.ARTICULATION:
-            raise CommandError("entity is not an articulation", operation=operation, entity_path=entity.path.value)
-        environments = self._indices(
-            command.environment_indices, self._spec.environments.count, "environment_indices", operation=operation
-        )
-        degrees = self._indices(
-            command.degree_of_freedom_indices, len(entity.joint_names), "degree_of_freedom_indices", operation=operation
-        )
-        expected = (len(environments), len(degrees))
-        if command.targets.shape != expected:
-            raise CommandError(
-                "target shape must exactly match selected environments and degrees of freedom",
+        try:
+            if not isinstance(command, ArticulationCommand):
+                raise CommandError("operation requires an ArticulationCommand", operation=operation)
+            entity = self._validate_handle(command.handle, operation)
+            if entity.kind is not EntityKind.ARTICULATION:
+                raise CommandError("entity is not an articulation", operation=operation, entity_path=entity.path.value)
+            environments = self._indices(
+                command.environment_indices,
+                self._spec.environments.count,
+                "environment_indices",
                 operation=operation,
-                backend_id=self._session.descriptor.provider_id,
-                world_id=self.world_id,
-                entity_path=entity.path.value,
-                details={"expected_shape": list(expected), "actual_shape": list(command.targets.shape)},
             )
-        targets = tuple(tuple(float(value) for value in row) for row in command.targets.rows())
-        self._native_call(
-            operation,
-            lambda: self._native.apply_articulation(entity.path, command.mode, targets, environments, degrees),
-            entity_path=entity.path.value,
-        )
+            degrees = self._indices(
+                command.degree_of_freedom_indices,
+                len(entity.joint_names),
+                "degree_of_freedom_indices",
+                operation=operation,
+            )
+            expected = (len(environments), len(degrees))
+            if command.targets.shape != expected:
+                raise CommandError(
+                    "target shape must exactly match selected environments and degrees of freedom",
+                    operation=operation,
+                    backend_id=self._descriptor.provider_id,
+                    world_id=self.world_id,
+                    entity_path=entity.path.value,
+                    details={"expected_shape": list(expected), "actual_shape": list(command.targets.shape)},
+                )
+            base_capability = CapabilityId(f"control.articulation.{command.mode.value}@1")
+            if self._descriptor.capabilities.get(base_capability) is None:
+                raise UnsupportedCapabilityError(
+                    "provider does not support the requested articulation command mode",
+                    operation=operation,
+                    backend_id=self._descriptor.provider_id,
+                    world_id=self.world_id,
+                    entity_path=entity.path.value,
+                    details={"capability_id": base_capability.value, "mode": command.mode.value},
+                ) from None
+            position_units = tuple(entity.joint_position_units[index] for index in degrees)
+            expected_units = {
+                "position": position_units,
+                "velocity": tuple("rad/s" if unit == "rad" else "m/s" for unit in position_units),
+                "effort": tuple("N*m" if unit == "rad" else "N" for unit in position_units),
+            }[command.mode.value]
+            actual_units = command.target_units
+            if not actual_units and self._spec.schema_version != PHYSICAL_WORLD_SCHEMA_VERSION:
+                actual_units = expected_units
+            if actual_units != expected_units:
+                raise CommandError(
+                    "command target units do not match selected articulation axes",
+                    operation=operation,
+                    backend_id=self._descriptor.provider_id,
+                    world_id=self.world_id,
+                    entity_path=entity.path.value,
+                    details={
+                        "detail_code": ARTICULATION_AXIS_UNITS_MISMATCH,
+                        "expected_units": expected_units,
+                        "actual_units": actual_units,
+                    },
+                ) from None
+            axis_capability = CapabilityId("control.articulation.position.axis-units@1")
+            if (
+                command.mode.value == "position"
+                and "m" in expected_units
+                and self._descriptor.capabilities.get(axis_capability) is None
+            ):
+                raise UnsupportedCapabilityError(
+                    "provider cannot apply metre articulation position targets",
+                    operation=operation,
+                    backend_id=self._descriptor.provider_id,
+                    world_id=self.world_id,
+                    entity_path=entity.path.value,
+                    details={
+                        "detail_code": ARTICULATION_POSITION_AXIS_UNITS_UNSUPPORTED,
+                        "capability_id": axis_capability.value,
+                    },
+                ) from None
+            targets = tuple(tuple(float(value) for value in row) for row in command.targets.rows())
+            prepared = NativeArticulationCommand(
+                entity.path,
+                command.mode,
+                targets,
+                environments,
+                degrees,
+            )
+        except BaseException:
+            self._pending_articulation_commands.clear()
+            raise
+        self._pending_articulation_commands.append(prepared)
 
     def read_articulation(self, handle: EntityHandle) -> ArticulationState:
         operation = "world.read_articulation"
@@ -334,7 +403,16 @@ class IsaacLabWorld:
         position, velocity = self._native_call(
             operation, lambda: self._native.read_articulation(entity.path), entity_path=entity.path.value
         )
-        return ArticulationState(ArrayValue.from_rows(position), ArrayValue.from_rows(velocity), self.tick)
+        return ArticulationState(
+            entity_id=entity.path.value,
+            generation=self.generation,
+            tick=self.tick,
+            joint_names=entity.joint_names,
+            joint_positions=ArrayValue.from_rows(position),
+            joint_velocities=ArrayValue.from_rows(velocity),
+            joint_position_units=entity.joint_position_units,
+            joint_velocity_units=tuple("rad/s" if unit == "rad" else "m/s" for unit in entity.joint_position_units),
+        )
 
     def apply_rigid_body_command(self, command: RigidBodyCommand) -> None:
         operation = "world.apply_rigid_body_command"
@@ -569,6 +647,20 @@ class IsaacLabWorld:
         )
         return SensorSample(handle, channels, self.tick)
 
+    def read_camera_calibration(self, handle: EntityHandle) -> NativeCameraCalibration:
+        """Read effective native camera parameters without advancing physics."""
+
+        operation = "world.read_camera_calibration"
+        self._ensure_ready(operation)
+        entity = self._validate_handle(handle, operation)
+        if entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None:
+            raise CommandError("entity is not a camera sensor", operation=operation, entity_path=entity.path.value)
+        return self._native_call(
+            operation,
+            lambda: self._native.camera_calibration(entity.path),
+            entity_path=entity.path.value,
+        )
+
     def publish_debug(self, batch: DebugBatch) -> DebugPublishReport:
         operation = "world.publish_debug"
         self._ensure_ready(operation)
@@ -601,7 +693,12 @@ class IsaacLabWorld:
         self._ensure_ready("world.step")
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise ValidationError("step count must be a positive integer", operation="world.step")
-        self._native_call("world.step", lambda: self._native.step(count))
+        commands = tuple(self._pending_articulation_commands)
+        self._pending_articulation_commands.clear()
+        self._native_call(
+            "world.step",
+            lambda: self._native.apply_articulation_commands_and_step(commands, count),
+        )
         self._step_index += count
         self._scene_sequence += count
         return self.tick
@@ -803,6 +900,7 @@ class IsaacLabWorld:
         self._state = WorldState.CLOSED
         self._scene_results.clear()
         self._drags.clear()
+        self._pending_articulation_commands.clear()
         self._entities.clear()
         try:
             self._native_call("world.close", self._native.close)

@@ -35,6 +35,20 @@ NativeSensorSample = tuple[NativeSensorChannel, ...]
 NativeDebugReport = tuple[int, int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class NativeCameraCalibration:
+    """Effective calibration read back from one initialized native camera."""
+
+    resolution_px: tuple[int, int]
+    intrinsic_matrix: tuple[float, ...]
+    projection: str
+    focal_length: float
+    horizontal_aperture: float
+    clipping_range_m: tuple[float, float]
+    position_m: Vector3
+    orientation_opengl_xyzw: Quaternion
+
+
 class NativePlanningError(RuntimeError):
     """Bounded private failure transported across the native worker seam."""
 
@@ -96,6 +110,17 @@ class NativePlanningResource:
     sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class NativeArticulationCommand:
+    """One fully validated articulation setter queued for a native physics tick."""
+
+    path: EntityPath
+    mode: CommandMode
+    targets: Matrix
+    environment_indices: tuple[int, ...]
+    degree_of_freedom_indices: tuple[int, ...]
+
+
 class NativeWorldDriver(Protocol):
     def reset(self, environment_indices: tuple[int, ...]) -> None: ...
 
@@ -109,6 +134,12 @@ class NativeWorldDriver(Protocol):
     ) -> None: ...
 
     def read_articulation(self, path: EntityPath) -> tuple[Matrix, Matrix]: ...
+
+    def apply_articulation_commands_and_step(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+    ) -> None: ...
 
     def apply_rigid_body_wrench(
         self,
@@ -152,6 +183,8 @@ class NativeWorldDriver(Protocol):
     def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]: ...
 
     def read_sensor(self, path: EntityPath) -> NativeSensorSample: ...
+
+    def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration: ...
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport: ...
 

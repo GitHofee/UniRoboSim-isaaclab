@@ -421,7 +421,9 @@ def test_articulation_commands_and_read(mode: CommandMode, tmp_path: Path) -> No
         degree_of_freedom_indices=(0,),
     )
     world.apply_articulation_command(command)
-    call = runtime.worlds[0].calls[-1]
+    assert runtime.worlds[0].calls == []
+    world.step()
+    call = next(item for item in runtime.worlds[0].calls if item[0] == "articulation")
     assert call[0] == "articulation"
     assert call[1][1] is mode
     state = world.read_articulation(handle)

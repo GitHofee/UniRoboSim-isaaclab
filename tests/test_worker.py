@@ -233,6 +233,9 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     assert fluid[0][0][0] == (0.0, 0.0, 1.0)
     world, sensor, _ = _dispatch(runtime, world, ("read_sensor", (EntityPath("/camera"),)))
     assert tuple(channel[0] for channel in sensor) == (CameraModality.RGB, CameraModality.DEPTH)
+    world, calibration, _ = _dispatch(runtime, world, ("camera_calibration", (EntityPath("/camera"),)))
+    assert calibration.resolution_px == (2, 2)
+    assert calibration.projection == "perspective"
     batch = debug_batch()
     world, report, _ = _dispatch(runtime, world, ("publish_debug", (batch,)))
     assert report == (1, 0, 1)

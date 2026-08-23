@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import hashlib
+import inspect
+import math
+from collections.abc import Mapping
+from pathlib import Path
+
+import pytest
+from unirobosim import (
+    ARTICULATION_AXIS_UNITS_MISMATCH,
+    PHYSICAL_WORLD_SCHEMA_VERSION,
+    WORLD_SCHEMA_VERSION,
+    ArrayValue,
+    ArticulationCommand,
+    BoxGeometrySpec,
+    BuildInput,
+    BuildResourceEntry,
+    BuildResourceManifest,
+    BuildSourceEntry,
+    CapabilityId,
+    CommandError,
+    CommandMode,
+    EntityKind,
+    EntityPath,
+    EntitySpec,
+    LocalSourceIdentity,
+    PhysicsSpec,
+    ValidationError,
+    WorldSpec,
+)
+
+from unirobosim_isaaclab.descriptor import DESCRIPTOR
+from unirobosim_isaaclab.droid_acceptance import (
+    _acceptance_world_spec,
+    _effective_camera_calibration,
+    _look_at_xyzw,
+)
+from unirobosim_isaaclab.native import _declared_joint_map
+from unirobosim_isaaclab.native_protocols import NativeCameraCalibration
+
+from .helpers import FakeNativeRuntime
+from .test_lifecycle_world import open_test_session
+
+
+def _build_input(asset: Path) -> BuildInput:
+    payload = asset.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    stat = asset.stat()
+    entry = BuildResourceEntry(
+        entity_id="droid",
+        component_id="robot.droid",
+        resource_id="resource.droid",
+        role="simulation",
+        media_type="model/vnd.usd",
+        requested_uri=str(asset),
+        resolved_uri=str(asset),
+        canonical_source_identity=f"sha256:{digest}",
+        byte_size=len(payload),
+        sha256=digest,
+        selected_simulation_input=True,
+        purposes=("collision", "planning", "simulation", "visual"),
+        relative_bundle_path="droid/droid.usd",
+    )
+    source = BuildSourceEntry(
+        resource_id=entry.resource_id,
+        source_kind="local-file",
+        source_root=str(asset.parent),
+        relative_source_path=asset.name,
+        expected_identity=LocalSourceIdentity(
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_mode,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        ),
+        expected_sha256=digest,
+    )
+    return BuildInput(manifest=BuildResourceManifest((entry,)), sources=(source,))
+
+
+def _physical_world(asset: Path, build_input: BuildInput) -> WorldSpec:
+    return WorldSpec(
+        "droid-physical",
+        (
+            EntitySpec(
+                EntityPath("/droid"),
+                EntityKind.ARTICULATION,
+                joint_names=("revolute", "prismatic"),
+                initial_joint_positions=(0.0, 0.1),
+                joint_position_units=("rad", "m"),
+                asset_uri=str(asset),
+            ),
+        ),
+        schema_version=PHYSICAL_WORLD_SCHEMA_VERSION,
+        build_resource_manifest_sha256=build_input.manifest.sha256,
+    )
+
+
+def test_descriptor_and_session_expose_the_core_090_contract() -> None:
+    assert DESCRIPTOR.supported_world_schema_versions == (WORLD_SCHEMA_VERSION, PHYSICAL_WORLD_SCHEMA_VERSION)
+    assert DESCRIPTOR.capabilities.get(CapabilityId("state.articulation.axis-units@1")) is not None
+    assert DESCRIPTOR.capabilities.get(CapabilityId("control.articulation.position.axis-units@1")) is not None
+    signature = inspect.signature(open_test_session(FakeNativeRuntime())[1].build)
+    assert signature.parameters["build_input"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_v5_build_input_and_articulation_state_are_self_describing(tmp_path: Path) -> None:
+    asset = tmp_path / "droid.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    build_input = _build_input(asset)
+    spec = _physical_world(asset, build_input)
+    runtime = FakeNativeRuntime()
+    _, session = open_test_session(runtime)
+    with pytest.raises(ValidationError):
+        session.build(spec)
+    world = session.build(spec, build_input=build_input)
+    state = world.read_articulation(world.resolve(EntityPath("/droid")))
+    assert state.entity_id == "/droid"
+    assert state.generation == world.generation
+    assert state.joint_names == ("revolute", "prismatic")
+    assert state.joint_position_units == ("rad", "m")
+    assert state.joint_velocity_units == ("rad/s", "m/s")
+
+
+def test_tick_batches_disjoint_resource_groups_before_one_native_step(tmp_path: Path) -> None:
+    asset = tmp_path / "droid.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    build_input = _build_input(asset)
+    runtime = FakeNativeRuntime()
+    _, session = open_test_session(runtime)
+    world = session.build(_physical_world(asset, build_input), build_input=build_input)
+    handle = world.resolve(EntityPath("/droid"))
+    world.apply_articulation_command(
+        ArticulationCommand(
+            handle,
+            CommandMode.POSITION,
+            ArrayValue.from_rows(((0.25,),)),
+            degree_of_freedom_indices=(0,),
+            target_units=("rad",),
+        )
+    )
+    world.apply_articulation_command(
+        ArticulationCommand(
+            handle,
+            CommandMode.POSITION,
+            ArrayValue.from_rows(((0.04,),)),
+            degree_of_freedom_indices=(1,),
+            target_units=("m",),
+        )
+    )
+    assert runtime.worlds[0].calls == []
+    world.step()
+    assert [call[0] for call in runtime.worlds[0].calls] == [
+        "articulation_batch",
+        "articulation",
+        "articulation",
+        "step",
+    ]
+
+
+def test_failed_second_command_discards_the_uncommitted_tick(tmp_path: Path) -> None:
+    asset = tmp_path / "droid.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    build_input = _build_input(asset)
+    runtime = FakeNativeRuntime()
+    _, session = open_test_session(runtime)
+    world = session.build(_physical_world(asset, build_input), build_input=build_input)
+    handle = world.resolve(EntityPath("/droid"))
+    world.apply_articulation_command(
+        ArticulationCommand(
+            handle,
+            CommandMode.POSITION,
+            ArrayValue.from_rows(((0.25,),)),
+            degree_of_freedom_indices=(0,),
+            target_units=("rad",),
+        )
+    )
+    with pytest.raises(CommandError) as caught:
+        world.apply_articulation_command(
+            ArticulationCommand(
+                handle,
+                CommandMode.POSITION,
+                ArrayValue.from_rows(((0.04,),)),
+                degree_of_freedom_indices=(1,),
+                target_units=("rad",),
+            )
+        )
+    assert caught.value.details["detail_code"] == ARTICULATION_AXIS_UNITS_MISMATCH
+    world.step()
+    batch = runtime.worlds[0].calls[0]
+    assert batch[0] == "articulation_batch" and batch[1] == ()
+    assert [call[0] for call in runtime.worlds[0].calls] == ["articulation_batch", "step"]
+
+
+def test_declared_joint_map_accepts_arm_and_gripper_subsets_without_robot_assumptions() -> None:
+    native = ("arm_1", "arm_2", "finger_left", "finger_right")
+    assert _declared_joint_map(EntityPath("/generic"), native, ("arm_1", "arm_2")) == (0, 1)
+    assert _declared_joint_map(EntityPath("/generic"), native, ("finger_left", "finger_right")) == (2, 3)
+    with pytest.raises(ValueError, match="not a subset"):
+        _declared_joint_map(EntityPath("/generic"), native, ("missing",))
+
+
+def test_droid_acceptance_world_pins_cross_backend_zero_gravity() -> None:
+    base = WorldSpec(
+        "droid-acceptance-gravity",
+        (
+            EntitySpec(
+                EntityPath("/marker"),
+                EntityKind.RIGID_BODY,
+                box=BoxGeometrySpec((0.1, 0.1, 0.1), 0.1),
+            ),
+        ),
+        physics=PhysicsSpec(time_step_seconds=1.0 / 240.0, gravity_m_s2=(0.0, 0.0, -9.81)),
+    )
+    effective = _acceptance_world_spec(
+        base,
+        entities=base.entities,
+        requirements=(),
+        gravity_m_s2=(0.0, 0.0, 0.0),
+    )
+    assert base.physics.gravity_m_s2 == (0.0, 0.0, -9.81)
+    assert effective.physics.gravity_m_s2 == (0.0, 0.0, 0.0)
+    assert effective.physics.time_step_seconds == 1.0 / 240.0
+
+
+def test_droid_effective_camera_metadata_is_derived_from_native_calibration() -> None:
+    eye = (2.2, -2.2, 1.6)
+    look_at = (0.0, 0.0, 0.65)
+    up = (0.0, 0.0, 1.0)
+    focus_distance = math.sqrt(sum((look_at[index] - eye[index]) ** 2 for index in range(3)))
+    focal_px = 1920.0 / (2.0 * math.tan(math.radians(60.0) / 2.0))
+    native = NativeCameraCalibration(
+        resolution_px=(1920, 1080),
+        intrinsic_matrix=(focal_px, 0.0, 960.0, 0.0, focal_px, 540.0, 0.0, 0.0, 1.0),
+        projection="perspective",
+        focal_length=18.147302994931884,
+        horizontal_aperture=20.955,
+        clipping_range_m=(0.05, 20.0),
+        position_m=eye,
+        orientation_opengl_xyzw=_look_at_xyzw(eye, look_at, up),
+    )
+    effective = _effective_camera_calibration(native, focus_distance_m=focus_distance, up_reference=up)
+    assert effective["schema_version"] == "unirobosim-effective-camera-calibration/1"
+    assert effective["K_row_major"] == native.intrinsic_matrix
+    assert effective["resolution_px"] == (1920, 1080)
+    projection = effective["projection"]
+    extrinsics = effective["extrinsics"]
+    assert isinstance(projection, Mapping)
+    assert isinstance(extrinsics, Mapping)
+    assert projection["horizontal_fov_deg"] == pytest.approx(60.0)
+    assert projection["vertical_fov_deg"] == pytest.approx(35.98339777135764)
+    assert extrinsics["eye_m"] == pytest.approx(eye)
+    assert extrinsics["look_at_m"] == pytest.approx(look_at)
+    assert extrinsics["up"] == up

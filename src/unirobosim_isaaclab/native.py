@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from unirobosim import (
     CameraModality,
@@ -31,7 +31,14 @@ from unirobosim import (
 
 from .config import _ANTI_ALIASING_MODES, IsaacLabAdapterConfig
 from .native_debug import NativeDebugOverlay, NativeDebugPayload
-from .native_protocols import Matrix, NativeDebugReport, NativeSensorSample, PointBatch
+from .native_protocols import (
+    Matrix,
+    NativeArticulationCommand,
+    NativeCameraCalibration,
+    NativeDebugReport,
+    NativeSensorSample,
+    PointBatch,
+)
 
 Vector3 = tuple[float, float, float]
 Segment = tuple[Vector3, Vector3]
@@ -283,6 +290,21 @@ def _ensure_launcher_setting(setting: str) -> None:
 def _native_name(path: EntityPath) -> str:
     digest = hashlib.sha256(path.value.encode()).hexdigest()[:10]
     return f"{path.name.replace('-', '_').replace('.', '_')}_{digest}"
+
+
+def _declared_joint_map(
+    path: EntityPath,
+    native_names: tuple[str, ...],
+    declared_names: tuple[str, ...],
+) -> tuple[int, ...]:
+    """Map any declared articulation subset without assuming a robot topology."""
+
+    if not set(declared_names).issubset(native_names):
+        raise ValueError(
+            f"declared joint names for {path.value} are not a subset of the USD; "
+            f"declared={declared_names}, native={native_names}"
+        )
+    return tuple(native_names.index(name) for name in declared_names)
 
 
 def _environment_origins(count: int, spacing: float) -> tuple[tuple[float, float, float], ...]:
@@ -1091,12 +1113,7 @@ class IsaacLabNativeWorld:
         for path, asset in self._articulations.items():
             entity = next(item for item in self._spec.entities if item.path == path)
             native_names = tuple(asset.joint_names)
-            if set(native_names) != set(entity.joint_names) or len(native_names) != len(entity.joint_names):
-                raise ValueError(
-                    f"joint names for {path.value} do not exactly match the USD; "
-                    f"declared={entity.joint_names}, native={native_names}"
-                )
-            joint_map = tuple(native_names.index(name) for name in entity.joint_names)
+            joint_map = _declared_joint_map(path, native_names, entity.joint_names)
             self._joint_maps[path] = joint_map
             root_pose = asset.data.default_root_pose.torch.clone()
             assert self._origins is not None
@@ -1129,12 +1146,7 @@ class IsaacLabNativeWorld:
                     f"expected={expected_paths}, actual={tuple(view.prim_paths)}"
                 )
             native_names = tuple(view.shared_metatype.dof_names)
-            if set(native_names) != set(entity.joint_names) or len(native_names) != len(entity.joint_names):
-                raise ValueError(
-                    f"joint names for {path.value} do not exactly match the USD; "
-                    f"declared={entity.joint_names}, native={native_names}"
-                )
-            joint_map = tuple(native_names.index(name) for name in entity.joint_names)
+            joint_map = _declared_joint_map(path, native_names, entity.joint_names)
             self._joint_maps[path] = joint_map
             root_pose = view.get_root_transforms().clone()
             root_velocity = view.get_root_velocities().clone()
@@ -1315,6 +1327,46 @@ class IsaacLabNativeWorld:
             damping=self._m.torch.full_like(target, damping), joint_ids=joint_ids, env_ids=env_ids
         )
         asset.write_data_to_sim()
+
+    def _validate_articulation_command(self, command: NativeArticulationCommand) -> None:
+        if type(command) is not NativeArticulationCommand or command.path not in self._joint_maps:
+            raise ValueError("articulation command references an unknown native articulation")
+        environment_count = self._spec.environments.count
+        joint_count = len(self._joint_maps[command.path])
+        if (
+            type(command.mode) is not CommandMode
+            or not command.environment_indices
+            or not command.degree_of_freedom_indices
+            or len(command.environment_indices) != len(set(command.environment_indices))
+            or len(command.degree_of_freedom_indices) != len(set(command.degree_of_freedom_indices))
+            or any(index < 0 or index >= environment_count for index in command.environment_indices)
+            or any(index < 0 or index >= joint_count for index in command.degree_of_freedom_indices)
+            or len(command.targets) != len(command.environment_indices)
+            or any(len(row) != len(command.degree_of_freedom_indices) for row in command.targets)
+            or any(not math.isfinite(value) for row in command.targets for value in row)
+        ):
+            raise ValueError("articulation command failed native batch prevalidation")
+
+    def apply_articulation_commands_and_step(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+    ) -> None:
+        """Validate a complete control tick, apply every setter, then step once."""
+
+        if type(commands) is not tuple or type(count) is not int or count <= 0:
+            raise ValueError("native articulation batch and step count are invalid")
+        for command in commands:
+            self._validate_articulation_command(command)
+        for command in commands:
+            self.apply_articulation(
+                command.path,
+                command.mode,
+                command.targets,
+                command.environment_indices,
+                command.degree_of_freedom_indices,
+            )
+        self.step(count)
 
     def _apply_usd_articulation(
         self,
@@ -1588,6 +1640,39 @@ class IsaacLabNativeWorld:
                 channel_values = tuple(float(item) for item in tensor.detach().cpu().reshape(-1).tolist())
             channels.append((modality, shape, channel_values))
         return tuple(channels)
+
+    def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
+        """Read the effective camera state authored into Isaac/USD."""
+
+        camera = self._cameras[path]
+        camera.update(0.0, force_recompute=True)
+        data = camera.data
+        if data.image_shape is None:
+            raise RuntimeError("native camera has no effective image shape")
+        height, width = (int(value) for value in data.image_shape)
+        matrices = data.intrinsic_matrices.torch.detach().cpu()
+        positions = data.pos_w.torch.detach().cpu()
+        orientations = data.quat_w_opengl.torch.detach().cpu()
+        if matrices.shape != (1, 3, 3) or positions.shape != (1, 3) or orientations.shape != (1, 4):
+            raise RuntimeError("native camera calibration requires exactly one initialized view")
+        sensor_prims = tuple(camera._sensor_prims)
+        if len(sensor_prims) != 1:
+            raise RuntimeError("native camera calibration requires exactly one USD camera prim")
+        sensor_prim = sensor_prims[0]
+        clipping = sensor_prim.GetClippingRangeAttr().Get()
+        return NativeCameraCalibration(
+            resolution_px=(width, height),
+            intrinsic_matrix=tuple(float(value) for value in matrices[0].reshape(-1).tolist()),
+            projection=str(sensor_prim.GetProjectionAttr().Get()),
+            focal_length=float(sensor_prim.GetFocalLengthAttr().Get()),
+            horizontal_aperture=float(sensor_prim.GetHorizontalApertureAttr().Get()),
+            clipping_range_m=(float(clipping[0]), float(clipping[1])),
+            position_m=cast(tuple[float, float, float], tuple(float(value) for value in positions[0].tolist())),
+            orientation_opengl_xyzw=cast(
+                tuple[float, float, float, float],
+                tuple(float(value) for value in orientations[0].tolist()),
+            ),
+        )
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport:
         for primitive in batch.primitives:

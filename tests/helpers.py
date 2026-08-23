@@ -21,7 +21,13 @@ from unirobosim import (
     WorldSpec,
 )
 
-from unirobosim_isaaclab.native_protocols import Matrix, NativeSensorSample, PointBatch
+from unirobosim_isaaclab.native_protocols import (
+    Matrix,
+    NativeArticulationCommand,
+    NativeCameraCalibration,
+    NativeSensorSample,
+    PointBatch,
+)
 
 
 def available_probe(config: object, descriptor: ProviderDescriptor) -> ProbeReport:
@@ -112,6 +118,22 @@ class FakeNativeWorld:
         self.calls.append(("read_articulation", path))
         count = self.spec.environments.count
         return tuple((0.2, -0.1) for _ in range(count)), tuple((0.0, 0.0) for _ in range(count))
+
+    def apply_articulation_commands_and_step(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+    ) -> None:
+        self.calls.append(("articulation_batch", commands))
+        for command in commands:
+            self.apply_articulation(
+                command.path,
+                command.mode,
+                command.targets,
+                command.environment_indices,
+                command.degree_of_freedom_indices,
+            )
+        self.step(count)
 
     def apply_rigid_body_wrench(
         self,
@@ -210,6 +232,21 @@ class FakeNativeWorld:
                 values = (1.25,) * math.prod(shape)
             channels.append((modality, shape, values))
         return tuple(channels)
+
+    def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
+        self.calls.append(("camera_calibration", path))
+        entity = next(item for item in self.spec.entities if item.path == path)
+        assert entity.camera is not None
+        return NativeCameraCalibration(
+            resolution_px=(entity.camera.width_px, entity.camera.height_px),
+            intrinsic_matrix=(3.0, 0.0, 1.0, 0.0, 3.0, 1.0, 0.0, 0.0, 1.0),
+            projection="perspective",
+            focal_length=20.0,
+            horizontal_aperture=10.0,
+            clipping_range_m=(entity.camera.near_plane_m, entity.camera.far_plane_m),
+            position_m=(0.0, 0.0, 0.0),
+            orientation_opengl_xyzw=(0.0, 0.0, 0.0, 1.0),
+        )
 
     def publish_debug(self, batch: DebugBatch) -> tuple[int, int, int]:
         self.calls.append(("publish_debug", batch))

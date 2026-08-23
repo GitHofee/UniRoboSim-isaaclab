@@ -31,10 +31,10 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.7.1"
+    assert unirobosim_isaaclab.__version__ == "0.9.0"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
-    assert DESCRIPTOR.contract_version == "v0alpha4"
+    assert DESCRIPTOR.contract_version == "v0alpha5"
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
     assert CAPABILITIES.get(CapabilityId("control.rigid_body.wrench@1")) is not None
     assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None

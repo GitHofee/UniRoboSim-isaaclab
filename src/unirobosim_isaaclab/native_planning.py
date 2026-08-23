@@ -518,7 +518,7 @@ class _PlanningAdmission:
         movable_names = tuple(model[3] for model in ordered_joint_models if model[3] is not None)
         if spec.kind is EntityKind.ARTICULATION:
             asset_names = tuple(self._world._articulations[spec.path].joint_names)
-            if set(movable_names) != set(asset_names) or set(spec.joint_names) != set(asset_names):
+            if set(movable_names) != set(asset_names) or not set(spec.joint_names).issubset(asset_names):
                 raise NativePlanningError("topology_unsupported")
         elif movable_names:
             raise NativePlanningError("topology_unsupported")
@@ -672,9 +672,7 @@ class _PlanningAdmission:
         if locked is not None:
             return PlanningEntityKind(locked)
         if spec.kind is EntityKind.ARTICULATION:
-            return (
-                PlanningEntityKind.ROBOT if spec.path.value.startswith("/robots/") else PlanningEntityKind.ARTICULATION
-            )
+            return PlanningEntityKind.ARTICULATION
         return PlanningEntityKind.RIGID_OBJECT
 
     def _joint_type(self, prim: Any) -> PlanningJointType | None:

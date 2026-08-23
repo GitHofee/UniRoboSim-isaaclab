@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import os
+import stat
 from collections.abc import Callable, Iterable
 from types import TracebackType
 from typing import cast
 
 from unirobosim import (
+    ASSET_DEPENDENCY_INCOMPLETE,
+    ASSET_IDENTITY_CHANGED,
+    WORLD_SCHEMA_UNSUPPORTED,
+    BuildInput,
     CapabilityNegotiationError,
     CapabilityRequirement,
     LifecycleError,
@@ -18,6 +25,7 @@ from unirobosim import (
     ProviderSelectionError,
     SessionState,
     UniRoboSimError,
+    UnsupportedCapabilityError,
     ValidationError,
     WorldBuildError,
     WorldSpec,
@@ -154,10 +162,129 @@ class IsaacLabSession:
         self._ensure_open("session.negotiate", allow_ready=True)
         return self.descriptor.capabilities.negotiate(tuple(requirements))
 
-    def build(self, spec: WorldSpec) -> IsaacLabWorld:
+    @staticmethod
+    def _validate_build_sources(build_input: BuildInput) -> tuple[str, str | None, str | None] | None:
+        for source in build_input.sources:
+            descriptors: list[int] = []
+            failure: tuple[str, str | None, str | None] | None = None
+            try:
+                directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                current = os.open(os.path.sep, directory_flags)
+                descriptors.append(current)
+                for part in source.source_root.split(os.path.sep):
+                    if not part:
+                        continue
+                    current = os.open(part, directory_flags, dir_fd=current)
+                    descriptors.append(current)
+                parts = source.relative_source_path.split("/")
+                for part in parts[:-1]:
+                    current = os.open(part, directory_flags, dir_fd=current)
+                    descriptors.append(current)
+                file_descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+                descriptors.append(file_descriptor)
+                before = os.fstat(file_descriptor)
+                identity = source.expected_identity
+                actual_identity = (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_mode,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                expected_identity = (
+                    identity.device,
+                    identity.inode,
+                    identity.mode,
+                    identity.byte_size,
+                    identity.mtime_ns,
+                    identity.ctime_ns,
+                )
+                digest = hashlib.sha256()
+                byte_size = 0
+                while chunk := os.read(file_descriptor, 1024 * 1024):
+                    byte_size += len(chunk)
+                    digest.update(chunk)
+                after = os.fstat(file_descriptor)
+                final_identity = (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mode,
+                    after.st_size,
+                    after.st_mtime_ns,
+                )
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or actual_identity != expected_identity
+                    or final_identity != actual_identity[:-1]
+                    or after.st_ctime_ns != before.st_ctime_ns
+                    or byte_size != identity.byte_size
+                    or digest.hexdigest() != source.expected_sha256
+                ):
+                    failure = (source.resource_id, source.expected_sha256[:12], digest.hexdigest()[:12])
+            except OSError as caught:
+                _scrub_exception(caught)
+                failure = (source.resource_id, None, None)
+            finally:
+                for descriptor in reversed(descriptors):
+                    try:
+                        os.close(descriptor)
+                    except OSError as caught:
+                        _scrub_exception(caught)
+                        failure = (source.resource_id, None, None)
+            if failure is not None:
+                return failure
+        return None
+
+    def build(self, spec: WorldSpec, *, build_input: BuildInput | None = None) -> IsaacLabWorld:
         self._ensure_open("session.build")
         if not isinstance(spec, WorldSpec):
             raise ValidationError("build requires a WorldSpec", operation="session.build")
+        if spec.schema_version not in self.descriptor.supported_world_schema_versions:
+            build_input = None
+            raise UnsupportedCapabilityError(
+                "provider does not support the requested World schema",
+                operation="session.build",
+                backend_id=self.descriptor.provider_id,
+                world_id=spec.world_id,
+                details={
+                    "detail_code": WORLD_SCHEMA_UNSUPPORTED,
+                    "requested_schema": spec.schema_version,
+                    "supported_world_schema_versions": self.descriptor.supported_world_schema_versions,
+                },
+            ) from None
+        if spec.build_resource_manifest_sha256 is None:
+            if build_input is not None:
+                build_input = None
+                raise ValidationError(
+                    "asset-free World cannot receive BuildInput",
+                    operation="session.build",
+                    details={"detail_code": ASSET_DEPENDENCY_INCOMPLETE},
+                ) from None
+        elif type(build_input) is not BuildInput or build_input.manifest.sha256 != spec.build_resource_manifest_sha256:
+            build_input = None
+            raise ValidationError(
+                "World and BuildInput manifest identities do not match",
+                operation="session.build",
+                details={"detail_code": ASSET_DEPENDENCY_INCOMPLETE},
+            ) from None
+        else:
+            source_failure = self._validate_build_sources(build_input)
+            build_input = None
+            if source_failure is not None:
+                resource_id, expected_prefix, actual_prefix = source_failure
+                details: dict[str, object] = {
+                    "detail_code": ASSET_IDENTITY_CHANGED,
+                    "resource_id": resource_id,
+                }
+                if expected_prefix is not None and actual_prefix is not None:
+                    details["expected_sha256_prefix"] = expected_prefix
+                    details["actual_sha256_prefix"] = actual_prefix
+                raise ValidationError(
+                    "build source identity changed",
+                    operation="session.build",
+                    details=details,
+                ) from None
         negotiation = self.negotiate(spec.requirements)
         if not negotiation.accepted:
             raise CapabilityNegotiationError(

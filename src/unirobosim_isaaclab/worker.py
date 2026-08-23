@@ -20,6 +20,8 @@ from unirobosim import CommandMode, DebugBatch, EntityPath, PointCommandMode, Wo
 from .config import IsaacLabAdapterConfig
 from .native_protocols import (
     Matrix,
+    NativeArticulationCommand,
+    NativeCameraCalibration,
     NativePlanningCatalog,
     NativePlanningError,
     NativePlanningResource,
@@ -151,6 +153,12 @@ def _dispatch(
         return active, None, False
     if operation == "read_articulation":
         return active, active.read_articulation(cast(EntityPath, args[0])), False
+    if operation == "apply_articulation_commands_and_step":
+        active.apply_articulation_commands_and_step(
+            cast(tuple[NativeArticulationCommand, ...], args[0]),
+            cast(int, args[1]),
+        )
+        return active, None, False
     if operation == "apply_rigid_body_wrench":
         active.apply_rigid_body_wrench(
             cast(EntityPath, args[0]),
@@ -194,6 +202,8 @@ def _dispatch(
         return active, active.read_particle_fluid(cast(EntityPath, args[0])), False
     if operation == "read_sensor":
         return active, active.read_sensor(cast(EntityPath, args[0])), False
+    if operation == "camera_calibration":
+        return active, active.camera_calibration(cast(EntityPath, args[0])), False
     if operation == "planning_catalog":
         planning = cast(NativePlanningWorldDriver, active)
         return active, planning.planning_catalog(cast(int, args[0])), False
@@ -518,6 +528,14 @@ class IsaacLabWorkerWorld:
         self._ensure_open("read_articulation")
         return cast(tuple[Matrix, Matrix], self._runtime._request("read_articulation", path))
 
+    def apply_articulation_commands_and_step(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+    ) -> None:
+        self._ensure_open("apply_articulation_commands_and_step")
+        self._runtime._request("apply_articulation_commands_and_step", commands, count)
+
     def apply_rigid_body_wrench(
         self,
         path: EntityPath,
@@ -606,6 +624,10 @@ class IsaacLabWorkerWorld:
     def read_sensor(self, path: EntityPath) -> NativeSensorSample:
         self._ensure_open("read_sensor")
         return cast(NativeSensorSample, self._runtime._request("read_sensor", path))
+
+    def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
+        self._ensure_open("camera_calibration")
+        return cast(NativeCameraCalibration, self._runtime._request("camera_calibration", path))
 
     def publish_debug(self, batch: DebugBatch) -> tuple[int, int, int]:
         self._ensure_open("publish_debug")
