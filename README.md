@@ -2,19 +2,19 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`unirobosim-isaaclab` connects UniRoboSim `0.7.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
+`unirobosim-isaaclab` connects UniRoboSim `0.9.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
 
 ## Compatibility
 
 | Item | Verified version |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.7.1,<0.8` |
+| UniRoboSim | `>=0.9,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
 | PyTorch | `2.10.0+cu128` |
-| Runtime contract | `v0alpha4` |
+| Runtime contract | `v0alpha5` |
 
 ## Installation
 
@@ -59,6 +59,27 @@ with Sim(backend="isaaclab", world_id="isaac-demo") as sim:
     print(box.state)
     print(camera.read("rgb").shape)
 ```
+
+The installed `unirobosim.backends/isaaclab` entry point uses a headless camera/render
+profile by default. Opt into a real Kit window for an interactive FastSim or EasyAPI
+run with one exact environment value:
+
+```bash
+UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE=visible python run_simulation.py
+```
+
+The complete public profile contract is:
+
+| Value | Launch behavior |
+| --- | --- |
+| unset | Headless, cameras enabled, rendering enabled |
+| `headless` | Headless, cameras enabled, rendering enabled |
+| `visible` | Visible Kit window, cameras enabled, rendering enabled |
+
+Values are case-sensitive. Any other value fails before the Isaac SDK is loaded.
+The adapter does not infer a profile from `DISPLAY`, so batch behavior is stable across
+machines. This selector applies only to normal installed entry-point discovery;
+`create_provider(IsaacLabAdapterConfig(...))` remains the explicit programmatic API.
 
 Use provider injection for launch settings that do not belong in the portable world:
 
@@ -109,7 +130,7 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.7.1 requires UniRoboSim Core 0.7.1 and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
+Adapter 0.9.1 requires UniRoboSim Core `>=0.9,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
 
 ## Verification
 
@@ -122,7 +143,12 @@ pytest -q
 python scripts/native_conformance.py --output result.json
 ```
 
-The 0.7.1 release source and installed artifacts pass 102 adapter tests. The native acceptance matrix covers rigid/contact, surface/volume deformables, robot and non-robot articulations, particle fluid, RGB/depth, native debug, provider reopen, planning-scene catalog/state/delta/resource reads, multiple environments, and clean-interpreter startup.
+The release gate covers the SDK-free source suite, deterministic artifacts, isolated
+wheel installation, and installed entry-point discovery. The native acceptance matrix
+covers rigid/contact, surface/volume deformables, robot and non-robot articulations,
+particle fluid, RGB/depth, native debug, provider reopen, planning-scene
+catalog/state/delta/resource reads, multiple environments, and clean-interpreter
+startup.
 
 ## Repository relationship
 

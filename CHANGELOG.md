@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.1
+
+- Add the public `UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE` entry-point profile selector.
+- Preserve the headless camera/render batch default while allowing an exact `visible`
+  opt-in for normal backend discovery.
+- Reject unknown profile values before loading the native Isaac SDK, without reflecting
+  untrusted environment content in errors.
+
 ## 0.7.0
 
 - Join the coordinated UniRoboSim 0.7 release train.

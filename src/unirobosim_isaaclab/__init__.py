@@ -1,5 +1,9 @@
 """Public lightweight entry point for the Isaac Lab adapter."""
 
+import os
+
+from unirobosim import ValidationError
+
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
 from .descriptor import CAMERA_CAPABILITIES, CAPABILITIES, DESCRIPTOR, descriptor_for_config
@@ -8,6 +12,7 @@ from .provider import IsaacLabProvider, IsaacLabSession
 from .world import IsaacLabWorld
 
 __version__ = DISTRIBUTION_VERSION
+ISAACLAB_LAUNCH_PROFILE_ENV = "UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE"
 
 
 def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProvider:
@@ -15,9 +20,26 @@ def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProv
 
 
 def create_easy_provider() -> IsaacLabProvider:
-    """Entry-point profile where an EasyAPI camera works without native config."""
+    """Create the installed EasyAPI profile selected explicitly by the environment."""
 
-    return IsaacLabProvider(IsaacLabAdapterConfig(enable_cameras=True, render=True))
+    launch_profile = os.getenv(ISAACLAB_LAUNCH_PROFILE_ENV)
+    if launch_profile is None or launch_profile == "headless":
+        headless = True
+    elif launch_profile == "visible":
+        headless = False
+    else:
+        raise ValidationError(
+            "Isaac Lab launch profile must be unset, 'headless', or 'visible'",
+            operation="isaaclab.launch_profile.resolve",
+        )
+
+    return IsaacLabProvider(
+        IsaacLabAdapterConfig(
+            headless=headless,
+            enable_cameras=True,
+            render=True,
+        )
+    )
 
 
 __all__ = [
@@ -29,6 +51,7 @@ __all__ = [
     "IsaacLabProvider",
     "IsaacLabSession",
     "IsaacLabWorld",
+    "ISAACLAB_LAUNCH_PROFILE_ENV",
     "__version__",
     "create_provider",
     "create_easy_provider",

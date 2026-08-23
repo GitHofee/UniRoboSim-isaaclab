@@ -2,19 +2,19 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`unirobosim-isaaclab` 将 UniRoboSim `0.7.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
+`unirobosim-isaaclab` 将 UniRoboSim `0.9.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
 
 ## 兼容矩阵
 
 | 项目 | 已验证版本 |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.7.1,<0.8` |
+| UniRoboSim | `>=0.9,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
 | PyTorch | `2.10.0+cu128` |
-| Runtime contract | `v0alpha4` |
+| Runtime contract | `v0alpha5` |
 
 ## 安装
 
@@ -59,6 +59,26 @@ with Sim(backend="isaaclab", world_id="isaac-demo") as sim:
     print(box.state)
     print(camera.read("rgb").shape)
 ```
+
+已安装的 `unirobosim.backends/isaaclab` 入口默认使用无头相机/渲染档位。
+FastSim 或 EasyAPI 需要真实 Kit 窗口时，通过一个精确的环境变量值显式启用：
+
+```bash
+UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE=visible python run_simulation.py
+```
+
+完整的公开档位合同如下：
+
+| 值 | 启动行为 |
+| --- | --- |
+| 未设置 | 无头，相机开启，渲染开启 |
+| `headless` | 无头，相机开启，渲染开启 |
+| `visible` | 显示 Kit 窗口，相机开启，渲染开启 |
+
+值区分大小写，其他值会在 Isaac SDK 加载前被拒绝。Adapter 不根据 `DISPLAY`
+自动推断档位，因此同一批处理任务在不同机器上的默认行为一致。这个选择器只作用于
+正常的已安装入口发现；`create_provider(IsaacLabAdapterConfig(...))` 仍是显式的
+程序化配置接口。
 
 需要定制非可移植启动参数时注入 Provider：
 
@@ -109,7 +129,7 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.7.1 要求 UniRoboSim Core 0.7.1，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
+Adapter 0.9.1 要求 UniRoboSim Core `>=0.9,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
 
 ## 验证
 
@@ -122,7 +142,10 @@ pytest -q
 python scripts/native_conformance.py --output result.json
 ```
 
-0.7.1 release 的源码与安装制品通过 102 项 Adapter 测试。原生验收覆盖刚体/接触、表面/体积柔性体、机器人与非机器人铰接体、粒子流体、RGB/深度、Native Debug、Provider 重启、planning-scene catalog/state/delta/resource 读取、多环境以及纯净解释器启动。
+发布门禁覆盖无 SDK 源码测试、确定性制品、隔离 wheel 安装和已安装入口发现。
+原生验收矩阵覆盖刚体/接触、表面/体积柔性体、机器人与非机器人铰接体、粒子流体、
+RGB/深度、Native Debug、Provider 重启、planning-scene catalog/state/delta/resource
+读取、多环境以及纯净解释器启动。
 
 ## 仓库关系
 
