@@ -129,7 +129,7 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.9.1 要求 UniRoboSim Core `>=0.9,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
+Adapter 0.9.2 要求 UniRoboSim Core `>=0.9,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
 
 ## 验证
 

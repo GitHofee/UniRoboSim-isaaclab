@@ -130,7 +130,7 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.9.1 requires UniRoboSim Core `>=0.9,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
+Adapter 0.9.2 requires UniRoboSim Core `>=0.9,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
 
 ## Verification
 

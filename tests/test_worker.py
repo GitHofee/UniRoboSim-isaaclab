@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
+import sys
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import unirobosim
 from unirobosim import (
     ArrayValue,
     CameraModality,
@@ -37,8 +42,14 @@ from unirobosim_isaaclab.worker import (
     _planning_error_reply,
     _proc_stat_session,
     _session_member_pids,
+    _spawn_worker,
     _SubprocessHandle,
     _terminate_worker_tree,
+    _validate_worker_startup,
+    _worker_command,
+    _worker_environment,
+    _worker_package_roots,
+    _worker_startup_fingerprint,
 )
 
 from .helpers import FakeNativeRuntime, FakeNativeWorld, make_articulation_asset, make_world
@@ -136,6 +147,15 @@ class FakeConnection:
         self.closed = True
 
 
+class FakeSpawnConnection(FakeConnection):
+    def __init__(self, descriptor: int, process: FakeProcess) -> None:
+        super().__init__([], process)
+        self.descriptor = descriptor
+
+    def fileno(self) -> int:
+        return self.descriptor
+
+
 class FakePopen:
     def __init__(self) -> None:
         self.pid = 1234
@@ -160,16 +180,175 @@ class FakePopen:
 
 
 def fake_worker_factory(
-    replies: list[object], *, process: FakeProcess | None = None, poll_result: bool = True
+    replies: list[object],
+    *,
+    process: FakeProcess | None = None,
+    poll_result: bool = True,
+    normalize_startup: bool = True,
 ) -> tuple[WorkerFactory, FakeConnection, FakeProcess]:
     handle = process if process is not None else FakeProcess()
-    connection = FakeConnection(replies, handle, poll_result=poll_result)
+    normalized = list(replies)
+    if normalize_startup and normalized and normalized[0] == ("ok", None):
+        normalized[0] = ("ok", _worker_startup_fingerprint())
+    connection = FakeConnection(normalized, handle, poll_result=poll_result)
 
     def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
         del config
         return connection, handle
 
     return cast(WorkerFactory, factory), connection, handle
+
+
+def test_worker_command_and_environment_anchor_loaded_packages(tmp_path: Path) -> None:
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    roots = _worker_package_roots()
+    environment = _worker_environment(
+        {
+            "PYTHONPATH": os.pathsep.join(("", "relative-entry", str(roots[0]), str(extra))),
+            "UNCHANGED": "value",
+        }
+    )
+    entries = tuple(Path(item) for item in environment["PYTHONPATH"].split(os.pathsep))
+    assert entries[: len(roots)] == roots
+    assert entries.count(roots[0]) == 1
+    assert extra.resolve() in entries
+    assert all(item.is_absolute() for item in entries)
+    assert environment["PYTHONSAFEPATH"] == "1"
+    assert environment["UNCHANGED"] == "value"
+
+    command = _worker_command(37)
+    assert command == (
+        sys.executable,
+        "-P",
+        "-B",
+        "-m",
+        "unirobosim_isaaclab.worker_bootstrap",
+        "37",
+    )
+
+
+def test_worker_environment_beats_conflicting_cwd_and_user_pythonpath(tmp_path: Path) -> None:
+    for package in ("unirobosim", "unirobosim_isaaclab"):
+        directory = tmp_path / package
+        directory.mkdir()
+        (directory / "__init__.py").write_text(
+            "raise RuntimeError('conflicting package was imported')\n",
+            encoding="utf-8",
+        )
+    environment = _worker_environment({**os.environ, "PYTHONPATH": str(tmp_path)})
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-P",
+            "-c",
+            "import json; from unirobosim_isaaclab.worker import _worker_startup_fingerprint; "
+            "print(json.dumps(_worker_startup_fingerprint(), sort_keys=True))",
+        ),
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == _worker_startup_fingerprint()
+
+
+def test_spawn_worker_passes_anchored_argv_and_child_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeProcess(pid=1234)
+    parent = FakeSpawnConnection(31, process)
+    child = FakeSpawnConnection(32, process)
+    context = SimpleNamespace(Pipe=lambda *, duplex: (parent, child))
+    captured: dict[str, object] = {}
+    popen = FakePopen()
+
+    def fake_popen(argv: object, **kwargs: object) -> FakePopen:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return popen
+
+    multiprocessing_module = cast(Any, worker_module).__dict__["multiprocessing"]
+    subprocess_module = cast(Any, worker_module).__dict__["subprocess"]
+    monkeypatch.setattr(multiprocessing_module, "get_context", lambda method: context)
+    monkeypatch.setattr(subprocess_module, "Popen", fake_popen)
+    config = IsaacLabAdapterConfig()
+
+    connection, handle = _spawn_worker(config)
+
+    assert cast(Any, connection) is parent
+    assert type(handle) is _SubprocessHandle
+    assert captured["argv"] == _worker_command(32)
+    kwargs = cast(dict[str, object], captured["kwargs"])
+    environment = cast(dict[str, str], kwargs["env"])
+    entries = tuple(Path(item) for item in environment["PYTHONPATH"].split(os.pathsep))
+    assert entries[: len(_worker_package_roots())] == _worker_package_roots()
+    assert kwargs["close_fds"] is True
+    assert kwargs["pass_fds"] == (32,)
+    assert kwargs["start_new_session"] is True
+    assert child.closed
+    assert parent.sent == [config]
+
+
+def test_spawn_worker_failure_closes_both_pipe_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeProcess(pid=1234)
+    parent = FakeSpawnConnection(41, process)
+    child = FakeSpawnConnection(42, process)
+    context = SimpleNamespace(Pipe=lambda *, duplex: (parent, child))
+    multiprocessing_module = cast(Any, worker_module).__dict__["multiprocessing"]
+    subprocess_module = cast(Any, worker_module).__dict__["subprocess"]
+    monkeypatch.setattr(multiprocessing_module, "get_context", lambda method: context)
+    monkeypatch.setattr(
+        subprocess_module,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+
+    with pytest.raises(OSError, match="spawn failed"):
+        _spawn_worker(IsaacLabAdapterConfig())
+    assert parent.closed and child.closed
+
+
+def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
+    fingerprint = _worker_startup_fingerprint()
+    assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/1"
+    assert fingerprint["worker_protocol"] == 1
+    assert fingerprint["adapter"] == {
+        "version": "0.9.2",
+        "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
+    }
+    core = cast(dict[str, object], fingerprint["core"])
+    assert core["version"] == unirobosim.__version__
+    assert Path(cast(str, core["origin"])).is_file()
+    _validate_worker_startup(deepcopy(fingerprint))
+
+    factory, connection, process = fake_worker_factory(
+        [("ok", deepcopy(fingerprint)), ("ok", None)], normalize_startup=False
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    runtime.close()
+    assert connection.closed and not process.alive
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        (("worker_protocol",), 0),
+        (("adapter", "version"), "0.9.1"),
+        (("adapter", "origin"), "/wrong/adapter/__init__.py"),
+        (("core", "version"), "0.7.1"),
+        (("core", "origin"), "/wrong/core/__init__.py"),
+    ],
+)
+def test_worker_startup_rejects_wrong_protocol_version_or_origin(field: tuple[str, ...], bad_value: object) -> None:
+    fingerprint = deepcopy(_worker_startup_fingerprint())
+    target = fingerprint
+    for name in field[:-1]:
+        target = cast(dict[str, object], target[name])
+    target[field[-1]] = bad_value
+    factory, connection, process = fake_worker_factory([("ok", fingerprint)], normalize_startup=False)
+    with pytest.raises(NativeWorkerError, match="startup fingerprint differs"):
+        IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert connection.closed and not process.alive
 
 
 def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
@@ -474,13 +653,14 @@ def test_worker_planning_failure_maps_only_bounded_code(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("startup_reply", "message"),
     [
+        (("ok", None), "startup fingerprint differs"),
         (("error", {"type": "ValueError", "message": "boom", "traceback": "remote trace"}), "ValueError"),
         (("unexpected", None), "invalid native worker reply"),
         (EOFError(), "disconnected"),
     ],
 )
 def test_worker_startup_failures_abort(startup_reply: object, message: str) -> None:
-    factory, connection, process = fake_worker_factory([startup_reply])
+    factory, connection, process = fake_worker_factory([startup_reply], normalize_startup=False)
     with pytest.raises(NativeWorkerError, match=message):
         IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
     assert connection.closed and not process.alive

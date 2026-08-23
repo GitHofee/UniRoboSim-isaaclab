@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.2
+
+- Anchor the clean native worker to the exact Core and adapter package roots loaded by
+  the parent process, independent of the caller's working directory or `PYTHONPATH`.
+- Add a fail-closed startup handshake for worker protocol, package versions, and
+  canonical package origins.
+- Start the clean worker with Python safe-path mode and preserve owned-process cleanup
+  on spawn or handshake failure.
+
 ## 0.9.1
 
 - Add the public `UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE` entry-point profile selector.

@@ -15,7 +15,7 @@ def _write_nondeterministic_sdist(path: Path, *, timestamp: int) -> None:
     with path.open("wb") as output:
         with gzip.GzipFile(filename=path.name, mode="wb", fileobj=output, mtime=timestamp) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-                root = tarfile.TarInfo("unirobosim_isaaclab-0.9.1")
+                root = tarfile.TarInfo("unirobosim_isaaclab-0.9.2")
                 root.type = tarfile.DIRTYPE
                 root.mode = 0o755
                 root.mtime = timestamp
@@ -25,7 +25,7 @@ def _write_nondeterministic_sdist(path: Path, *, timestamp: int) -> None:
                 root.gname = "builder"
                 archive.addfile(root)
                 payload = b"portable source payload\n"
-                member = tarfile.TarInfo("unirobosim_isaaclab-0.9.1/example.txt")
+                member = tarfile.TarInfo("unirobosim_isaaclab-0.9.2/example.txt")
                 member.mode = 0o644
                 member.mtime = timestamp + 1
                 member.uid = 1000
@@ -87,7 +87,7 @@ def test_release_metadata_requires_the_matching_core_contract() -> None:
     project_root = Path(__file__).resolve().parents[1]
     with (project_root / "pyproject.toml").open("rb") as stream:
         project_file = tomllib.load(stream)
-    assert project_file["project"]["version"] == "0.9.1"
+    assert project_file["project"]["version"] == "0.9.2"
     assert project_file["project"]["dependencies"] == ["unirobosim>=0.9,<0.10"]
     assert project_file["project"]["optional-dependencies"]["dev"] == [
         "mypy==1.20.2",

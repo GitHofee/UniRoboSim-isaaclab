@@ -15,8 +15,10 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+import unirobosim
 from unirobosim import CommandMode, DebugBatch, EntityPath, PointCommandMode, WorldSpec
 
+from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
 from .native_protocols import (
     Matrix,
@@ -38,6 +40,8 @@ from .planning_scene import planning_scene_demanded
 
 _CALL_TIMEOUT_SECONDS = 300.0
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
+_WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/1"
+_WORKER_PROTOCOL_VERSION = 1
 
 Request = tuple[str, tuple[Any, ...]]
 Reply = tuple[str, Any]
@@ -45,6 +49,93 @@ Reply = tuple[str, Any]
 
 class NativeWorkerError(RuntimeError):
     """A native worker failed or returned an exception."""
+
+
+def _module_origin(module: object, name: str) -> Path:
+    raw_origin = getattr(module, "__file__", None)
+    if type(raw_origin) is not str or not raw_origin:
+        raise NativeWorkerError(f"{name} package has no concrete origin")
+    origin = Path(raw_origin).resolve()
+    if not origin.is_file():
+        raise NativeWorkerError(f"{name} package origin is not a file: {origin}")
+    return origin
+
+
+def _worker_startup_fingerprint() -> dict[str, object]:
+    """Describe the exact Core and adapter packages loaded by this process."""
+
+    adapter = sys.modules.get(__package__)
+    if adapter is None:
+        raise NativeWorkerError("adapter package is not loaded")
+    core_version = getattr(unirobosim, "__version__", None)
+    if type(core_version) is not str or not core_version:
+        raise NativeWorkerError("UniRoboSim Core package has no valid version")
+    return {
+        "schema": _WORKER_HANDSHAKE_SCHEMA,
+        "worker_protocol": _WORKER_PROTOCOL_VERSION,
+        "core": {
+            "version": core_version,
+            "origin": str(_module_origin(unirobosim, "unirobosim")),
+        },
+        "adapter": {
+            "version": DISTRIBUTION_VERSION,
+            "origin": str(_module_origin(adapter, "unirobosim_isaaclab")),
+        },
+    }
+
+
+def _worker_package_roots() -> tuple[Path, ...]:
+    """Return ordered import roots for the exact packages loaded by the parent."""
+
+    adapter = sys.modules.get(__package__)
+    if adapter is None:
+        raise NativeWorkerError("adapter package is not loaded")
+    origins = (
+        _module_origin(adapter, "unirobosim_isaaclab"),
+        _module_origin(unirobosim, "unirobosim"),
+    )
+    roots: list[Path] = []
+    for origin in origins:
+        root = origin.parent.parent
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _worker_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a child-only environment with exact package roots taking precedence."""
+
+    child = dict(os.environ if environ is None else environ)
+    entries = list(_worker_package_roots())
+    for raw_entry in child.get("PYTHONPATH", "").split(os.pathsep):
+        if not raw_entry:
+            continue
+        candidate = Path(raw_entry)
+        if not candidate.is_absolute():
+            continue
+        resolved = candidate.resolve()
+        if resolved not in entries:
+            entries.append(resolved)
+    child["PYTHONPATH"] = os.pathsep.join(str(entry) for entry in entries)
+    child["PYTHONSAFEPATH"] = "1"
+    return child
+
+
+def _worker_command(connection_descriptor: int) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-P",
+        "-B",
+        "-m",
+        "unirobosim_isaaclab.worker_bootstrap",
+        str(connection_descriptor),
+    )
+
+
+def _validate_worker_startup(value: object) -> None:
+    expected = _worker_startup_fingerprint()
+    if type(value) is not dict or value != expected:
+        raise NativeWorkerError(f"native worker startup fingerprint differs: expected {expected!r}, got {value!r}")
 
 
 class _ProcessHandle(Protocol):
@@ -257,7 +348,7 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
         except Exception as exc:
             connection.send(_error_reply(exc))
             return
-        connection.send(("ok", None))
+        connection.send(("ok", _worker_startup_fingerprint()))
         while True:
             try:
                 request = cast(Request, connection.recv())
@@ -296,21 +387,27 @@ def _spawn_worker(config: IsaacLabAdapterConfig) -> tuple[Connection, _ProcessHa
         # the native worker import boundary real while retaining the same Pipe.
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe(duplex=True)
-        bootstrap_process = subprocess.Popen(
-            [
-                sys.executable,
-                "-B",
-                "-m",
-                "unirobosim_isaaclab.worker_bootstrap",
-                str(child.fileno()),
-            ],
-            close_fds=True,
-            pass_fds=(child.fileno(),),
-            start_new_session=True,
-        )
-        child.close()
-        parent.send(config)
-        return parent, _SubprocessHandle(bootstrap_process)
+        descriptor = child.fileno()
+        process: _SubprocessHandle | None = None
+        try:
+            bootstrap_process = subprocess.Popen(
+                _worker_command(descriptor),
+                close_fds=True,
+                env=_worker_environment(),
+                pass_fds=(descriptor,),
+                start_new_session=True,
+            )
+            process = _SubprocessHandle(bootstrap_process)
+            child.close()
+            parent.send(config)
+            return parent, process
+        except BaseException:
+            child.close()
+            parent.close()
+            if process is not None:
+                _terminate_worker_tree(process)
+                process.join(_SHUTDOWN_TIMEOUT_SECONDS)
+            raise
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=True)
     spawned_process: BaseProcess = context.Process(
@@ -400,7 +497,7 @@ class IsaacLabWorkerRuntime:
         self._closed = False
         self._active_world: IsaacLabWorkerWorld | None = None
         try:
-            self._receive("worker startup")
+            _validate_worker_startup(self._receive("worker startup"))
         except Exception:
             self._abort()
             raise
