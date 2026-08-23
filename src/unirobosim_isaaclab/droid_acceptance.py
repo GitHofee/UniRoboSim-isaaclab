@@ -756,12 +756,17 @@ def _compose(
     adapter_module = import_module("fastsim.integrations.unirobosim.adapter")
     composition = import_module("fastsim.integrations.unirobosim.composition")
     projection_module = import_module("fastsim.integrations.unirobosim.projection")
+    simulation_query_module = import_module("fastsim.integrations.unirobosim._simulation_query")
     services = import_module("fastsim.integrations.unirobosim.services")
     planning_module = import_module("fastsim.integrations.unirobosim._planning_raw")
 
     adapter = adapter_module._UniRoboSimAdapter(
         projection,
         entry_points=lambda: (_entry_point(provider),),
+    )
+    simulation_root = simulation_query_module._SimulationQueryRoot(
+        run_id="droid-equivalence-isaaclab",
+        projection=projection,
     )
     rate_policy = control.ScheduleRatePolicy(projection.rate_policy)
     executor = control.ControlChunkExecutor(
@@ -807,6 +812,7 @@ def _compose(
         camera_spec.height_px,
     )
     planning_raw._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
+    simulation_root._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
     executor.bind_authority_submitter(kernel.submit_authority)
     for observation_provider in projection_module.observation_providers(projection):
         kernel.observations.register(observation_provider)
@@ -817,6 +823,7 @@ def _compose(
         adapter=adapter,
         executor=executor,
         planning_raw=planning_raw,
+        simulation_root=simulation_root,
     )
     return bundle, adapter
 
