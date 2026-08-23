@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, NoReturn, cast
 
 from unirobosim import (
     PLANNING_FRAME_DECLARATIONS_SCHEMA_VERSION,
@@ -528,137 +528,219 @@ def _entry_point(provider: IsaacLabProvider) -> object:
     )
 
 
-def _telemetry_adapter_type(base: type[Any]) -> type[Any]:
-    class DroidTelemetryAdapter(base):  # type: ignore[misc]
-        def __init__(
-            self,
-            projection: object,
-            provider: IsaacLabProvider,
-            sample_stride: int,
-            focus_distance_m: float,
-            up_reference: tuple[float, float, float],
-        ) -> None:
-            super().__init__(projection, entry_points=lambda: (_entry_point(provider),))
-            self._droid_sample_stride = sample_stride
-            self._droid_focus_distance_m = focus_distance_m
-            self._droid_up_reference = up_reference
-            self._droid_sample_lock = threading.Lock()
-            self._droid_samples: dict[int, Mapping[str, object]] = {}
-            self._droid_last_sample: tuple[int, Mapping[str, object]] | None = None
-            self._droid_camera_handle: object | None = None
-            self._droid_camera_calibration: Mapping[str, object] | None = None
-            self._droid_ee_frame_id: str | None = None
+@dataclass(frozen=True, slots=True)
+class _DroidTelemetryRequest:
+    """Acceptance-only read executed by FastSim's simulation authority."""
 
-        def prepare(self, plan: object, *, seed: int) -> object:
-            tick = super().prepare(plan, seed=seed)
-            self._droid_capture()
-            return tick
+    operation: ClassVar[str] = "isaaclab.droid.telemetry"
+    probe: _DroidTelemetryProbe
+    expected_generation: int
+    expected_tick: int
 
-        def reset(self, *, seed: int) -> object:
-            tick = super().reset(seed=seed)
-            with self._droid_sample_lock:
-                self._droid_samples.clear()
-                self._droid_last_sample = None
-            self._droid_camera_handle = None
-            self._droid_camera_calibration = None
-            self._droid_ee_frame_id = None
-            self._droid_capture()
-            return tick
+    def execute(self, backend: object, context: object) -> Mapping[str, object]:
+        return self.probe._capture_on_authority(
+            backend,
+            context,
+            expected_generation=self.expected_generation,
+            expected_tick=self.expected_tick,
+        )
 
-        def step(self) -> object:
-            tick = super().step()
-            if self._local_tick % self._droid_sample_stride == 0:
-                self._droid_capture()
-            return tick
 
-        def _droid_capture(self) -> None:
-            world = self._required_world()
-            articulation = self._projection.articulations[0]
-            joint_state = world.read_articulation(self._live[articulation.entity_id].handle)
-            if self._droid_camera_handle is None:
-                self._droid_camera_handle = world.resolve(_CAMERA_PATH)
-            rgb = world.read_sensor(self._droid_camera_handle).channel(CameraModality.RGB)
-            if rgb.shape != (1, 1080, 1920, 3):
-                raise RuntimeError(f"Isaac RGB shape differs from frozen acceptance shape: {rgb.shape}")
-            if self._droid_camera_calibration is None:
-                self._droid_camera_calibration = _effective_camera_calibration(
-                    world.read_camera_calibration(self._droid_camera_handle),
-                    focus_distance_m=self._droid_focus_distance_m,
-                    up_reference=self._droid_up_reference,
-                )
-            planning = world.planning_scene_state(0)
-            if self._droid_ee_frame_id is None:
-                catalog = world.planning_scene_catalog(0)
-                matches = tuple(frame.frame_id for frame in catalog.frames if frame.name == "gripper_center")
-                if len(matches) != 1:
-                    raise RuntimeError("planning scene must expose exactly one gripper_center frame")
-                self._droid_ee_frame_id = matches[0]
-            frame_matches = tuple(frame for frame in planning.frames if frame.frame_id == self._droid_ee_frame_id)
-            if len(frame_matches) != 1:
-                raise RuntimeError("planning state is missing the gripper_center frame")
-            pose = frame_matches[0].world_pose
-            positions = tuple(float(value) for value in joint_state.joint_positions.rows()[0])
-            if joint_state.joint_names != _JOINTS or len(positions) != len(_JOINTS):
-                raise RuntimeError("Isaac articulation state differs from the frozen DROID axis order")
-            tick = int(self._local_tick)
-            rgb_bytes = rgb.to_bytes()
-            sample: Mapping[str, object] = MappingProxyType(
-                {
-                    "simulation_tick": tick,
-                    "simulation_time_s": tick / 240.0,
-                    "arm": MappingProxyType({"joint_ids": _ARM_JOINTS, "position_rad": positions[: len(_ARM_JOINTS)]}),
-                    "gripper": MappingProxyType(
-                        {"joint_ids": _GRIPPER_JOINTS, "position_rad": positions[len(_ARM_JOINTS) :]}
-                    ),
-                    "end_effector": MappingProxyType(
-                        {
-                            "frame_id": "gripper_center",
-                            "position_m": tuple(float(value) for value in pose.position_m),
-                            "quaternion_xyzw": tuple(float(value) for value in pose.orientation_xyzw),
-                        }
-                    ),
-                    "rgb": MappingProxyType(
-                        {
-                            "data": rgb_bytes,
-                            "width": 1920,
-                            "height": 1080,
-                            "format": "rgb8",
-                        }
-                    ),
-                }
+def _raise_telemetry_read_failure(kind: str, message: str) -> NoReturn:
+    """Reject a stale diagnostic request without failing FastSim Runtime."""
+
+    authority_reads = import_module("fastsim.runtime._authority_reads")
+    kinds = {
+        "integrity": authority_reads._AuthorityReadFailureKind.INTEGRITY,
+        "stale_generation": authority_reads._AuthorityReadFailureKind.STALE_GENERATION,
+    }
+    failure = authority_reads._AuthorityReadFailure(kinds[kind], message)
+    raise authority_reads._ExpectedAuthorityReadFailure(failure) from None
+
+
+class _DroidTelemetryProbe:
+    """Read DROID state and RGB without changing the formal adapter type.
+
+    Planning resource requests deliberately accept only FastSim's exact
+    ``_UniRoboSimAdapter``.  The acceptance recorder therefore submits a
+    generation-pinned authority read instead of subclassing or wrapping that
+    adapter.  Production lifecycle and planning-resource ownership remain
+    identical to a normal FastSim run.
+    """
+
+    def __init__(
+        self,
+        adapter: object,
+        kernel: Any,
+        sample_stride: int,
+        focus_distance_m: float,
+        up_reference: tuple[float, float, float],
+        width_px: int,
+        height_px: int,
+    ) -> None:
+        self._adapter = adapter
+        self._kernel = kernel
+        self._sample_stride = sample_stride
+        self._focus_distance_m = focus_distance_m
+        self._up_reference = up_reference
+        self._width_px = width_px
+        self._height_px = height_px
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._camera_handle: object | None = None
+        self._camera_calibration: tuple[int, Mapping[str, object]] | None = None
+        self._ee_frame_id: str | None = None
+        self._last_sample: tuple[int, int, Mapping[str, object]] | None = None
+
+    def sample(self, tick: int) -> Mapping[str, object]:
+        if type(tick) is not int or tick < 0 or tick % self._sample_stride != 0:
+            raise ValueError("Isaac sample tick is outside the frozen 30 Hz schedule")
+        snapshot = self._kernel.snapshot
+        generation = getattr(snapshot, "generation", None)
+        current_tick = getattr(snapshot, "tick", None)
+        if type(generation) is not int or generation <= 0 or current_tick != tick:
+            raise RuntimeError("Isaac sample request differs from the current runtime state")
+        with self._lock:
+            if self._last_sample is not None and self._last_sample[:2] == (generation, tick):
+                return self._last_sample[2]
+        sample = self._submit(generation, tick)
+        with self._lock:
+            self._last_sample = (generation, tick, sample)
+        return sample
+
+    def camera_calibration(self) -> Mapping[str, object]:
+        snapshot = self._kernel.snapshot
+        generation = getattr(snapshot, "generation", None)
+        tick = getattr(snapshot, "tick", None)
+        if type(generation) is not int or generation <= 0 or type(tick) is not int or tick < 0:
+            raise RuntimeError("Isaac runtime state is unavailable for camera calibration")
+        with self._lock:
+            calibration = self._camera_calibration
+        if calibration is not None and calibration[0] == generation:
+            return calibration[1]
+        self._submit(generation, tick)
+        with self._lock:
+            calibration = self._camera_calibration
+        if calibration is None or calibration[0] != generation:
+            raise RuntimeError("Isaac effective camera calibration is unavailable before reset")
+        return calibration[1]
+
+    def close(self) -> None:
+        with self._lock:
+            self._camera_handle = None
+            self._camera_calibration = None
+            self._ee_frame_id = None
+            self._last_sample = None
+
+    def _submit(self, expected_generation: int, expected_tick: int) -> Mapping[str, object]:
+        ticket = self._kernel.submit_authority_read(_DroidTelemetryRequest(self, expected_generation, expected_tick))
+        outcome = ticket.result(30.0)
+        resolved = outcome.resolve(self._kernel.snapshot)
+        sample = getattr(resolved, "value", None)
+        if not isinstance(sample, Mapping):
+            failure = getattr(resolved, "message", "authority telemetry read did not return a sample")
+            raise RuntimeError(str(failure))
+        return cast(Mapping[str, object], sample)
+
+    def _capture_on_authority(
+        self,
+        backend: object,
+        context: object,
+        *,
+        expected_generation: int,
+        expected_tick: int,
+    ) -> Mapping[str, object]:
+        if backend is not self._adapter:
+            _raise_telemetry_read_failure("integrity", "Isaac telemetry request reached a foreign adapter")
+        generation = getattr(context, "generation", None)
+        context_tick = getattr(context, "tick", None)
+        if generation != expected_generation or context_tick != expected_tick:
+            _raise_telemetry_read_failure(
+                "stale_generation",
+                "Isaac telemetry request belongs to a stale runtime state",
             )
-            with self._droid_sample_lock:
-                if len(self._droid_samples) >= 4:
-                    raise RuntimeError("runner did not consume bounded Isaac telemetry in time")
-                self._droid_samples[tick] = sample
+        with self._lock:
+            if generation != self._generation:
+                self._generation = generation
+                self._camera_handle = None
+                self._camera_calibration = None
+                self._ee_frame_id = None
+                self._last_sample = None
 
-        def droid_sample(self, tick: int) -> Mapping[str, object]:
-            if type(tick) is not int or tick < 0 or tick % self._droid_sample_stride != 0:
-                raise ValueError("Isaac sample tick is outside the frozen 30 Hz schedule")
-            with self._droid_sample_lock:
-                if self._droid_last_sample is not None and self._droid_last_sample[0] == tick:
-                    return self._droid_last_sample[1]
-                try:
-                    sample = self._droid_samples.pop(tick)
-                except KeyError:
-                    raise RuntimeError(f"Isaac authority sample for tick {tick} is unavailable") from None
-                self._droid_last_sample = (tick, sample)
-                return sample
+        adapter = cast(Any, backend)
+        if adapter._local_tick != expected_tick:
+            _raise_telemetry_read_failure(
+                "stale_generation",
+                "Isaac adapter tick differs from the FastSim runtime tick",
+            )
+        world = adapter._required_world()
+        articulation = adapter._projection.articulations[0]
+        joint_state = world.read_articulation(adapter._live[articulation.entity_id].handle)
+        with self._lock:
+            camera_handle = self._camera_handle
+        if camera_handle is None:
+            camera_handle = world.resolve(_CAMERA_PATH)
+            with self._lock:
+                self._camera_handle = camera_handle
+        rgb = world.read_sensor(camera_handle).channel(CameraModality.RGB)
+        expected_shape = (1, self._height_px, self._width_px, 3)
+        if rgb.shape != expected_shape:
+            raise RuntimeError(f"Isaac RGB shape differs from frozen acceptance shape: {rgb.shape}")
+        with self._lock:
+            cached_calibration = self._camera_calibration
+        if cached_calibration is None:
+            effective_calibration = _effective_camera_calibration(
+                world.read_camera_calibration(camera_handle),
+                focus_distance_m=self._focus_distance_m,
+                up_reference=self._up_reference,
+            )
+            with self._lock:
+                self._camera_calibration = (generation, effective_calibration)
 
-        def droid_camera_calibration(self) -> Mapping[str, object]:
-            if self._droid_camera_calibration is None:
-                raise RuntimeError("Isaac effective camera calibration is unavailable before reset")
-            return self._droid_camera_calibration
-
-        def close(self) -> None:
-            try:
-                super().close()
-            finally:
-                with self._droid_sample_lock:
-                    self._droid_samples.clear()
-                    self._droid_last_sample = None
-
-    return DroidTelemetryAdapter
+        planning = world.planning_scene_state(0)
+        with self._lock:
+            ee_frame_id = self._ee_frame_id
+        if ee_frame_id is None:
+            catalog = world.planning_scene_catalog(0)
+            matches = tuple(frame.frame_id for frame in catalog.frames if frame.name == "gripper_center")
+            if len(matches) != 1:
+                raise RuntimeError("planning scene must expose exactly one gripper_center frame")
+            ee_frame_id = matches[0]
+            with self._lock:
+                self._ee_frame_id = ee_frame_id
+        frame_matches = tuple(frame for frame in planning.frames if frame.frame_id == ee_frame_id)
+        if len(frame_matches) != 1:
+            raise RuntimeError("planning state is missing the gripper_center frame")
+        pose = frame_matches[0].world_pose
+        positions = tuple(float(value) for value in joint_state.joint_positions.rows()[0])
+        if joint_state.joint_names != _JOINTS or len(positions) != len(_JOINTS):
+            raise RuntimeError("Isaac articulation state differs from the frozen DROID axis order")
+        rgb_bytes = rgb.to_bytes()
+        return MappingProxyType(
+            {
+                "simulation_tick": expected_tick,
+                "simulation_time_s": float(cast(Any, context).sim_time_seconds),
+                "arm": MappingProxyType({"joint_ids": _ARM_JOINTS, "position_rad": positions[: len(_ARM_JOINTS)]}),
+                "gripper": MappingProxyType(
+                    {"joint_ids": _GRIPPER_JOINTS, "position_rad": positions[len(_ARM_JOINTS) :]}
+                ),
+                "end_effector": MappingProxyType(
+                    {
+                        "frame_id": "gripper_center",
+                        "position_m": tuple(float(value) for value in pose.position_m),
+                        "quaternion_xyzw": tuple(float(value) for value in pose.orientation_xyzw),
+                    }
+                ),
+                "rgb": MappingProxyType(
+                    {
+                        "data": rgb_bytes,
+                        "width": self._width_px,
+                        "height": self._height_px,
+                        "format": "rgb8",
+                    }
+                ),
+            }
+        )
 
 
 def _compose(
@@ -677,8 +759,10 @@ def _compose(
     services = import_module("fastsim.integrations.unirobosim.services")
     planning_module = import_module("fastsim.integrations.unirobosim._planning_raw")
 
-    adapter_type = _telemetry_adapter_type(adapter_module._UniRoboSimAdapter)
-    adapter = adapter_type(projection, provider, sample_stride, focus_distance_m, up_reference)
+    adapter = adapter_module._UniRoboSimAdapter(
+        projection,
+        entry_points=lambda: (_entry_point(provider),),
+    )
     rate_policy = control.ScheduleRatePolicy(projection.rate_policy)
     executor = control.ControlChunkExecutor(
         "droid-equivalence-isaaclab",
@@ -707,6 +791,19 @@ def _compose(
         seed=17,
         options=runtime.RuntimeOptions(step_pacing_seconds=0.0),
         authority_participants=(driver.participant_spec(), planning_bridge.participant_spec()),
+    )
+    camera_entities = tuple(entity for entity in projection.world_spec.entities if entity.path == _CAMERA_PATH)
+    if len(camera_entities) != 1 or camera_entities[0].camera is None:
+        raise RuntimeError("DROID acceptance projection must contain exactly one scene camera")
+    camera_spec = camera_entities[0].camera
+    adapter._droid_telemetry_probe = _DroidTelemetryProbe(
+        adapter,
+        kernel,
+        sample_stride,
+        focus_distance_m,
+        up_reference,
+        camera_spec.width_px,
+        camera_spec.height_px,
     )
     planning_raw._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
     executor.bind_authority_submitter(kernel.submit_authority)
@@ -740,11 +837,17 @@ class DroidAcceptanceBackendRun:
     _window_id: str | None = field(default=None, repr=False)
 
     def sample(self, tick: int) -> Mapping[str, object]:
-        return cast(Mapping[str, object], self._adapter.droid_sample(tick))
+        probe = getattr(self._adapter, "_droid_telemetry_probe", None)
+        if type(probe) is not _DroidTelemetryProbe:
+            raise RuntimeError("Isaac simulator-camera telemetry is unavailable")
+        return probe.sample(tick)
 
     @property
     def camera_calibration(self) -> Mapping[str, object]:
-        return cast(Mapping[str, object], self._adapter.droid_camera_calibration())
+        probe = getattr(self._adapter, "_droid_telemetry_probe", None)
+        if type(probe) is not _DroidTelemetryProbe:
+            raise RuntimeError("Isaac simulator-camera calibration is unavailable")
+        return probe.camera_calibration()
 
     @property
     def physics_diagnostics(self) -> Mapping[str, object]:
@@ -797,6 +900,9 @@ class DroidAcceptanceBackendRun:
     def close(self) -> None:
         if self._closed:
             return
+        probe = getattr(self._adapter, "_droid_telemetry_probe", None)
+        if type(probe) is _DroidTelemetryProbe:
+            probe.close()
         if self._visible_window and self._display is not None and self._window_id is not None:
             observed_closed = _wait_for_window_close(self._display, self._window_id)
             close_path = self._output_dir / f"droid-{self._run_kind}-isaaclab.window-close.json"

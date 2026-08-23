@@ -5,6 +5,7 @@ import inspect
 import math
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 from unirobosim import (
@@ -18,6 +19,8 @@ from unirobosim import (
     BuildResourceEntry,
     BuildResourceManifest,
     BuildSourceEntry,
+    CameraModality,
+    CameraSpec,
     CapabilityId,
     CommandError,
     CommandMode,
@@ -35,6 +38,7 @@ from unirobosim_isaaclab.descriptor import DESCRIPTOR
 from unirobosim_isaaclab.droid_acceptance import (
     DroidAcceptanceBackendRun,
     _acceptance_world_spec,
+    _DroidTelemetryProbe,
     _effective_camera_calibration,
     _look_at_xyzw,
     create_backend_run,
@@ -322,6 +326,123 @@ def test_droid_acceptance_visible_window_is_keyword_only_and_defaults_off() -> N
     parameter = inspect.signature(create_backend_run).parameters["visible_window"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is False
+
+
+def test_droid_scene_camera_cache_never_crosses_runtime_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Kernel:
+        snapshot = SimpleNamespace(generation=1, tick=0)
+
+    kernel = Kernel()
+    probe = _DroidTelemetryProbe(object(), kernel, 8, 1.0, (0.0, 0.0, 1.0), 1280, 720)
+    submissions: list[tuple[int, int]] = []
+
+    def submit(generation: int, tick: int) -> Mapping[str, object]:
+        submissions.append((generation, tick))
+        calibration: Mapping[str, object] = MappingProxyType({"generation": generation})
+        with probe._lock:
+            probe._camera_calibration = (generation, calibration)
+        return MappingProxyType({"generation": generation, "tick": tick})
+
+    monkeypatch.setattr(probe, "_submit", submit)
+    assert probe.sample(0)["generation"] == 1
+    assert probe.camera_calibration()["generation"] == 1
+
+    kernel.snapshot = SimpleNamespace(generation=2, tick=0)
+    assert probe.sample(0)["generation"] == 2
+    assert probe.camera_calibration()["generation"] == 2
+    assert submissions == [(1, 0), (2, 0)]
+
+
+def test_droid_stale_authority_read_does_not_fail_runtime() -> None:
+    runtime = pytest.importorskip("fastsim.runtime", exc_type=ImportError)
+
+    class Backend:
+        _local_tick = 0
+
+        def prepare(self, _plan: object, *, seed: int) -> object:
+            return runtime.BackendTick(0, 0.0)
+
+        def reset(self, *, seed: int) -> object:
+            self._local_tick = 0
+            return runtime.BackendTick(0, 0.0)
+
+        def step(self) -> object:
+            self._local_tick += 1
+            return runtime.BackendTick(self._local_tick, self._local_tick / 240.0)
+
+        def read_observation(self, _entity_id: str, _provider_key: str) -> object:
+            raise LookupError
+
+        def close(self) -> None:
+            return None
+
+    backend = Backend()
+    kernel = runtime.RuntimeKernel(
+        SimpleNamespace(runtime={"physics_hz": 240.0}),
+        backend,
+        run_id="droid-stale-telemetry-test",
+        options=runtime.RuntimeOptions(step_pacing_seconds=0.0),
+    )
+    probe = _DroidTelemetryProbe(backend, kernel, 8, 1.0, (0.0, 0.0, 1.0), 1280, 720)
+    kernel.prepare(timeout=2.0)
+    try:
+        with pytest.raises(RuntimeError, match="stale runtime state"):
+            probe._submit(2, 0)
+        assert kernel.state is runtime.RuntimeState.READY
+        assert kernel.failure is None
+    finally:
+        kernel.close(timeout=2.0)
+
+
+def test_droid_compose_keeps_exact_adapter_and_planning_gate() -> None:
+    adapter_module = pytest.importorskip("fastsim.integrations.unirobosim.adapter", exc_type=ImportError)
+    aliases_module = pytest.importorskip("fastsim.integrations.unirobosim.aliases", exc_type=ImportError)
+    planning_module = pytest.importorskip("fastsim.integrations.unirobosim._planning_raw", exc_type=ImportError)
+    projection_module = pytest.importorskip("fastsim.integrations.unirobosim.projection", exc_type=ImportError)
+    world = WorldSpec(
+        "droid-compose-exact-adapter",
+        (
+            EntitySpec(
+                EntityPath("/camera"),
+                EntityKind.CAMERA_SENSOR,
+                camera=CameraSpec(
+                    width_px=1280,
+                    height_px=720,
+                    modalities=(CameraModality.RGB,),
+                ),
+            ),
+        ),
+    )
+    projection = projection_module.UniRoboSimProjection(
+        plan_digest="a" * 64,
+        plan_content_digest="a" * 64,
+        backend=aliases_module.backend_alias("isaaclab"),
+        world_spec=world,
+        build_input=None,
+        entities=(),
+        articulations=(),
+        default_entity_id=None,
+        physics_dt_seconds=1.0 / 240.0,
+        control_hz=240.0,
+        rate_policy="exact",
+        initial_generation_seed=1,
+        planning_reads_demanded=False,
+    )
+    bundle, adapter = droid_acceptance._compose(
+        SimpleNamespace(runtime={"physics_hz": 240.0}),
+        projection,
+        object(),
+        8,
+        1.0,
+        (0.0, 0.0, 1.0),
+    )
+    try:
+        assert type(adapter) is adapter_module._UniRoboSimAdapter
+        assert planning_module._authority_adapter(adapter) is adapter
+        assert type(adapter._droid_telemetry_probe) is _DroidTelemetryProbe
+        assert bundle.planning_raw is not None
+    finally:
+        bundle.close(timeout=2.0)
 
 
 def test_droid_acceptance_default_window_evidence_does_not_query_x11(
