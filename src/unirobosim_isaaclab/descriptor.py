@@ -31,6 +31,7 @@ CAPABILITIES = CapabilitySet(
                 {
                     "rigid_body": ["model/vnd.usd"],
                     "articulation": ["model/vnd.usd"],
+                    "static_scene": ["model/vnd.usd"],
                 }
             ),
         ),
@@ -52,6 +53,32 @@ CAPABILITIES = CapabilitySet(
         CapabilityDeclaration(
             CapabilityId("world.multi-environment@1"),
             FrozenMap({"isolation": "physx-environment-origins"}),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("scene.static@1"),
+            FrozenMap(
+                {
+                    "asset_format": "model/vnd.usd",
+                    "motion": "static",
+                    "replication": "per-environment",
+                }
+            ),
+            limitations=(
+                "static-scene assets containing rigid bodies or articulations are rejected",
+                "static-scene state and drag commands are unsupported",
+            ),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("entity.scale.rigid@1"),
+            FrozenMap({"axes": "xyz", "semantics": "physical"}),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("entity.scale.articulation.uniform@1"),
+            FrozenMap({"axes": "uniform-xyz", "semantics": "physical"}),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("entity.scale.static_scene@1"),
+            FrozenMap({"axes": "xyz", "semantics": "physical"}),
         ),
         CapabilityDeclaration(
             CapabilityId("state.rigid_body@1"),
@@ -188,6 +215,7 @@ CAPABILITIES = CapabilitySet(
             ),
             limitations=(
                 "the first admitted profile includes only rigid objects and articulations plus the provider ground",
+                "static-scene entities fail planning admission until their complete collider forest can be published",
                 "inline cube and sphere colliders and proven PhysX convexHull meshes are supported; any other "
                 "effective collider fails planning admission",
                 "collision groups, non-default filtering, authored collision margins, and persistent cross-entity "
@@ -203,8 +231,14 @@ CAPABILITIES = CapabilitySet(
 CAMERA_CAPABILITIES = (
     CapabilityDeclaration(
         CapabilityId("sensor.camera@1"),
-        FrozenMap({"schedule": "synchronous", "pose_frame": "environment-local-world"}),
-        limitations=("link attachment and asynchronous schedules are unsupported",),
+        FrozenMap(
+            {
+                "mount_parent_kinds": ["articulation"],
+                "pose_frames": ["environment-local-world", "parent-local"],
+                "schedule": "synchronous",
+            }
+        ),
+        limitations=("asynchronous schedules are unsupported",),
     ),
     CapabilityDeclaration(
         CapabilityId("sensor.camera.rgb@1"),
@@ -213,6 +247,10 @@ CAMERA_CAPABILITIES = (
     CapabilityDeclaration(
         CapabilityId("sensor.camera.depth@1"),
         FrozenMap({"dtype": "float32", "unit": "metre", "no_hit": 0.0, "metric": "distance-to-camera"}),
+    ),
+    CapabilityDeclaration(
+        CapabilityId("sensor.camera.normals@1"),
+        FrozenMap({"dtype": "float32", "frame": "camera-local", "layout": "environment-height-width-xyz"}),
     ),
 )
 

@@ -33,7 +33,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.9.3"
+    assert unirobosim_isaaclab.__version__ == "0.9.4"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha5"
@@ -48,6 +48,13 @@ def test_public_identity_and_protocol() -> None:
     assert any("particle reaction loads" in limitation for limitation in fluid_state.limitations)
     assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is not None
     assert CAPABILITIES.get(CapabilityId("render.browser-scene@1")) is not None
+    asset_formats = CAPABILITIES.get(CapabilityId("asset.formats@1"))
+    assert asset_formats is not None
+    assert asset_formats.properties["static_scene"] == ("model/vnd.usd",)
+    assert CAPABILITIES.get(CapabilityId("scene.static@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("entity.scale.rigid@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("entity.scale.articulation.uniform@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("entity.scale.static_scene@1")) is not None
     planning = CAPABILITIES.get(CapabilityId("planning.scene@2"))
     assert planning is not None
     assert planning.properties["collision_authority"] == "composed-usd-and-physx-effective"
@@ -65,6 +72,10 @@ def test_public_identity_and_protocol() -> None:
     )
     assert camera_provider.descriptor is not DESCRIPTOR
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.rgb@1")) is not None
+    assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.normals@1")) is not None
+    camera_profile = camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera@1"))
+    assert camera_profile is not None
+    assert camera_profile.properties["mount_parent_kinds"] == ("articulation",)
     assert camera_provider.descriptor.metadata["camera_anti_aliasing"] == "fxaa"
     assert camera_provider.descriptor.metadata["camera_texture_streaming"] is False
     assert camera_provider.descriptor.metadata["render_on_step"] is True

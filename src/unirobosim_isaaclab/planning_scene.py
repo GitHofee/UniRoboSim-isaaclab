@@ -72,6 +72,14 @@ def validate_planning_build_spec(spec: WorldSpec, *, backend_id: str) -> None:
     """Bounded static admission before any native planning traversal is allowed."""
 
     for entity in spec.entities:
+        if entity.kind is EntityKind.STATIC_SCENE:
+            raise PlanningSceneIncompleteError(
+                "the Isaac Lab planning profile cannot yet publish a complete static-scene collider forest",
+                operation="planning_scene.preflight",
+                backend_id=backend_id,
+                world_id=spec.world_id,
+                entity_path=entity.path.value,
+            ) from None
         if entity.kind in _SOFT_KINDS:
             raise PlanningSceneIncompleteError(
                 "the Isaac Lab planning profile does not admit soft-matter collision participants",

@@ -118,10 +118,10 @@ class IsaacLabWorld:
     @staticmethod
     def validate_build_spec(spec: WorldSpec, *, backend_id: str) -> None:
         for entity in spec.entities:
-            if entity.kind is EntityKind.ARTICULATION:
+            if entity.kind in {EntityKind.ARTICULATION, EntityKind.STATIC_SCENE}:
                 if entity.asset_uri is None:
                     raise WorldBuildError(
-                        "Isaac Lab articulations require a local USD asset_uri",
+                        f"Isaac Lab {entity.kind.value} entities require a local USD asset_uri",
                         operation="session.build.preflight",
                         backend_id=backend_id,
                         world_id=spec.world_id,
@@ -130,7 +130,7 @@ class IsaacLabWorld:
                 asset = _local_asset_path(entity.asset_uri)
                 if asset is None or asset.suffix.lower() not in {".usd", ".usda", ".usdc"} or not asset.is_file():
                     raise WorldBuildError(
-                        "articulation asset_uri must resolve to an existing local USD file",
+                        f"{entity.kind.value} asset_uri must resolve to an existing local USD file",
                         operation="session.build.preflight",
                         backend_id=backend_id,
                         world_id=spec.world_id,
@@ -166,6 +166,17 @@ class IsaacLabWorld:
                         backend_id=backend_id,
                         world_id=spec.world_id,
                         entity_path=entity.path.value,
+                    )
+            if entity.kind is EntityKind.CAMERA_SENSOR and entity.mount is not None:
+                parent = next(item for item in spec.entities if item.path == entity.mount.parent_path)
+                if parent.kind is not EntityKind.ARTICULATION:
+                    raise UnsupportedCapabilityError(
+                        "this Isaac Lab adapter profile supports camera mounts only on articulations",
+                        operation="session.build.preflight",
+                        backend_id=backend_id,
+                        world_id=spec.world_id,
+                        entity_path=entity.path.value,
+                        details={"parent_path": parent.path.value, "parent_kind": parent.kind.value},
                     )
 
     @property
@@ -715,9 +726,18 @@ class IsaacLabWorld:
     def _proxy_visual(entity: EntitySpec) -> SceneVisual:
         if entity.kind is EntityKind.RIGID_BODY:
             dimensions = (0.5, 0.5, 0.5) if entity.box is None else entity.box.dimensions_m
+            dimensions = (
+                dimensions[0] * entity.scale_xyz[0],
+                dimensions[1] * entity.scale_xyz[1],
+                dimensions[2] * entity.scale_xyz[2],
+            )
             color = (0.15, 0.7, 0.95, 1.0) if entity.box is None else entity.box.color_rgba
         elif entity.kind is EntityKind.ARTICULATION:
-            dimensions = (0.55, 0.45, 0.7)
+            dimensions = (
+                0.55 * entity.scale_xyz[0],
+                0.45 * entity.scale_xyz[1],
+                0.7 * entity.scale_xyz[2],
+            )
             color = (0.92, 0.49, 0.16, 1.0)
         elif entity.kind is EntityKind.PARTICLE_FLUID:
             dimensions = (0.45, 0.45, 0.45)
@@ -725,6 +745,13 @@ class IsaacLabWorld:
         elif entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
             dimensions = (0.7, 0.7, 0.15)
             color = (0.55, 0.35, 0.9, 0.82)
+        elif entity.kind is EntityKind.STATIC_SCENE:
+            dimensions = (
+                4.0 * entity.scale_xyz[0],
+                4.0 * entity.scale_xyz[1],
+                4.0 * entity.scale_xyz[2],
+            )
+            color = (0.42, 0.48, 0.56, 0.55)
         else:
             dimensions = (0.18, 0.18, 0.28)
             color = (0.2, 0.85, 0.45, 0.9)

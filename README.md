@@ -9,7 +9,7 @@
 | Item | Required profile |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.9.1,<0.10` |
+| UniRoboSim | `>=0.9.2,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
@@ -135,12 +135,14 @@ with Sim(provider=provider) as sim:
 ## Implemented native features
 
 - USD articulations, including robots and non-robot articulated objects;
+- immutable static-scene USD composition without rigid-object or contact-sensor wrappers;
+- physical rigid, uniform articulation, and static-scene asset scaling;
 - joint position, velocity, and effort control;
 - rigid-body pose/twist, persistent wrench, aggregated normal contact, reset, and scene pose writes;
 - triangle surface deformables and tetrahedral volume deformables;
 - volume-deformable kinematic-node position control;
 - fixed-count PhysX PBD particle-fluid state and commands;
-- RTX RGB/depth camera sensors;
+- RTX RGB/depth/normals camera sensors, including articulation-root and named-link mounts;
 - native point/line/axes/text/bounding-box/trajectory debug overlays;
 - scene snapshots, scene deltas, and idempotent browser drag transactions;
 - multi-environment batching and restartable process-isolated lifecycle.
@@ -161,7 +163,9 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.9.3 requires UniRoboSim Core `>=0.9.1,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
+Adapter 0.9.4 requires UniRoboSim Core `>=0.9.2,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly.
+
+A world that demands `planning.scene@2` currently rejects `STATIC_SCENE` before native allocation. This fail-closed gate prevents a planner from receiving a silently incomplete room collider set.
 
 ## Verification
 
@@ -177,7 +181,7 @@ python scripts/native_conformance.py --output result.json
 The release gate covers the SDK-free source suite, deterministic artifacts, isolated
 wheel installation, and installed entry-point discovery. The native acceptance matrix
 covers rigid/contact, surface/volume deformables, robot and non-robot articulations,
-particle fluid, RGB/depth, native debug, provider reopen, planning-scene
+particle fluid, RGB/depth/normals, mounted cameras, static USD scenes, native debug, provider reopen, planning-scene
 catalog/state/delta/resource reads, multiple environments, and clean-interpreter
 startup.
 

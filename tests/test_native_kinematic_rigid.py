@@ -118,6 +118,7 @@ def _bare_world(*, kinematic: bool, raw: bool) -> tuple[IsaacLabNativeWorld, Any
     world._deformables = {}
     world._fluids = {}
     world._cameras = {}
+    world._mounted_cameras = {}
     world._debug_lifetimes = {}
     world._kinematic_rigids = {path: kinematic}
     if raw:

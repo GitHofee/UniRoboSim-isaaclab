@@ -362,6 +362,11 @@ class _PlanningAdmission:
             if spec.kind is EntityKind.CAMERA_SENSOR:
                 self._verify_nonphysical_entity(spec)
                 continue
+            if spec.kind is EntityKind.STATIC_SCENE:
+                # Public preflight rejects this today. Keep the native admission
+                # fail-closed as defense in depth so its colliders can never be
+                # silently omitted if a caller bypasses the public facade.
+                raise NativePlanningError("topology_unsupported")
             if spec.kind not in {EntityKind.ARTICULATION, EntityKind.RIGID_BODY}:
                 raise NativePlanningError("soft_matter_unsupported")
             result = self._entity_catalog(spec)

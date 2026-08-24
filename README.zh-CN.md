@@ -9,7 +9,7 @@
 | 项目 | 要求档位 |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.9.1,<0.10` |
+| UniRoboSim | `>=0.9.2,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
@@ -132,12 +132,14 @@ with Sim(provider=provider) as sim:
 ## 已实现原生能力
 
 - USD 机器人及非机器人铰接物体；
+- 不经刚体或接触传感器包装的不可变静态场景 USD 组合；
+- 刚体、均匀缩放铰接体与静态场景资产的物理缩放；
 - 关节位置、速度和力矩控制；
 - 刚体位姿/速度、持续 wrench、聚合接触、reset 和场景位姿写入；
 - 三角形表面柔性体和四面体体积柔性体；
 - 体积柔性体运动学节点位置控制；
 - 固定粒子数 PhysX PBD 流体状态与控制；
-- RTX RGB/深度相机；
+- RTX RGB/深度/法线相机，以及 articulation root 和具名 link 挂载；
 - Native 点、线、坐标轴、文本、包围盒和轨迹调试覆盖层；
 - 场景快照、增量和幂等浏览器拖拽事务；
 - 多环境 batch 和可重启进程隔离生命周期。
@@ -158,7 +160,9 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.9.3 要求 UniRoboSim Core `>=0.9.1,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
+Adapter 0.9.4 要求 UniRoboSim Core `>=0.9.2,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。
+
+如果 World 同时要求 `planning.scene@2`，当前版本会在创建原生资源前拒绝 `STATIC_SCENE`。该 fail-closed 门禁用于防止规划器静默收到缺失房间碰撞体的世界几何。
 
 ## 验证
 
@@ -173,7 +177,7 @@ python scripts/native_conformance.py --output result.json
 
 发布门禁覆盖无 SDK 源码测试、确定性制品、隔离 wheel 安装和已安装入口发现。
 原生验收矩阵覆盖刚体/接触、表面/体积柔性体、机器人与非机器人铰接体、粒子流体、
-RGB/深度、Native Debug、Provider 重启、planning-scene catalog/state/delta/resource
+RGB/深度/法线、挂载相机、静态 USD 场景、Native Debug、Provider 重启、planning-scene catalog/state/delta/resource
 读取、多环境以及纯净解释器启动。
 
 ## 仓库关系

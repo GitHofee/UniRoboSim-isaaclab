@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from urllib.parse import unquote, urlparse
 
 from unirobosim import (
     CameraModality,
@@ -26,6 +27,7 @@ from unirobosim import (
     EntityPath,
     EntitySpec,
     PointCommandMode,
+    Pose,
     WorldSpec,
 )
 
@@ -283,6 +285,16 @@ class _UsdArticulation:
     root_prim: Any
 
 
+@dataclass
+class _MountedCamera:
+    parent_path: EntityPath
+    body_name: str
+    body_suffix: str
+    local_pose: Pose
+    body_index: int | None = None
+    raw_body_view: Any | None = None
+
+
 def _is_kinematic_rigid(prim: Any, usd_physics: Any) -> bool:
     """Read the authored rigid-body motion mode without importing USD at module load time."""
 
@@ -327,6 +339,107 @@ def _ensure_launcher_setting(setting: str) -> None:
 def _native_name(path: EntityPath) -> str:
     digest = hashlib.sha256(path.value.encode()).hexdigest()[:10]
     return f"{path.name.replace('-', '_').replace('.', '_')}_{digest}"
+
+
+def _native_asset_path(uri: str) -> str:
+    """Return the exact local path admitted by the public preflight."""
+
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        return str(Path(unquote(parsed.path)))
+    if not parsed.scheme:
+        return str(Path(uri))
+    raise ValueError("native USD assets must use a local path or file URI")
+
+
+def _usd_file_cfg(
+    modules: SimpleNamespace,
+    entity: EntitySpec,
+    *,
+    activate_contact_sensors: bool = False,
+) -> Any:
+    """Create one scale-aware USD spawn config for every physical asset kind."""
+
+    if entity.asset_uri is None:
+        raise ValueError("USD-backed entities require asset_uri")
+    return modules.sim_utils.UsdFileCfg(
+        usd_path=_native_asset_path(entity.asset_uri),
+        scale=entity.scale_xyz,
+        activate_contact_sensors=activate_contact_sensors,
+    )
+
+
+def _scaled_dimensions(
+    dimensions: tuple[float, float, float],
+    scale_xyz: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return tuple(dimensions[index] * scale_xyz[index] for index in range(3))  # type: ignore[return-value]
+
+
+def _camera_native_data_type(modality: CameraModality) -> str:
+    if modality is CameraModality.RGB:
+        return "rgb"
+    if modality is CameraModality.DEPTH:
+        return "distance_to_camera"
+    if modality is CameraModality.NORMALS:
+        return "normals"
+    raise ValueError(f"unsupported camera modality: {modality!r}")
+
+
+def _relationship_target_path(relationship: Any) -> str | None:
+    targets = tuple(relationship.GetTargets())
+    return str(targets[0]) if len(targets) == 1 else None
+
+
+def _nearest_body_path(target_path: str | None, body_paths: set[str], root_path: str) -> str | None:
+    candidate = target_path
+    while candidate is not None and (candidate == root_path or candidate.startswith(f"{root_path}/")):
+        if candidate in body_paths:
+            return candidate
+        if candidate == root_path:
+            break
+        candidate = candidate.rsplit("/", 1)[0]
+    return None
+
+
+def _articulation_mount_body_suffix(modules: SimpleNamespace, root_path: str, link_name: str | None) -> str:
+    """Resolve a unique physical root/link body below one authored articulation."""
+
+    body_prims = tuple(
+        modules.sim_utils.get_all_matching_child_prims(
+            root_path,
+            lambda prim: prim.HasAPI(modules.UsdPhysics.RigidBodyAPI),
+        )
+    )
+    body_by_path = {str(prim.GetPath()): prim for prim in body_prims}
+    if link_name is not None:
+        matches = tuple(path for path, prim in body_by_path.items() if prim.GetName() == link_name)
+        if len(matches) != 1:
+            raise ValueError(
+                f"camera mount link {link_name!r} must identify exactly one articulation body; found {len(matches)}"
+            )
+        selected = matches[0]
+    else:
+        children: set[str] = set()
+        joint_prims = modules.sim_utils.get_all_matching_child_prims(
+            root_path,
+            lambda prim: prim.IsA(modules.UsdPhysics.Joint),
+        )
+        body_paths = set(body_by_path)
+        for prim in joint_prims:
+            joint = modules.UsdPhysics.Joint(prim)
+            parent = _nearest_body_path(_relationship_target_path(joint.GetBody0Rel()), body_paths, root_path)
+            child = _nearest_body_path(_relationship_target_path(joint.GetBody1Rel()), body_paths, root_path)
+            if parent is not None and child is not None and parent != child:
+                children.add(child)
+        roots = tuple(sorted(body_paths - children))
+        if len(roots) != 1:
+            raise ValueError(f"camera root mount requires exactly one articulation root body; found {len(roots)}")
+        selected = roots[0]
+    suffix = selected.removeprefix(root_path)
+    if not suffix.startswith("/"):
+        raise ValueError("camera mount body must be below the articulation entity root")
+    return suffix
 
 
 def _declared_joint_map(
@@ -636,6 +749,8 @@ class IsaacLabNativeWorld:
         self._initial_usd_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._usd_rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
         self._kinematic_rigids: dict[EntityPath, bool] = {}
+        self._static_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
+        self._mounted_cameras: dict[EntityPath, _MountedCamera] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
         self._deformables: dict[EntityPath, Any] = {}
@@ -752,18 +867,24 @@ class IsaacLabNativeWorld:
             self._sim.set_setting("/physics/updateVelocitiesToUsd", True)
         for index, origin in enumerate(self._origins_cpu):
             sim_utils.create_prim(f"/World/env_{index}", "Xform", translation=origin)
-        ground = sim_utils.GroundPlaneCfg(color=(0.2, 0.23, 0.28))
-        ground.func("/World/unirobosimGround", ground)
+        if not any(entity.kind is EntityKind.STATIC_SCENE for entity in self._spec.entities):
+            ground = sim_utils.GroundPlaneCfg(color=(0.2, 0.23, 0.28))
+            ground.func("/World/unirobosimGround", ground)
         for entity in self._spec.entities:
             if entity.kind is EntityKind.ARTICULATION:
                 self._author_articulation(entity)
             elif entity.kind is EntityKind.RIGID_BODY:
                 self._author_rigid(entity)
+            elif entity.kind is EntityKind.STATIC_SCENE:
+                self._author_static_scene(entity)
             elif entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
                 self._author_deformable(entity)
             elif entity.kind is EntityKind.PARTICLE_FLUID:
                 self._author_particle_fluid(entity)
-            elif entity.kind is EntityKind.CAMERA_SENSOR:
+        # Camera parents must already exist before a mounted sensor resolves its
+        # articulation root/link. WorldSpec ordering is deliberately irrelevant.
+        for entity in self._spec.entities:
+            if entity.kind is EntityKind.CAMERA_SENSOR:
                 self._author_camera(entity)
         self._sim.reset()
         self._initialize_usd_articulations()
@@ -785,7 +906,7 @@ class IsaacLabNativeWorld:
             return
         cfg = self._m.ArticulationCfg(
             prim_path=f"/World/env_.*/{_native_name(entity.path)}",
-            spawn=self._m.sim_utils.UsdFileCfg(usd_path=str(entity.asset_uri).removeprefix("file://")),
+            spawn=_usd_file_cfg(self._m, entity),
             init_state=self._m.ArticulationCfg.InitialStateCfg(
                 pos=entity.pose.position,
                 rot=entity.pose.orientation_xyzw,
@@ -815,7 +936,7 @@ class IsaacLabNativeWorld:
         articulations: list[_UsdArticulation] = []
         for index in range(self._spec.environments.count):
             root = f"/World/env_{index}/{name}"
-            cfg = self._m.sim_utils.UsdFileCfg(usd_path=str(entity.asset_uri).removeprefix("file://"))
+            cfg = _usd_file_cfg(self._m, entity)
             cfg.func(
                 root,
                 cfg,
@@ -840,7 +961,7 @@ class IsaacLabNativeWorld:
             cfg = self._m.RigidObjectCfg(
                 prim_path=f"/World/env_.*/{_native_name(entity.path)}",
                 spawn=self._m.sim_utils.CuboidCfg(
-                    size=entity.box.dimensions_m,
+                    size=_scaled_dimensions(entity.box.dimensions_m, entity.scale_xyz),
                     rigid_props=self._m.sim_utils.RigidBodyPropertiesCfg(),
                     mass_props=self._m.sim_utils.MassPropertiesCfg(mass=entity.box.mass_kg),
                     collision_props=self._m.sim_utils.CollisionPropertiesCfg(),
@@ -881,10 +1002,7 @@ class IsaacLabNativeWorld:
         name = _native_name(entity.path)
         cfg = self._m.RigidObjectCfg(
             prim_path=f"/World/env_.*/{name}",
-            spawn=self._m.sim_utils.UsdFileCfg(
-                usd_path=str(entity.asset_uri).removeprefix("file://"),
-                activate_contact_sensors=True,
-            ),
+            spawn=_usd_file_cfg(self._m, entity, activate_contact_sensors=True),
             init_state=self._m.RigidObjectCfg.InitialStateCfg(
                 pos=entity.pose.position,
                 rot=entity.pose.orientation_xyzw,
@@ -939,10 +1057,7 @@ class IsaacLabNativeWorld:
         kinematic: bool | None = None
         for index in range(self._spec.environments.count):
             root = f"/World/env_{index}/{name}"
-            cfg = self._m.sim_utils.UsdFileCfg(
-                usd_path=str(entity.asset_uri).removeprefix("file://"),
-                activate_contact_sensors=True,
-            )
+            cfg = _usd_file_cfg(self._m, entity, activate_contact_sensors=True)
             cfg.func(
                 root,
                 cfg,
@@ -969,6 +1084,37 @@ class IsaacLabNativeWorld:
         assert kinematic is not None
         self._usd_rigids[entity.path] = tuple(bodies)
         self._kinematic_rigids[entity.path] = kinematic
+
+    def _author_static_scene(self, entity: EntitySpec) -> None:
+        """Compose one immutable USD scene per environment without asset wrappers."""
+
+        assert entity.asset_uri is not None
+        name = _native_name(entity.path)
+        roots: list[str] = []
+        for index in range(self._spec.environments.count):
+            root = f"/World/env_{index}/{name}"
+            cfg = _usd_file_cfg(self._m, entity)
+            cfg.func(
+                root,
+                cfg,
+                translation=entity.pose.position,
+                orientation=entity.pose.orientation_xyzw,
+            )
+            forbidden = self._m.sim_utils.get_all_matching_child_prims(
+                root,
+                lambda prim: (
+                    prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                    or prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI)
+                    or prim.IsA(self._m.UsdPhysics.Joint)
+                ),
+            )
+            if forbidden:
+                paths = tuple(str(prim.GetPath()) for prim in forbidden[:8])
+                raise ValueError(
+                    f"static-scene USD must not contain rigid bodies, articulations, or physics joints; found={paths}"
+                )
+            roots.append(root)
+        self._static_scene_roots[entity.path] = tuple(roots)
 
     def _author_deformable(self, entity: EntitySpec) -> None:
         assert entity.deformable is not None
@@ -1161,12 +1307,36 @@ class IsaacLabNativeWorld:
         camera = entity.camera
         aperture = 20.955
         focal_length = aperture / (2.0 * math.tan(math.radians(camera.horizontal_fov_degrees) / 2.0))
-        data_types = [
-            "rgb" if modality is CameraModality.RGB else "distance_to_camera" for modality in camera.modalities
-        ]
+        data_types = [_camera_native_data_type(modality) for modality in camera.modalities]
+        prim_path = f"/World/env_.*/{_native_name(entity.path)}"
+        if entity.mount is not None:
+            parent = next(item for item in self._spec.entities if item.path == entity.mount.parent_path)
+            if parent.kind is not EntityKind.ARTICULATION:
+                raise ValueError("mounted cameras require an articulation parent in this adapter profile")
+            parent_name = _native_name(parent.path)
+            suffix: str | None = None
+            for environment in range(self._spec.environments.count):
+                root = f"/World/env_{environment}/{parent_name}"
+                current = _articulation_mount_body_suffix(self._m, root, entity.mount.parent_link_name)
+                if suffix is None:
+                    suffix = current
+                elif current != suffix:
+                    raise ValueError("camera mount body must have the same relative path in every environment")
+            assert suffix is not None
+            prim_path = f"/World/env_.*/{parent_name}{suffix}/{_native_name(entity.path)}"
+            self._mounted_cameras[entity.path] = _MountedCamera(
+                parent_path=parent.path,
+                body_name=suffix.rsplit("/", 1)[-1],
+                body_suffix=suffix,
+                local_pose=entity.pose,
+            )
         cfg = self._m.CameraCfg(
-            prim_path=f"/World/env_.*/{_native_name(entity.path)}",
+            prim_path=prim_path,
             update_period=0.0,
+            # Isaac Lab otherwise freezes ``CameraData.pos_w`` and quaternion
+            # at initialization.  Pay the FrameView pose-refresh cost only for
+            # cameras whose parent can move.
+            update_latest_camera_pose=entity.mount is not None,
             height=camera.height_px,
             width=camera.width_px,
             data_types=data_types,
@@ -1187,6 +1357,77 @@ class IsaacLabNativeWorld:
             ),
         )
         self._cameras[entity.path] = self._m.Camera(cfg)
+
+    def _mounted_parent_pose(self, binding: _MountedCamera) -> tuple[Any, Any]:
+        if binding.parent_path in self._articulations:
+            articulation = self._articulations[binding.parent_path]
+            if binding.body_index is None:
+                matches = tuple(
+                    index for index, name in enumerate(articulation.body_names) if name == binding.body_name
+                )
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f"mounted camera body {binding.body_name!r} must match exactly one native articulation body"
+                    )
+                binding.body_index = matches[0]
+            return (
+                articulation.data.body_pos_w.torch[:, binding.body_index],
+                articulation.data.body_quat_w.torch[:, binding.body_index],
+            )
+        if binding.parent_path in self._usd_articulation_views:
+            if binding.raw_body_view is None:
+                parent_name = _native_name(binding.parent_path)
+                expected_paths = [
+                    f"/World/env_{environment}/{parent_name}{binding.body_suffix}"
+                    for environment in range(self._spec.environments.count)
+                ]
+                view = self._usd_simulation_view().create_rigid_body_view(expected_paths)
+                if view.count != self._spec.environments.count or tuple(view.prim_paths) != tuple(expected_paths):
+                    raise RuntimeError("mounted camera raw body view did not preserve environment order")
+                binding.raw_body_view = view
+            transforms = binding.raw_body_view.get_transforms()
+            return transforms[:, :3], transforms[:, 3:7]
+        raise RuntimeError("mounted camera parent articulation is not initialized")
+
+    def _sync_mounted_camera(self, path: EntityPath) -> None:
+        binding = self._mounted_cameras.get(path)
+        if binding is None:
+            return
+        parent_position, parent_orientation = self._mounted_parent_pose(binding)
+        local_position = self._m.torch.tensor(
+            binding.local_pose.position,
+            device=parent_position.device,
+            dtype=parent_position.dtype,
+        ).expand_as(parent_position)
+        local_orientation = self._m.torch.tensor(
+            binding.local_pose.orientation_xyzw,
+            device=parent_orientation.device,
+            dtype=parent_orientation.dtype,
+        ).expand_as(parent_orientation)
+        parent_vector = parent_orientation[:, :3]
+        twice_cross = 2.0 * self._m.torch.cross(parent_vector, local_position, dim=-1)
+        position = (
+            parent_position
+            + local_position
+            + parent_orientation[:, 3:4] * twice_cross
+            + self._m.torch.cross(parent_vector, twice_cross, dim=-1)
+        )
+        parent_x, parent_y, parent_z, parent_w = parent_orientation.unbind(dim=-1)
+        local_x, local_y, local_z, local_w = local_orientation.unbind(dim=-1)
+        orientation = self._m.torch.stack(
+            (
+                parent_w * local_x + parent_x * local_w + parent_y * local_z - parent_z * local_y,
+                parent_w * local_y - parent_x * local_z + parent_y * local_w + parent_z * local_x,
+                parent_w * local_z + parent_x * local_y - parent_y * local_x + parent_z * local_w,
+                parent_w * local_w - parent_x * local_x - parent_y * local_y - parent_z * local_z,
+            ),
+            dim=-1,
+        )
+        self._cameras[path].set_world_poses(position, orientation, convention="opengl")
+
+    def _sync_all_mounted_cameras(self) -> None:
+        for path in self._mounted_cameras:
+            self._sync_mounted_camera(path)
 
     def _initialize_articulations(self) -> None:
         torch = self._m.torch
@@ -1378,6 +1619,7 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         self._sim.forward()
         self._update_assets(0.0)
+        self._sync_all_mounted_cameras()
 
     def apply_articulation(
         self,
@@ -1715,11 +1957,12 @@ class IsaacLabNativeWorld:
         entity = next(item for item in self._spec.entities if item.path == path)
         assert entity.camera is not None
         assert self._sim is not None
+        self._sync_mounted_camera(path)
         self._sim.render()
         camera.update(0.0, force_recompute=True)
         channels = []
         for modality in entity.camera.modalities:
-            native_name = "rgb" if modality is CameraModality.RGB else "distance_to_camera"
+            native_name = _camera_native_data_type(modality)
             value = camera.data.output[native_name]
             tensor = getattr(value, "torch", value)
             channel_values: tuple[float | int, ...] | bytes
@@ -1731,13 +1974,24 @@ class IsaacLabNativeWorld:
                 tensor = tensor.to(dtype=self._m.torch.uint8).contiguous()
                 shape = tuple(int(size) for size in tensor.shape)
                 channel_values = tensor.detach().cpu().numpy().tobytes(order="C")
-            else:
+            elif modality is CameraModality.DEPTH:
                 tensor = tensor[..., 0]
                 valid = self._m.torch.isfinite(tensor)
                 valid &= tensor >= entity.camera.near_plane_m
                 valid &= tensor <= entity.camera.far_plane_m
                 tensor = self._m.torch.where(valid, tensor, self._m.torch.zeros_like(tensor))
                 tensor = tensor.to(dtype=self._m.torch.float32)
+                shape = tuple(int(size) for size in tensor.shape)
+                channel_values = tuple(float(item) for item in tensor.detach().cpu().reshape(-1).tolist())
+            else:
+                if tensor.shape[-1] != 3:
+                    raise RuntimeError("native camera normals must have exactly three channels")
+                tensor = tensor.to(dtype=self._m.torch.float32)
+                tensor = self._m.torch.where(
+                    self._m.torch.isfinite(tensor),
+                    tensor,
+                    self._m.torch.zeros_like(tensor),
+                )
                 shape = tuple(int(size) for size in tensor.shape)
                 channel_values = tuple(float(item) for item in tensor.detach().cpu().reshape(-1).tolist())
             channels.append((modality, shape, channel_values))
@@ -1747,6 +2001,7 @@ class IsaacLabNativeWorld:
         """Read the effective camera state authored into Isaac/USD."""
 
         camera = self._cameras[path]
+        self._sync_mounted_camera(path)
         camera.update(0.0, force_recompute=True)
         data = camera.data
         if data.image_shape is None:
@@ -1796,6 +2051,7 @@ class IsaacLabNativeWorld:
     def _flush_debug_render(self) -> None:
         if self._config.render:
             assert self._sim is not None
+            self._sync_all_mounted_cameras()
             self._sim.render()
 
     def _remove_debug_keys(self, keys: tuple[tuple[str, str, str], ...]) -> None:
@@ -1845,6 +2101,8 @@ class IsaacLabNativeWorld:
                     native_step_index,
                     self._render_interval_steps,
                 )
+                if render:
+                    self._sync_all_mounted_cameras()
                 self._sim.step(render=render)
                 self._update_assets(self._native_dt)
             self._step_index += 1
@@ -1882,6 +2140,8 @@ class IsaacLabNativeWorld:
         self._initial_usd_rigid.clear()
         self._usd_rigid_wrenches.clear()
         self._kinematic_rigids.clear()
+        self._static_scene_roots.clear()
+        self._mounted_cameras.clear()
         self._usd_tensor_view = None
         self._contacts.clear()
         self._deformables.clear()

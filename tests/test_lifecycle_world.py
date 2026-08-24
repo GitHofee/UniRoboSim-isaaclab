@@ -636,7 +636,11 @@ def test_camera_and_debug_endpoints_are_strict_and_backend_neutral() -> None:
             EntitySpec(
                 EntityPath("/camera"),
                 EntityKind.CAMERA_SENSOR,
-                camera=CameraSpec(width_px=4, height_px=3),
+                camera=CameraSpec(
+                    width_px=4,
+                    height_px=3,
+                    modalities=(CameraModality.RGB, CameraModality.DEPTH, CameraModality.NORMALS),
+                ),
             ),
             EntitySpec(
                 EntityPath("/fluid"),
@@ -661,6 +665,9 @@ def test_camera_and_debug_endpoints_are_strict_and_backend_neutral() -> None:
     assert rgb.is_packed
     assert rgb.to_bytes() == bytes((17,)) * (2 * 3 * 4 * 3)
     assert sample.channel(CameraModality.DEPTH).shape == (2, 3, 4)
+    normals = sample.channel(CameraModality.NORMALS)
+    assert normals.shape == (2, 3, 4, 3)
+    assert normals.values[:6] == (0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
     with pytest.raises(CommandError):
         world.read_sensor(fluid)
     with pytest.raises(CommandError):
