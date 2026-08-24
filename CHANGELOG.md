@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.5
+
+- Accept a PhysX `convexHull` collision carrier whose Prim is itself a
+  `UsdGeom.Mesh`, while retaining the existing container + one descendant Mesh
+  representation.
+- Use the same exact-one-Mesh selection rule for PhysX cooking and multi-environment
+  clone signatures; ambiguous multi-Mesh and nested-collider subtrees still fail
+  closed.
+
+## 0.9.4
+
+- Add immutable static-scene USD composition, physical asset scaling and mounted
+  RGB/depth/normals cameras.
+- Reject static scenes before native allocation when a complete
+  `planning.scene@2` catalog is required but cannot yet be represented.
+
 ## 0.9.3
 
 - Provide a reproducible Isaac Lab 6.1.17 source-profile patch that removes

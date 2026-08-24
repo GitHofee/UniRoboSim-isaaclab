@@ -50,6 +50,7 @@ from unirobosim import (
     parse_planning_frame_declarations,
 )
 
+from ._collision_mesh import single_exact_convex_mesh
 from .native import IsaacLabNativeWorld, _native_name
 from .native_protocols import (
     NativePlanningCatalog,
@@ -919,13 +920,7 @@ class _PlanningAdmission:
         return descriptor
 
     def _cook_exact_convex(self, carrier: Any) -> tuple[bytes, int, int, str]:
-        descendants = tuple(prim for prim in self._walk(carrier) if prim != carrier and prim.IsA(self._m.UsdGeom.Mesh))
-        nested_colliders = tuple(
-            prim for prim in self._walk(carrier) if prim != carrier and prim.HasAPI(self._m.UsdPhysics.CollisionAPI)
-        )
-        if len(descendants) != 1 or nested_colliders:
-            raise NativePlanningError("collision_cooking_failed")
-        mesh_prim = descendants[0]
+        mesh_prim = single_exact_convex_mesh(self._m, carrier, self._walk(carrier))
         mesh = self._m.UsdGeom.Mesh(mesh_prim)
         points = tuple(mesh.GetPointsAttr().Get() or ())
         counts = tuple(int(value) for value in (mesh.GetFaceVertexCountsAttr().Get() or ()))
@@ -1184,13 +1179,7 @@ class _PlanningAdmission:
         approximation = str(mesh_api.GetApproximationAttr().Get()) if mesh_api else ""
         if approximation != "convexHull":
             raise NativePlanningError("collision_geometry_unsupported")
-        descendants = tuple(item for item in self._walk(prim) if item != prim and item.IsA(self._m.UsdGeom.Mesh))
-        nested_colliders = tuple(
-            item for item in self._walk(prim) if item != prim and item.HasAPI(self._m.UsdPhysics.CollisionAPI)
-        )
-        if len(descendants) != 1 or nested_colliders:
-            raise NativePlanningError("collision_cooking_failed")
-        mesh = descendants[0]
+        mesh = single_exact_convex_mesh(self._m, prim, self._walk(prim))
         child_matrix, child_resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(mesh, prim)
         if child_resets:
             raise NativePlanningError("collision_cooking_failed")
