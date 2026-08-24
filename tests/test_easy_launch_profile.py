@@ -14,7 +14,12 @@ _NATIVE_SDK_ROOTS = {"isaaclab", "isaacsim", "omni", "pxr", "torch", "torchvisio
 
 def _easy_config() -> IsaacLabAdapterConfig:
     provider = unirobosim_isaaclab.create_easy_provider()
-    return provider._config  # type: ignore[attr-defined]
+    return provider._config
+
+
+def _explicit_config(profile: str) -> IsaacLabAdapterConfig:
+    provider = unirobosim_isaaclab.create_easy_provider(launch_profile=profile)
+    return provider._config
 
 
 def test_easy_launch_profile_absent_preserves_batch_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,6 +58,46 @@ def test_easy_launch_profile_exact_values(
         config.render_on_step,
         config.max_render_hz,
     ) == expected
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("headless", (True, True, True, False, None)),
+        ("headless-physics", (True, False, False, False, None)),
+        ("visible", (False, True, True, True, 60.0)),
+    ],
+)
+def test_explicit_launch_profile_is_authoritative_without_environment_read(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+    expected: tuple[bool, bool, bool, bool, float | None],
+) -> None:
+    monkeypatch.setattr(os, "getenv", lambda name: pytest.fail(f"unexpected environment read: {name}"))
+
+    config = _explicit_config(profile)
+
+    assert (
+        config.headless,
+        config.enable_cameras,
+        config.render,
+        config.render_on_step,
+        config.max_render_hz,
+    ) == expected
+
+
+@pytest.mark.parametrize("profile", ["", "VISIBLE", " visible", "visible ", "auto", "1", True, 1])
+def test_explicit_launch_profile_rejects_noncanonical_values_without_environment_or_sdk_import(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: object,
+) -> None:
+    monkeypatch.setattr(os, "getenv", lambda name: pytest.fail(f"unexpected environment read: {name}"))
+
+    with pytest.raises(ValidationError) as caught:
+        unirobosim_isaaclab.create_easy_provider(launch_profile=profile)  # type: ignore[arg-type]
+
+    assert caught.value.operation == "isaaclab.launch_profile.resolve"
+    assert not (_NATIVE_SDK_ROOTS & set(sys.modules))
 
 
 @pytest.mark.parametrize("profile", ["", "VISIBLE", " visible", "visible ", "auto", "1"])
@@ -105,4 +150,4 @@ def test_explicit_provider_creation_does_not_read_the_easy_profile(monkeypatch: 
 
     provider = unirobosim_isaaclab.create_provider()
 
-    assert provider._config.headless is True  # type: ignore[attr-defined]
+    assert provider._config.headless is True

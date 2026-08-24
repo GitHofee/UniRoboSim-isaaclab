@@ -19,23 +19,32 @@ def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProv
     return IsaacLabProvider(config)
 
 
-def create_easy_provider() -> IsaacLabProvider:
-    """Create the installed EasyAPI profile selected explicitly by the environment."""
+def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvider:
+    """Create the installed EasyAPI profile selected by an argument or the environment.
 
-    launch_profile = os.getenv(ISAACLAB_LAUNCH_PROFILE_ENV)
-    if launch_profile is None or launch_profile == "headless":
+    An explicit profile is authoritative and deliberately avoids consulting process
+    state. Omitting it retains the original EasyAPI environment-variable contract.
+    """
+
+    resolved_profile = os.getenv(ISAACLAB_LAUNCH_PROFILE_ENV) if launch_profile is None else launch_profile
+    if resolved_profile is not None and not isinstance(resolved_profile, str):
+        raise ValidationError(
+            "Isaac Lab launch profile must be unset, 'headless', 'headless-physics', or 'visible'",
+            operation="isaaclab.launch_profile.resolve",
+        ) from None
+    if resolved_profile is None or resolved_profile == "headless":
         headless = True
         enable_cameras = True
         render = True
         render_on_step = False
         max_render_hz = None
-    elif launch_profile == "headless-physics":
+    elif resolved_profile == "headless-physics":
         headless = True
         enable_cameras = False
         render = False
         render_on_step = False
         max_render_hz = None
-    elif launch_profile == "visible":
+    elif resolved_profile == "visible":
         headless = False
         enable_cameras = True
         render = True

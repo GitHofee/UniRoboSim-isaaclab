@@ -1,6 +1,7 @@
 """Backend identity and launch-profile-aware capabilities."""
 
 from unirobosim import (
+    COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
     WORLD_SCHEMA_VERSION,
     CapabilityDeclaration,
@@ -31,6 +32,7 @@ CAPABILITIES = CapabilitySet(
                 {
                     "rigid_body": ["model/vnd.usd"],
                     "articulation": ["model/vnd.usd"],
+                    "composite_scene": ["model/vnd.usd"],
                     "static_scene": ["model/vnd.usd"],
                 }
             ),
@@ -66,6 +68,31 @@ CAPABILITIES = CapabilitySet(
             limitations=(
                 "static-scene assets containing rigid bodies or articulations are rejected",
                 "static-scene state and drag commands are unsupported",
+            ),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("scene.composite@1"),
+            FrozenMap(
+                {
+                    "asset_format": "model/vnd.usd",
+                    "composition": "reference-once-per-environment",
+                    "motion": "mixed-physics",
+                    "reset": "contained-rigid-and-articulation-state",
+                }
+            ),
+            limitations=(
+                "composite containers do not accept commands directly",
+                "only explicitly declared embedded entities expose state and control",
+            ),
+        ),
+        CapabilityDeclaration(
+            CapabilityId("entity.embedded-binding@1"),
+            FrozenMap(
+                {
+                    "admission": "build-time",
+                    "composition": "no-respawn",
+                    "path_authority": "container-relative-prim-path",
+                }
             ),
         ),
         CapabilityDeclaration(
@@ -258,9 +285,13 @@ DESCRIPTOR = ProviderDescriptor(
     provider_id="nvidia.isaaclab",
     display_name="UniRoboSim Isaac Lab 3.0",
     version=DISTRIBUTION_VERSION,
-    contract_version="v0alpha5",
+    contract_version="v0alpha6",
     capabilities=CAPABILITIES,
-    supported_world_schema_versions=(WORLD_SCHEMA_VERSION, PHYSICAL_WORLD_SCHEMA_VERSION),
+    supported_world_schema_versions=(
+        WORLD_SCHEMA_VERSION,
+        PHYSICAL_WORLD_SCHEMA_VERSION,
+        COMPOSITE_WORLD_SCHEMA_VERSION,
+    ),
     metadata=FrozenMap(
         {
             "isaac_lab_release": "3.0.0-beta2",

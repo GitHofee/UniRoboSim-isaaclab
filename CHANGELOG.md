@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.10.0
+
+- Add UniRoboSim Core 0.10 composite USD scene support. The adapter composes one
+  scene layer per environment and binds declared rigid bodies and articulations to
+  existing Prims without respawning them.
+- Resolve embedded articulation joints by their complete USD Prim paths so duplicate
+  short joint names remain unambiguous.
+- Capture and deterministically restore embedded rigid-body and articulation state on
+  reset, including authored articulation roots that are not exposed as entities.
+
+## 0.9.6
+
+- Let the installed backend factory accept the canonical `visible`, `headless`, or
+  `headless-physics` launch profile as an explicit keyword-only argument.
+- Keep zero-argument EasyAPI environment compatibility while ensuring an explicit
+  FastSim profile never reads or inherits process environment state.
+
 ## 0.9.5
 
 - Accept a PhysX `convexHull` collision carrier whose Prim is itself a

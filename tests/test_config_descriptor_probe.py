@@ -33,10 +33,10 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.9.5"
+    assert unirobosim_isaaclab.__version__ == "0.10.0"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
-    assert DESCRIPTOR.contract_version == "v0alpha5"
+    assert DESCRIPTOR.contract_version == "v0alpha6"
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
     assert CAPABILITIES.get(CapabilityId("control.rigid_body.wrench@1")) is not None
     assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None
@@ -51,7 +51,10 @@ def test_public_identity_and_protocol() -> None:
     asset_formats = CAPABILITIES.get(CapabilityId("asset.formats@1"))
     assert asset_formats is not None
     assert asset_formats.properties["static_scene"] == ("model/vnd.usd",)
+    assert asset_formats.properties["composite_scene"] == ("model/vnd.usd",)
     assert CAPABILITIES.get(CapabilityId("scene.static@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("scene.composite@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("entity.embedded-binding@1")) is not None
     assert CAPABILITIES.get(CapabilityId("entity.scale.rigid@1")) is not None
     assert CAPABILITIES.get(CapabilityId("entity.scale.articulation.uniform@1")) is not None
     assert CAPABILITIES.get(CapabilityId("entity.scale.static_scene@1")) is not None

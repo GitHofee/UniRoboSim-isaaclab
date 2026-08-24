@@ -2,21 +2,21 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`unirobosim-isaaclab` 将 UniRoboSim `0.9.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
+`unirobosim-isaaclab` 将 UniRoboSim `0.10.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
 
 ## 兼容矩阵
 
 | 项目 | 要求档位 |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.9.2,<0.10` |
+| UniRoboSim | `>=0.10,<0.11` |
 | Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
 | PyTorch | `torch==2.11.0` |
 | TorchVision | `torchvision==0.26.0` |
 | TorchAudio | `torchaudio==2.11.0` |
-| Runtime contract | `v0alpha5` |
+| Runtime contract | `v0alpha6` |
 
 ## 安装
 
@@ -105,6 +105,9 @@ UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE=visible python run_simulation.py
 自动推断档位，因此同一批处理任务在不同机器上的默认行为一致。这个选择器只作用于
 正常的已安装入口发现；`create_provider(IsaacLabAdapterConfig(...))` 仍是显式的
 程序化配置接口。
+FastSim 会把 Plan 中的规范值直接传给同一个入口工厂，例如
+`create_easy_provider(launch_profile="headless-physics")`。显式关键字不会读取
+`UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE`；环境变量只保留给零参数 EasyAPI 兼容路径。
 
 需要定制非可移植启动参数时注入 Provider：
 
@@ -132,6 +135,8 @@ with Sim(provider=provider) as sim:
 ## 已实现原生能力
 
 - USD 机器人及非机器人铰接物体；
+- 每个环境只组合一次的复合 USD 场景，并把显式声明的内嵌刚体和铰接体绑定到
+  已有 Prim，不重复生成实体；
 - 不经刚体或接触传感器包装的不可变静态场景 USD 组合；
 - 刚体、均匀缩放铰接体与静态场景资产的物理缩放；
 - 关节位置、速度和力矩控制；
@@ -160,9 +165,11 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.9.5 要求 UniRoboSim Core `>=0.9.2,<0.10`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
+Adapter 0.10.0 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
 
-如果 World 同时要求 `planning.scene@2`，当前版本会在创建原生资源前拒绝 `STATIC_SCENE`。该 fail-closed 门禁用于防止规划器静默收到缺失房间碰撞体的世界几何。
+如果 World 同时要求 `planning.scene@2`，当前版本会在创建原生资源前拒绝
+`STATIC_SCENE` 和 `COMPOSITE_SCENE`。该 fail-closed 门禁用于防止规划器静默收到
+缺失房间碰撞体的世界几何。
 
 ## 验证
 

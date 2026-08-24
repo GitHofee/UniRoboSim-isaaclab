@@ -10,6 +10,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 from unirobosim import (
     ARTICULATION_AXIS_UNITS_MISMATCH,
+    COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
     WORLD_SCHEMA_VERSION,
     ArrayValue,
@@ -106,7 +107,11 @@ def _physical_world(asset: Path, build_input: BuildInput) -> WorldSpec:
 
 
 def test_descriptor_and_session_expose_the_core_090_contract() -> None:
-    assert DESCRIPTOR.supported_world_schema_versions == (WORLD_SCHEMA_VERSION, PHYSICAL_WORLD_SCHEMA_VERSION)
+    assert DESCRIPTOR.supported_world_schema_versions == (
+        WORLD_SCHEMA_VERSION,
+        PHYSICAL_WORLD_SCHEMA_VERSION,
+        COMPOSITE_WORLD_SCHEMA_VERSION,
+    )
     assert DESCRIPTOR.capabilities.get(CapabilityId("state.articulation.axis-units@1")) is not None
     assert DESCRIPTOR.capabilities.get(CapabilityId("control.articulation.position.axis-units@1")) is not None
     signature = inspect.signature(open_test_session(FakeNativeRuntime())[1].build)
@@ -238,7 +243,7 @@ def test_droid_acceptance_entry_point_closes_metadata_and_factory() -> None:
     assert entry_point.name == "isaaclab"
     assert entry_point.group == "unirobosim.backends"
     assert entry_point.value == "unirobosim_isaaclab:create_easy_provider"
-    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.9.5")
+    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.0")
     factory = entry_point.load()
     assert callable(factory)
     assert factory() is provider
@@ -268,6 +273,7 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
         plan_digest="a" * 64,
         plan_content_digest="a" * 64,
         backend=aliases_module.backend_alias("isaaclab"),
+        launch_profile="headless",
         world_spec=world,
         build_input=None,
         entities=(),
@@ -288,7 +294,7 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
         "group": "unirobosim.backends",
         "value": "unirobosim_isaaclab:create_easy_provider",
         "distribution": "unirobosim-isaaclab",
-        "version": "0.9.5",
+        "version": "0.10.0",
     }
     assert entry_point.load()() is provider
 
@@ -419,6 +425,7 @@ def test_droid_compose_keeps_exact_adapter_and_planning_gate() -> None:
         plan_digest="a" * 64,
         plan_content_digest="a" * 64,
         backend=aliases_module.backend_alias("isaaclab"),
+        launch_profile="headless",
         world_spec=world,
         build_input=None,
         entities=(),

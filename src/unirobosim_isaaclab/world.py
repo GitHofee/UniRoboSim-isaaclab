@@ -118,7 +118,9 @@ class IsaacLabWorld:
     @staticmethod
     def validate_build_spec(spec: WorldSpec, *, backend_id: str) -> None:
         for entity in spec.entities:
-            if entity.kind in {EntityKind.ARTICULATION, EntityKind.STATIC_SCENE}:
+            if entity.kind in {EntityKind.ARTICULATION, EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE}:
+                if entity.embedded_binding is not None:
+                    continue
                 if entity.asset_uri is None:
                     raise WorldBuildError(
                         f"Isaac Lab {entity.kind.value} entities require a local USD asset_uri",
@@ -138,6 +140,8 @@ class IsaacLabWorld:
                         details={"asset_uri": entity.asset_uri},
                     )
             if entity.kind is EntityKind.RIGID_BODY:
+                if entity.embedded_binding is not None:
+                    continue
                 if entity.asset_uri is None and entity.box is None:
                     raise WorldBuildError(
                         "Isaac Lab rigid bodies require a portable box or local USD asset_uri",
@@ -745,7 +749,7 @@ class IsaacLabWorld:
         elif entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
             dimensions = (0.7, 0.7, 0.15)
             color = (0.55, 0.35, 0.9, 0.82)
-        elif entity.kind is EntityKind.STATIC_SCENE:
+        elif entity.kind in {EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE}:
             dimensions = (
                 4.0 * entity.scale_xyz[0],
                 4.0 * entity.scale_xyz[1],

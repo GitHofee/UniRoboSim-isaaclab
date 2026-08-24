@@ -2,21 +2,21 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`unirobosim-isaaclab` connects UniRoboSim `0.9.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
+`unirobosim-isaaclab` connects UniRoboSim `0.10.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
 
 ## Compatibility
 
 | Item | Required profile |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.9.2,<0.10` |
+| UniRoboSim | `>=0.10,<0.11` |
 | Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
 | PyTorch | `torch==2.11.0` |
 | TorchVision | `torchvision==0.26.0` |
 | TorchAudio | `torchaudio==2.11.0` |
-| Runtime contract | `v0alpha5` |
+| Runtime contract | `v0alpha6` |
 
 ## Installation
 
@@ -108,6 +108,10 @@ Values are case-sensitive. Any other value fails before the Isaac SDK is loaded.
 The adapter does not infer a profile from `DISPLAY`, so batch behavior is stable across
 machines. This selector applies only to normal installed entry-point discovery;
 `create_provider(IsaacLabAdapterConfig(...))` remains the explicit programmatic API.
+FastSim passes its canonical Plan value directly to the same entry-point factory, for
+example `create_easy_provider(launch_profile="headless-physics")`. An explicit keyword
+never reads `UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE`; the environment remains a
+zero-argument EasyAPI compatibility path only.
 
 Use provider injection for launch settings that do not belong in the portable world:
 
@@ -135,6 +139,8 @@ with Sim(provider=provider) as sim:
 ## Implemented native features
 
 - USD articulations, including robots and non-robot articulated objects;
+- composite USD scenes composed once per environment, with explicitly declared
+  embedded rigid bodies and articulations bound to their existing Prims;
 - immutable static-scene USD composition without rigid-object or contact-sensor wrappers;
 - physical rigid, uniform articulation, and static-scene asset scaling;
 - joint position, velocity, and effort control;
@@ -163,9 +169,11 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.9.5 requires UniRoboSim Core `>=0.9.2,<0.10` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
+Adapter 0.10.0 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
-A world that demands `planning.scene@2` currently rejects `STATIC_SCENE` before native allocation. This fail-closed gate prevents a planner from receiving a silently incomplete room collider set.
+A world that demands `planning.scene@2` currently rejects `STATIC_SCENE` and
+`COMPOSITE_SCENE` before native allocation. This fail-closed gate prevents a planner
+from receiving a silently incomplete room collider set.
 
 ## Verification
 

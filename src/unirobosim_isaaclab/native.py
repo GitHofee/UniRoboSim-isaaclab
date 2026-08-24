@@ -286,6 +286,29 @@ class _UsdArticulation:
 
 
 @dataclass
+class _CompositeRigidState:
+    view: Any
+    initial_transforms: Any
+    initial_velocities: Any
+    environment_by_index: tuple[int, ...]
+    kinematic: bool
+
+
+@dataclass
+class _CompositeArticulationState:
+    view: Any
+    initial_root_transforms: Any
+    initial_root_velocities: Any
+    initial_dof_positions: Any
+    initial_dof_velocities: Any
+    initial_position_targets: Any
+    initial_velocity_targets: Any
+    initial_actuation_forces: Any
+    initial_stiffnesses: Any
+    initial_dampings: Any
+
+
+@dataclass
 class _MountedCamera:
     parent_path: EntityPath
     body_name: str
@@ -455,6 +478,45 @@ def _declared_joint_map(
             f"declared={declared_names}, native={native_names}"
         )
     return tuple(native_names.index(name) for name in declared_names)
+
+
+def _declared_joint_path_map(
+    path: EntityPath,
+    native_paths: object,
+    expected_paths: tuple[tuple[str, ...], ...],
+) -> tuple[int, ...]:
+    """Map logical joints by exact composed Prim path, including duplicate short names."""
+
+    try:
+        rows = tuple(tuple(str(item) for item in row) for row in cast(Iterable[Iterable[object]], native_paths))
+    except TypeError as exc:
+        raise ValueError(f"native articulation for {path.value} did not expose per-environment DOF paths") from exc
+    if len(rows) != len(expected_paths) or not rows:
+        raise ValueError(
+            f"native articulation DOF path environments changed for {path.value}; "
+            f"expected={len(expected_paths)}, actual={len(rows)}"
+        )
+    mapping: tuple[int, ...] | None = None
+    for environment, (native_row, expected_row) in enumerate(zip(rows, expected_paths, strict=True)):
+        if len(native_row) != len(set(native_row)):
+            raise ValueError(
+                f"native articulation DOF paths are ambiguous for {path.value} in environment {environment}"
+            )
+        if any(expected not in native_row for expected in expected_row):
+            missing = tuple(expected for expected in expected_row if expected not in native_row)
+            raise ValueError(
+                f"embedded joint Prim paths for {path.value} are not DOFs of the bound articulation; missing={missing}"
+            )
+        current = tuple(native_row.index(expected) for expected in expected_row)
+        if mapping is None:
+            mapping = current
+        elif current != mapping:
+            raise ValueError(
+                f"embedded articulation DOF order changed across environments for {path.value}; "
+                f"first={mapping}, environment_{environment}={current}"
+            )
+    assert mapping is not None
+    return mapping
 
 
 def _environment_origins(count: int, spacing: float) -> tuple[tuple[float, float, float], ...]:
@@ -750,6 +812,10 @@ class IsaacLabNativeWorld:
         self._usd_rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
         self._kinematic_rigids: dict[EntityPath, bool] = {}
         self._static_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
+        self._composite_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
+        self._embedded_joint_paths: dict[EntityPath, tuple[tuple[str, ...], ...]] = {}
+        self._composite_rigid_states: list[_CompositeRigidState] = []
+        self._composite_articulation_states: list[_CompositeArticulationState] = []
         self._mounted_cameras: dict[EntityPath, _MountedCamera] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
@@ -867,10 +933,21 @@ class IsaacLabNativeWorld:
             self._sim.set_setting("/physics/updateVelocitiesToUsd", True)
         for index, origin in enumerate(self._origins_cpu):
             sim_utils.create_prim(f"/World/env_{index}", "Xform", translation=origin)
-        if not any(entity.kind is EntityKind.STATIC_SCENE for entity in self._spec.entities):
+        if not any(
+            entity.kind in {EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE} for entity in self._spec.entities
+        ):
             ground = sim_utils.GroundPlaneCfg(color=(0.2, 0.23, 0.28))
             ground.func("/World/unirobosimGround", ground)
+        # Containers must be composed before any embedded entity resolves exact
+        # source Prim paths. This pass is deliberately independent of WorldSpec
+        # ordering and authors each source asset exactly once per environment.
         for entity in self._spec.entities:
+            if entity.kind is EntityKind.COMPOSITE_SCENE:
+                self._author_composite_scene(entity)
+        self._bind_embedded_entities()
+        for entity in self._spec.entities:
+            if entity.embedded_binding is not None or entity.kind is EntityKind.COMPOSITE_SCENE:
+                continue
             if entity.kind is EntityKind.ARTICULATION:
                 self._author_articulation(entity)
             elif entity.kind is EntityKind.RIGID_BODY:
@@ -889,6 +966,7 @@ class IsaacLabNativeWorld:
         self._sim.reset()
         self._initialize_usd_articulations()
         self._initialize_usd_rigids()
+        self._initialize_composite_physics()
         self._origins = self._m.torch.tensor(self._origins_cpu, device=self._sim.device, dtype=self._m.torch.float32)
         self._initialize_articulations()
         self._initialize_rigids()
@@ -1115,6 +1193,126 @@ class IsaacLabNativeWorld:
                 )
             roots.append(root)
         self._static_scene_roots[entity.path] = tuple(roots)
+
+    def _author_composite_scene(self, entity: EntitySpec) -> None:
+        """Compose one mixed-physics USD container per environment exactly once."""
+
+        assert entity.asset_uri is not None
+        name = _native_name(entity.path)
+        roots: list[str] = []
+        for index in range(self._spec.environments.count):
+            root = f"/World/env_{index}/{name}"
+            cfg = _usd_file_cfg(self._m, entity)
+            cfg.func(
+                root,
+                cfg,
+                translation=entity.pose.position,
+                orientation=entity.pose.orientation_xyzw,
+            )
+            roots.append(root)
+        self._composite_scene_roots[entity.path] = tuple(roots)
+
+    @staticmethod
+    def _prim_path_string(prim: Any) -> str:
+        path = prim.GetPath()
+        return str(getattr(path, "pathString", path))
+
+    def _embedded_prim(self, root: str, relative_path: str, *, entity: EntitySpec, role: str) -> Any:
+        stage = self._m.sim_utils.get_current_stage()
+        absolute_path = f"{root}/{relative_path}"
+        prim = stage.GetPrimAtPath(absolute_path)
+        if not prim or not prim.IsValid() or self._prim_path_string(prim) != absolute_path:
+            raise ValueError(
+                f"embedded {role} Prim for {entity.path.value} does not resolve exactly below its container: "
+                f"{absolute_path}"
+            )
+        return prim
+
+    def _bind_embedded_entities(self) -> None:
+        """Bind declared logical entities to already composed Prim trees without spawning."""
+
+        claimed: dict[tuple[EntityPath, str], EntityPath] = {}
+        for entity in self._spec.entities:
+            binding = entity.embedded_binding
+            if binding is None:
+                continue
+            roots = self._composite_scene_roots.get(binding.container_path)
+            if roots is None:
+                raise ValueError(
+                    f"embedded entity {entity.path.value} references a composite container that was not composed"
+                )
+            for prim_binding in (*binding.link_prims, *binding.joint_prims):
+                key = (binding.container_path, prim_binding.relative_prim_path)
+                owner = claimed.get(key)
+                if owner is not None and owner != entity.path:
+                    raise ValueError(
+                        f"embedded Prim {prim_binding.relative_prim_path!r} is claimed by both "
+                        f"{owner.value} and {entity.path.value}"
+                    )
+                claimed[key] = entity.path
+
+            root_binding = next(
+                item for item in binding.link_prims if item.relative_prim_path == binding.root_body_prim_path
+            )
+            del root_binding  # Core validation proves membership; native validation below proves physics type.
+            root_prims: list[Any] = []
+            joint_paths_by_environment: list[tuple[str, ...]] = []
+            kinematic: bool | None = None
+            for root in roots:
+                link_prims = tuple(
+                    self._embedded_prim(
+                        root,
+                        item.relative_prim_path,
+                        entity=entity,
+                        role=f"link {item.logical_name!r}",
+                    )
+                    for item in binding.link_prims
+                )
+                if any(not prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI) for prim in link_prims):
+                    raise ValueError(f"all embedded links for {entity.path.value} must be rigid-body Prims")
+                root_prim = self._embedded_prim(
+                    root,
+                    binding.root_body_prim_path,
+                    entity=entity,
+                    role="root body",
+                )
+                root_prims.append(root_prim)
+                if entity.kind is EntityKind.ARTICULATION:
+                    if not root_prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI):
+                        raise ValueError(
+                            f"embedded articulation root body for {entity.path.value} must have "
+                            "UsdPhysics.ArticulationRootAPI"
+                        )
+                    joint_prims = tuple(
+                        self._embedded_prim(
+                            root,
+                            item.relative_prim_path,
+                            entity=entity,
+                            role=f"joint {item.logical_name!r}",
+                        )
+                        for item in binding.joint_prims
+                    )
+                    if any(not prim.IsA(self._m.UsdPhysics.Joint) for prim in joint_prims):
+                        raise ValueError(f"all embedded joints for {entity.path.value} must be UsdPhysics.Joint Prims")
+                    joint_paths_by_environment.append(tuple(self._prim_path_string(prim) for prim in joint_prims))
+                elif entity.kind is EntityKind.RIGID_BODY:
+                    if len(binding.link_prims) != 1:
+                        raise ValueError("an embedded rigid body must bind exactly one rigid-body link Prim")
+                    current_kinematic = _is_kinematic_rigid(root_prim, self._m.UsdPhysics)
+                    if kinematic is None:
+                        kinematic = current_kinematic
+                    elif current_kinematic != kinematic:
+                        raise ValueError("embedded rigid body kinematic mode changed across environments")
+                else:
+                    raise ValueError("only rigid bodies and articulations can use an embedded binding")
+
+            if entity.kind is EntityKind.ARTICULATION:
+                self._usd_articulations[entity.path] = tuple(_UsdArticulation(root_prim=prim) for prim in root_prims)
+                self._embedded_joint_paths[entity.path] = tuple(joint_paths_by_environment)
+            else:
+                assert kinematic is not None
+                self._usd_rigids[entity.path] = tuple(_UsdRigid(rigid_prim=prim) for prim in root_prims)
+                self._kinematic_rigids[entity.path] = kinematic
 
     def _author_deformable(self, entity: EntitySpec) -> None:
         assert entity.deformable is not None
@@ -1467,8 +1665,15 @@ class IsaacLabNativeWorld:
                     f"USD articulation view for {path.value} did not preserve environment order; "
                     f"expected={expected_paths}, actual={tuple(view.prim_paths)}"
                 )
-            native_names = tuple(view.shared_metatype.dof_names)
-            joint_map = _declared_joint_map(path, native_names, entity.joint_names)
+            if path in self._embedded_joint_paths:
+                joint_map = _declared_joint_path_map(
+                    path,
+                    view.dof_paths,
+                    self._embedded_joint_paths[path],
+                )
+            else:
+                native_names = tuple(view.shared_metatype.dof_names)
+                joint_map = _declared_joint_map(path, native_names, entity.joint_names)
             self._joint_maps[path] = joint_map
             root_pose = view.get_root_transforms().clone()
             root_velocity = view.get_root_velocities().clone()
@@ -1499,6 +1704,142 @@ class IsaacLabNativeWorld:
             self._usd_rigid_wrenches[path] = (
                 self._m.torch.zeros((view.count, 3), device=transforms.device, dtype=self._m.torch.float32),
                 self._m.torch.zeros((view.count, 3), device=transforms.device, dtype=self._m.torch.float32),
+            )
+
+    def _initialize_composite_physics(self) -> None:
+        """Capture every unbound physical body contained by composite scenes."""
+
+        if not self._composite_scene_roots:
+            return
+        tensor_view = self._usd_simulation_view()
+        bound_articulation_roots = {
+            self._prim_path_string(articulation.root_prim)
+            for articulations in self._usd_articulations.values()
+            for articulation in articulations
+        }
+
+        # Capture provider-authored articulation roots that were not admitted as
+        # public embedded entities. They remain lifecycle-managed, but private.
+        root_rows: list[dict[str, str]] = []
+        for roots in self._composite_scene_roots.values():
+            for root in roots:
+                root_row: dict[str, str] = {}
+                prims = self._m.sim_utils.get_all_matching_child_prims(
+                    root,
+                    lambda prim: prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI),
+                )
+                for prim in prims:
+                    absolute = self._prim_path_string(prim)
+                    if absolute in bound_articulation_roots:
+                        continue
+                    relative = absolute.removeprefix(f"{root}/")
+                    if not relative or relative == absolute or relative in root_row:
+                        raise ValueError("composite articulation roots are ambiguous below their container")
+                    root_row[relative] = absolute
+                root_rows.append(root_row)
+        if root_rows:
+            expected_relative_roots = tuple(sorted(root_rows[0]))
+            if any(tuple(sorted(row)) != expected_relative_roots for row in root_rows[1:]):
+                raise ValueError("composite articulation-root topology changed across environments")
+            # One native view per topology avoids combining unrelated mechanisms
+            # that can have different DOF/link counts.
+            for relative in expected_relative_roots:
+                paths = tuple(row[relative] for row in root_rows)
+                view = tensor_view.create_articulation_view(list(paths))
+                if view.count != len(paths) or tuple(view.prim_paths) != paths:
+                    raise RuntimeError(
+                        "composite articulation view did not preserve environment order; "
+                        f"expected={paths}, actual={tuple(view.prim_paths)}"
+                    )
+                self._composite_articulation_states.append(
+                    _CompositeArticulationState(
+                        view=view,
+                        initial_root_transforms=view.get_root_transforms().clone(),
+                        initial_root_velocities=view.get_root_velocities().clone(),
+                        initial_dof_positions=view.get_dof_positions().clone(),
+                        initial_dof_velocities=view.get_dof_velocities().clone(),
+                        initial_position_targets=view.get_dof_position_targets().clone(),
+                        initial_velocity_targets=view.get_dof_velocity_targets().clone(),
+                        initial_actuation_forces=view.get_dof_actuation_forces().clone(),
+                        initial_stiffnesses=view.get_dof_stiffnesses().clone(),
+                        initial_dampings=view.get_dof_dampings().clone(),
+                    )
+                )
+
+        articulation_links: set[str] = set()
+        articulation_views = [
+            *(state.view for state in self._composite_articulation_states),
+            *self._usd_articulation_views.values(),
+        ]
+        for view in articulation_views:
+            try:
+                articulation_links.update(str(path) for row in view.link_paths for path in row)
+            except TypeError as exc:
+                raise RuntimeError("native articulation view did not expose exact link Prim paths") from exc
+
+        # Every remaining rigid body is captured in a homogeneous motion-mode
+        # view. The environment map permits deterministic partial reset without
+        # assuming PhysX preserves the caller's path order.
+        rigid_by_mode: dict[bool, list[tuple[str, int]]] = {False: [], True: []}
+        environment = 0
+        for roots in self._composite_scene_roots.values():
+            reference_relative_paths: tuple[str, ...] | None = None
+            reference_modes: dict[str, bool] = {}
+            for root in roots:
+                rigid_row: dict[str, Any] = {}
+                prims = self._m.sim_utils.get_all_matching_child_prims(
+                    root,
+                    lambda prim: prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI),
+                )
+                for prim in prims:
+                    absolute = self._prim_path_string(prim)
+                    relative = absolute.removeprefix(f"{root}/")
+                    if not relative or relative == absolute or relative in rigid_row:
+                        raise ValueError("composite rigid-body paths are ambiguous below their container")
+                    rigid_row[relative] = prim
+                relative_paths = tuple(sorted(rigid_row))
+                if reference_relative_paths is None:
+                    reference_relative_paths = relative_paths
+                    reference_modes = {
+                        relative: _is_kinematic_rigid(rigid_row[relative], self._m.UsdPhysics)
+                        for relative in relative_paths
+                    }
+                elif relative_paths != reference_relative_paths:
+                    raise ValueError("composite rigid-body topology changed across environments")
+                for relative in relative_paths:
+                    prim = rigid_row[relative]
+                    absolute = self._prim_path_string(prim)
+                    mode = _is_kinematic_rigid(prim, self._m.UsdPhysics)
+                    if mode != reference_modes[relative]:
+                        raise ValueError("composite rigid-body kinematic mode changed across environments")
+                    if absolute not in articulation_links:
+                        rigid_by_mode[mode].append((absolute, environment))
+                environment += 1
+
+        for kinematic, path_rows in rigid_by_mode.items():
+            if not path_rows:
+                continue
+            requested_paths = tuple(path for path, _ in path_rows)
+            environment_by_path = {path: environment for path, environment in path_rows}
+            if len(environment_by_path) != len(requested_paths):
+                raise ValueError("composite rigid-body paths are not globally unique")
+            view = tensor_view.create_rigid_body_view(list(requested_paths))
+            actual_paths = tuple(view.prim_paths)
+            if view.count != len(requested_paths) or set(actual_paths) != set(requested_paths):
+                raise RuntimeError(
+                    "composite rigid-body view did not preserve the requested Prim set; "
+                    f"requested_count={len(requested_paths)}, actual_count={view.count}"
+                )
+            transforms = view.get_transforms().clone()
+            velocities = view.get_velocities().clone()
+            self._composite_rigid_states.append(
+                _CompositeRigidState(
+                    view=view,
+                    initial_transforms=transforms,
+                    initial_velocities=velocities,
+                    environment_by_index=tuple(environment_by_path[path] for path in actual_paths),
+                    kinematic=kinematic,
+                )
             )
 
     def _initialize_rigids(self) -> None:
@@ -1538,6 +1879,57 @@ class IsaacLabNativeWorld:
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
         env_ids = list(environment_indices)
+        for state in getattr(self, "_composite_rigid_states", ()):
+            selected = tuple(
+                index
+                for index, environment in enumerate(state.environment_by_index)
+                if environment in environment_indices
+            )
+            if not selected:
+                continue
+            indices = self._m.torch.tensor(
+                selected,
+                device=state.initial_transforms.device,
+                dtype=self._m.torch.int64,
+            )
+            _write_usd_rigid_state(
+                state.view,
+                state.initial_transforms[indices],
+                state.initial_velocities[indices],
+                indices,
+                kinematic=state.kinematic,
+            )
+        for state in getattr(self, "_composite_articulation_states", ()):
+            indices = self._m.torch.tensor(
+                environment_indices,
+                device=state.initial_dof_positions.device,
+                dtype=self._m.torch.int64,
+            )
+            state.view.set_root_transforms(state.initial_root_transforms[indices], indices)
+            state.view.set_root_velocities(state.initial_root_velocities[indices], indices)
+            state.view.set_dof_positions(state.initial_dof_positions[indices], indices)
+            state.view.set_dof_velocities(state.initial_dof_velocities[indices], indices)
+            state.view.set_dof_position_targets(state.initial_position_targets[indices], indices)
+            state.view.set_dof_velocity_targets(state.initial_velocity_targets[indices], indices)
+            state.view.set_dof_actuation_forces(state.initial_actuation_forces[indices], indices)
+            stiffness_indices = self._m.torch.tensor(
+                environment_indices,
+                device=state.initial_stiffnesses.device,
+                dtype=self._m.torch.int64,
+            )
+            damping_indices = self._m.torch.tensor(
+                environment_indices,
+                device=state.initial_dampings.device,
+                dtype=self._m.torch.int64,
+            )
+            state.view.set_dof_stiffnesses(
+                state.initial_stiffnesses[stiffness_indices],
+                stiffness_indices,
+            )
+            state.view.set_dof_dampings(
+                state.initial_dampings[damping_indices],
+                damping_indices,
+            )
         for path, asset in self._articulations.items():
             root_pose, positions, velocities = self._initial_articulation[path]
             asset.write_root_pose_to_sim_index(root_pose=root_pose[env_ids], env_ids=env_ids)
@@ -1568,8 +1960,18 @@ class IsaacLabNativeWorld:
             for environment in environment_indices:
                 stiffness[environment, list(joint_ids)] = self._config.position_stiffness
                 damping[environment, list(joint_ids)] = self._config.position_damping
-            view.set_dof_stiffnesses(stiffness[indices], indices)
-            view.set_dof_dampings(damping[indices], indices)
+            stiffness_indices = self._m.torch.tensor(
+                environment_indices,
+                device=stiffness.device,
+                dtype=self._m.torch.int64,
+            )
+            damping_indices = self._m.torch.tensor(
+                environment_indices,
+                device=damping.device,
+                dtype=self._m.torch.int64,
+            )
+            view.set_dof_stiffnesses(stiffness[stiffness_indices], stiffness_indices)
+            view.set_dof_dampings(damping[damping_indices], damping_indices)
         for path, asset in self._rigids.items():
             root_pose, root_velocity = self._initial_rigid[path]
             asset.reset(env_ids=env_ids)
@@ -1742,8 +2144,18 @@ class IsaacLabNativeWorld:
         view.set_dof_position_targets(positions[indices], indices)
         view.set_dof_velocity_targets(velocities[indices], indices)
         view.set_dof_actuation_forces(efforts[indices], indices)
-        view.set_dof_stiffnesses(stiffness[indices], indices)
-        view.set_dof_dampings(damping[indices], indices)
+        stiffness_indices = self._m.torch.tensor(
+            environment_indices,
+            device=stiffness.device,
+            dtype=self._m.torch.int64,
+        )
+        damping_indices = self._m.torch.tensor(
+            environment_indices,
+            device=damping.device,
+            dtype=self._m.torch.int64,
+        )
+        view.set_dof_stiffnesses(stiffness[stiffness_indices], stiffness_indices)
+        view.set_dof_dampings(damping[damping_indices], damping_indices)
 
     def read_articulation(self, path: EntityPath) -> tuple[Matrix, Matrix]:
         if path in self._usd_articulation_views:
@@ -2141,6 +2553,10 @@ class IsaacLabNativeWorld:
         self._usd_rigid_wrenches.clear()
         self._kinematic_rigids.clear()
         self._static_scene_roots.clear()
+        self._composite_scene_roots.clear()
+        self._embedded_joint_paths.clear()
+        self._composite_rigid_states.clear()
+        self._composite_articulation_states.clear()
         self._mounted_cameras.clear()
         self._usd_tensor_view = None
         self._contacts.clear()

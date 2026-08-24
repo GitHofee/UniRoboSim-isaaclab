@@ -363,7 +363,7 @@ class _PlanningAdmission:
             if spec.kind is EntityKind.CAMERA_SENSOR:
                 self._verify_nonphysical_entity(spec)
                 continue
-            if spec.kind is EntityKind.STATIC_SCENE:
+            if spec.kind in {EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE}:
                 # Public preflight rejects this today. Keep the native admission
                 # fail-closed as defense in depth so its colliders can never be
                 # silently omitted if a caller bypasses the public facade.
