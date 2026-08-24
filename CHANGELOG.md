@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.1
+
+- Preserve authored per-joint stiffness and damping by default instead of applying
+  one global gain pair to every articulation DoF.
+- Restore authored gains across reset and control-mode changes; position commands
+  fall back locally only for explicitly commanded authored-zero drives.
+- Keep raw articulation state and gain tensor indexing on their respective devices,
+  including CUDA state with CPU-resident PhysX gain tables.
+- Expose complete composite-scene planning geometry and tolerate degenerate USD
+  faces only when they contain fewer than three vertices; malformed valid faces and
+  meshes with no usable triangles still fail closed.
+
 ## 0.10.0
 
 - Add UniRoboSim Core 0.10 composite USD scene support. The adapter composes one

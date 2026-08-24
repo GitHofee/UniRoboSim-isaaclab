@@ -339,9 +339,8 @@ def _exact_filtered_pair_encoding(
     if len(bodies) > _MAX_FILTERED_COLLISION_BODIES or not 1 <= first_class_bit <= 31:
         raise NativePlanningError("collision_filter_unsupported")
     body_set = frozenset(bodies)
-    if (
-        not self_filtered_bodies.issubset(body_set)
-        or any(left not in body_set or right not in body_set or left >= right for left, right in filtered_pairs)
+    if not self_filtered_bodies.issubset(body_set) or any(
+        left not in body_set or right not in body_set or left >= right for left, right in filtered_pairs
     ):
         raise NativePlanningError("collision_filter_unsupported")
     participants = tuple(sorted({item for pair in filtered_pairs for item in pair} | set(self_filtered_bodies)))
@@ -372,8 +371,7 @@ def _exact_filtered_pair_encoding(
         for left_index, left in enumerate(participants):
             for right in participants[left_index + 1 :]:
                 predicted = (
-                    class_by_body[right] in allowed_classes[left]
-                    and class_by_body[left] in allowed_classes[right]
+                    class_by_body[right] in allowed_classes[left] and class_by_body[left] in allowed_classes[right]
                 )
                 if predicted != allowed(left, right):
                     mismatch = (left, right)
@@ -429,7 +427,7 @@ def _triangulate_faces(
     orientation: str,
     hole_faces: frozenset[int] = frozenset(),
 ) -> tuple[tuple[int, int, int], ...]:
-    if not counts or sum(counts) != len(indices) or any(count < 3 for count in counts):
+    if not counts or sum(counts) != len(indices) or any(count < 0 for count in counts):
         raise NativePlanningError("collision_cooking_failed")
     if any(face < 0 or face >= len(counts) for face in hole_faces):
         raise NativePlanningError("collision_cooking_failed")
@@ -442,7 +440,11 @@ def _triangulate_faces(
     for face_index, count in enumerate(counts):
         face = indices[cursor : cursor + count]
         cursor += count
-        if face_index in hole_faces:
+        # USD permits authored degenerate faces and PhysX ignores them while
+        # cooking.  Mirror that effective collision topology instead of
+        # rejecting an otherwise valid mesh because one face has 0--2
+        # vertices.  A mesh with no valid triangle still fails below.
+        if face_index in hole_faces or count < 3:
             continue
         for offset in range(1, count - 1):
             triangle = (face[0], face[offset], face[offset + 1])
@@ -460,10 +462,7 @@ def _reflect_mesh_input(
         return mesh_input
     if reflection not in {(-1, 1, 1), (1, -1, 1), (1, 1, -1)}:
         raise NativePlanningError("collision_geometry_unsupported")
-    vertices = tuple(
-        tuple(vertex[axis] * reflection[axis] for axis in range(3))
-        for vertex in mesh_input.vertices
-    )
+    vertices = tuple(tuple(vertex[axis] * reflection[axis] for axis in range(3)) for vertex in mesh_input.vertices)
     return _MeshInput(
         vertices,  # type: ignore[arg-type]
         mesh_input.face_counts,
@@ -486,10 +485,7 @@ def _bake_mesh_linear_transform(
     linear: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
 ) -> _MeshInput:
     vertices = tuple(
-        tuple(
-            sum(vertex[axis] * linear[axis][component] for axis in range(3))
-            for component in range(3)
-        )
+        tuple(sum(vertex[axis] * linear[axis][component] for axis in range(3)) for component in range(3))
         for vertex in mesh_input.vertices
     )
     if any(not math.isfinite(component) for vertex in vertices for component in vertex):
@@ -565,10 +561,7 @@ def _matrix_pose_scale_reflection(
         for left, right in ((0, 1), (0, 2), (1, 2))
     ):
         raise NativePlanningError("collision_geometry_unsupported")
-    normalized_basis = tuple(
-        tuple(component / scale[axis] for component in basis[axis])
-        for axis in range(3)
-    )
+    normalized_basis = tuple(tuple(component / scale[axis] for component in basis[axis]) for axis in range(3))
     determinant = (
         normalized_basis[0][0]
         * (normalized_basis[1][1] * normalized_basis[2][2] - normalized_basis[1][2] * normalized_basis[2][1])
@@ -776,14 +769,10 @@ class _PlanningAdmission:
             )
         else:
             effective_pairs = frozenset(
-                (left, right)
-                for left_index, left in enumerate(owner_paths)
-                for right in owner_paths[left_index + 1 :]
+                (left, right) for left_index, left in enumerate(owner_paths) for right in owner_paths[left_index + 1 :]
             )
         collider_count_by_owner = {path: collision_owner_paths.count(path) for path in owner_paths}
-        self_filtered_bodies = frozenset(
-            path for path, count in collider_count_by_owner.items() if count > 1
-        )
+        self_filtered_bodies = frozenset(path for path, count in collider_count_by_owner.items() if count > 1)
         encoding, next_bit, _classes = _exact_filtered_pair_encoding(
             owner_paths,
             effective_pairs,
@@ -794,8 +783,7 @@ class _PlanningAdmission:
 
         named_pairs = tuple(
             sorted(
-                tuple(sorted((body_name_by_path[left], body_name_by_path[right])))
-                for left, right in effective_pairs
+                tuple(sorted((body_name_by_path[left], body_name_by_path[right]))) for left, right in effective_pairs
             )
         )
         self_owner_names = tuple(sorted(body_name_by_path[path] for path in self_filtered_bodies))
@@ -1053,13 +1041,11 @@ class _PlanningAdmission:
                 filter_pair_count,
                 filter_self_owner_count,
                 enabled_self_collisions,
-            ) = (
-                self._articulation_collision_filter_projection(
-                    root,
-                    bodies,
-                    body_name_by_path,
-                    tuple(owner_path for _prim, owner_path in collision_models),
-                )
+            ) = self._articulation_collision_filter_projection(
+                root,
+                bodies,
+                body_name_by_path,
+                tuple(owner_path for _prim, owner_path in collision_models),
             )
         else:
             filter_encoding = {}
@@ -1741,8 +1727,7 @@ class _PlanningAdmission:
         unexpected = {
             schema
             for schema in applied
-            if ("Collision" in schema or "FilteredPairs" in schema)
-            and schema not in _SUPPORTED_COLLISION_SCHEMAS
+            if ("Collision" in schema or "FilteredPairs" in schema) and schema not in _SUPPORTED_COLLISION_SCHEMAS
         }
         if unexpected:
             raise NativePlanningError("collision_geometry_unsupported")
@@ -1786,8 +1771,7 @@ class _PlanningAdmission:
         if resets:
             raise NativePlanningError("collision_geometry_unsupported")
         mesh_capable = not any(
-            prim.IsA(schema)
-            for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
+            prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
         )
         local_pose, scale, reflection, baked_linear = _collision_pose_scale_bake(
             self._m,
@@ -2310,8 +2294,7 @@ class _PlanningAdmission:
         if resets:
             raise NativePlanningError("collision_geometry_unsupported")
         mesh_capable = not any(
-            prim.IsA(schema)
-            for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
+            prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
         )
         local_pose, scale, reflection, baked_linear = _collision_pose_scale_bake(
             self._m,

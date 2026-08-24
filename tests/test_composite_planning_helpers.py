@@ -91,6 +91,19 @@ def test_triangle_mesh_canonicalization_preserves_winding_and_holes() -> None:
     ) == ((0, 3, 4),)
 
 
+def test_triangle_mesh_canonicalization_skips_degenerate_faces_like_physx() -> None:
+    assert _triangulate_faces(
+        (0, 3, 2, 4, 0),
+        (0, 1, 2, 3, 4, 0, 2, 3, 4),
+        vertex_count=5,
+        orientation="rightHanded",
+    ) == (
+        (0, 1, 2),
+        (0, 2, 3),
+        (0, 3, 4),
+    )
+
+
 @pytest.mark.parametrize(
     ("counts", "indices", "vertex_count", "orientation"),
     (

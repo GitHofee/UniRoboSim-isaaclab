@@ -28,8 +28,10 @@ class IsaacLabAdapterConfig:
     max_render_hz: float | None = None
     fluid_render_mode: str = "particles"
     experience: str | None = None
-    position_stiffness: float = 1000.0
-    position_damping: float = 100.0
+    # ``None`` delegates position-drive gains to the authored asset.  Numeric
+    # values retain the legacy adapter-wide override for callers that need it.
+    position_stiffness: float | None = None
+    position_damping: float | None = None
     velocity_damping: float = 100.0
     max_cached_scene_commands: int = 4096
 
@@ -80,13 +82,14 @@ class IsaacLabAdapterConfig:
             )
         if self.render and self.headless and not self.enable_cameras:
             raise ValidationError("headless rendering requires enable_cameras", operation="isaaclab.config.validate")
-        gains = {
+        optional_gains = {
             "position_stiffness": self.position_stiffness,
             "position_damping": self.position_damping,
-            "velocity_damping": self.velocity_damping,
         }
         normalized: dict[str, float] = {}
-        for name, value in gains.items():
+        for name, value in optional_gains.items():
+            if value is None:
+                continue
             if isinstance(value, bool):
                 raise ValidationError(f"{name} must be numeric", operation="isaaclab.config.validate")
             try:
@@ -98,6 +101,19 @@ class IsaacLabAdapterConfig:
             if not math.isfinite(gain) or gain < 0.0:
                 raise ValidationError(f"{name} must be non-negative and finite", operation="isaaclab.config.validate")
             normalized[name] = gain
+        if isinstance(self.velocity_damping, bool):
+            raise ValidationError("velocity_damping must be numeric", operation="isaaclab.config.validate")
+        try:
+            velocity_damping = float(self.velocity_damping)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "velocity_damping must be numeric", operation="isaaclab.config.validate", cause=exc
+            ) from exc
+        if not math.isfinite(velocity_damping) or velocity_damping < 0.0:
+            raise ValidationError(
+                "velocity_damping must be non-negative and finite", operation="isaaclab.config.validate"
+            )
+        normalized["velocity_damping"] = velocity_damping
         object.__setattr__(self, "environment_spacing_m", spacing)
         if self.max_render_hz is not None:
             if isinstance(self.max_render_hz, bool):

@@ -313,7 +313,7 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/1"
     assert fingerprint["worker_protocol"] == 1
     assert fingerprint["adapter"] == {
-        "version": "0.10.0",
+        "version": "0.10.1",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
     }
     core = cast(dict[str, object], fingerprint["core"])

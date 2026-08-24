@@ -86,6 +86,26 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(
+            CapabilityId("scene.composite.unbound-rigid-mode@1"),
+            FrozenMap(
+                {
+                    "metadata_key": "composite_unbound_rigid_mode",
+                    "modes": ["authored", "kinematic"],
+                    "default": "authored",
+                    "authoring": "current-stage-override-before-first-reset",
+                    "unbound_definition": "rigid-body-not-owned-by-fastsim-embedded-binding",
+                    "embedded_link_protection": "exact-link-or-nearest-rigid-ancestor-within-composite",
+                    "private_joint_bodies": "kinematic",
+                    "embedded_joint_protection": "exact-relative-prim-path",
+                    "private_joint_prims": "disabled-in-current-stage-before-first-reset",
+                    "joint_prims": "schemas-preserved",
+                    "write_order": "disable-private-joints-then-kinematic-unbound-bodies",
+                    "collision": "preserved",
+                    "multi_environment": "identical-relative-selection-required",
+                }
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("entity.embedded-binding@1"),
             FrozenMap(
                 {

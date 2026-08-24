@@ -47,6 +47,36 @@ Vector3 = tuple[float, float, float]
 Segment = tuple[Vector3, Vector3]
 Color = tuple[float, float, float, float]
 
+_COMPOSITE_UNBOUND_RIGID_MODE_KEY = "composite_unbound_rigid_mode"
+_COMPOSITE_UNBOUND_RIGID_MODES = frozenset({"authored", "kinematic"})
+_POSITION_STIFFNESS_FALLBACK = 1000.0
+_POSITION_DAMPING_FALLBACK = 100.0
+
+
+def _position_command_gains(
+    stiffness: Any,
+    damping: Any,
+    *,
+    fallback_authored_zero: bool,
+    fallback_authored_damping: bool,
+) -> tuple[Any, Any]:
+    """Resolve cached per-joint gains for an explicit position command.
+
+    Authored zero stiffness usually denotes a passive or velocity-driven joint.
+    It is preserved during initialization/reset, but a caller explicitly issuing
+    a position command needs a usable drive.  Legacy numeric configuration is an
+    intentional global override and therefore never receives this fallback.
+    """
+
+    if not fallback_authored_zero:
+        return stiffness, damping
+    zero_stiffness = stiffness <= 0.0
+    stiffness = stiffness.masked_fill(zero_stiffness, _POSITION_STIFFNESS_FALLBACK)
+    if fallback_authored_damping:
+        damping = damping.masked_fill(zero_stiffness, _POSITION_DAMPING_FALLBACK)
+    return stiffness, damping
+
+
 _GLYPHS = {
     "0": "01110/10001/10011/10101/11001/10001/01110",
     "1": "00100/01100/00100/00100/00100/00100/01110",
@@ -322,6 +352,18 @@ def _is_kinematic_rigid(prim: Any, usd_physics: Any) -> bool:
     """Read the authored rigid-body motion mode without importing USD at module load time."""
 
     return bool(usd_physics.RigidBodyAPI(prim).GetKinematicEnabledAttr().Get())
+
+
+def _composite_unbound_rigid_mode(entity: EntitySpec) -> str:
+    """Return the exact opt-in policy for otherwise unbound composite rigid bodies."""
+
+    mode = entity.metadata.get(_COMPOSITE_UNBOUND_RIGID_MODE_KEY, "authored")
+    if type(mode) is not str or mode not in _COMPOSITE_UNBOUND_RIGID_MODES:
+        raise ValueError(
+            f"composite scene {entity.path.value} metadata {_COMPOSITE_UNBOUND_RIGID_MODE_KEY!r} "
+            "must be exactly 'authored' or 'kinematic'"
+        )
+    return mode
 
 
 def _write_usd_rigid_state(
@@ -805,6 +847,7 @@ class IsaacLabNativeWorld:
         self._usd_articulations: dict[EntityPath, tuple[_UsdArticulation, ...]] = {}
         self._usd_articulation_views: dict[EntityPath, Any] = {}
         self._initial_usd_articulation: dict[EntityPath, tuple[Any, Any, Any, Any]] = {}
+        self._initial_usd_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
         self._rigids: dict[EntityPath, Any] = {}
         self._usd_rigids: dict[EntityPath, tuple[_UsdRigid, ...]] = {}
         self._usd_rigid_views: dict[EntityPath, Any] = {}
@@ -829,6 +872,7 @@ class IsaacLabNativeWorld:
         self._step_index = 0
         self._joint_maps: dict[EntityPath, tuple[int, ...]] = {}
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
+        self._initial_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
         self._initial_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._initial_deformable: dict[EntityPath, tuple[Any, Any | None]] = {}
         self._origins_cpu = _environment_origins(spec.environments.count, config.environment_spacing_m)
@@ -1198,6 +1242,7 @@ class IsaacLabNativeWorld:
         """Compose one mixed-physics USD container per environment exactly once."""
 
         assert entity.asset_uri is not None
+        unbound_rigid_mode = _composite_unbound_rigid_mode(entity)
         name = _native_name(entity.path)
         roots: list[str] = []
         for index in range(self._spec.environments.count):
@@ -1210,7 +1255,136 @@ class IsaacLabNativeWorld:
                 orientation=entity.pose.orientation_xyzw,
             )
             roots.append(root)
+        if unbound_rigid_mode == "kinematic":
+            self._author_unbound_composite_rigids_kinematic(entity, tuple(roots))
         self._composite_scene_roots[entity.path] = tuple(roots)
+
+    def _author_unbound_composite_rigids_kinematic(
+        self,
+        entity: EntitySpec,
+        roots: tuple[str, ...],
+    ) -> None:
+        """Disable private joints and freeze bodies not owned by embedded FastSim entities."""
+
+        declared_embedded_body_paths = {
+            prim.relative_prim_path
+            for candidate in self._spec.entities
+            if candidate.embedded_binding is not None and candidate.embedded_binding.container_path == entity.path
+            for prim in candidate.embedded_binding.link_prims
+        }
+        declared_embedded_joint_paths = {
+            prim.relative_prim_path
+            for candidate in self._spec.entities
+            if candidate.embedded_binding is not None and candidate.embedded_binding.container_path == entity.path
+            for prim in candidate.embedded_binding.joint_prims
+        }
+        selected_rows: list[dict[str, Any]] = []
+        protected_rows: list[tuple[str, ...]] = []
+        disabled_joint_rows: list[dict[str, Any]] = []
+        for root in roots:
+            physical_prims = self._m.sim_utils.get_all_matching_child_prims(
+                root,
+                lambda prim: prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI) or prim.IsA(self._m.UsdPhysics.Joint),
+            )
+            rigid_by_relative_path: dict[str, Any] = {}
+            joint_by_relative_path: dict[str, Any] = {}
+            for prim in physical_prims:
+                absolute = self._prim_path_string(prim)
+                relative = absolute.removeprefix(f"{root}/")
+                if not relative or relative == absolute:
+                    raise ValueError("composite physical Prim paths are ambiguous below their container")
+                if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
+                    if relative in rigid_by_relative_path:
+                        raise ValueError("composite rigid-body paths are ambiguous below their container")
+                    rigid_by_relative_path[relative] = prim
+                if prim.IsA(self._m.UsdPhysics.Joint):
+                    if relative in joint_by_relative_path:
+                        raise ValueError("composite joint paths are ambiguous below their container")
+                    joint_by_relative_path[relative] = prim
+
+            rigid_body_paths = {self._prim_path_string(prim) for prim in rigid_by_relative_path.values()}
+            protected_body_paths: set[str] = set()
+            for relative in declared_embedded_body_paths:
+                declared_path = f"{root}/{relative}"
+                owner_path = _nearest_body_path(declared_path, rigid_body_paths, root)
+                if owner_path is None:
+                    raise ValueError(
+                        "embedded link did not resolve to a rigid-body carrier while applying composite "
+                        f"unbound-rigid mode: {declared_path}"
+                    )
+                protected_body_paths.add(owner_path)
+            protected_rows.append(tuple(sorted(path.removeprefix(f"{root}/") for path in protected_body_paths)))
+            missing_embedded_joints = declared_embedded_joint_paths - joint_by_relative_path.keys()
+            if missing_embedded_joints:
+                raise ValueError(
+                    "embedded joint paths did not resolve while applying composite unbound-rigid mode: "
+                    f"{tuple(sorted(missing_embedded_joints))[:8]}"
+                )
+            disabled_joint_rows.append(
+                {
+                    relative: prim
+                    for relative, prim in joint_by_relative_path.items()
+                    if relative not in declared_embedded_joint_paths
+                }
+            )
+
+            selected_rows.append(
+                {
+                    relative: prim
+                    for relative, prim in rigid_by_relative_path.items()
+                    if self._prim_path_string(prim) not in protected_body_paths
+                }
+            )
+
+        expected_protected_paths = protected_rows[0] if protected_rows else ()
+        for environment, actual_protected_paths in enumerate(protected_rows[1:], start=1):
+            if actual_protected_paths != expected_protected_paths:
+                raise ValueError(
+                    "composite embedded rigid-body protection changed across environments; "
+                    f"first={expected_protected_paths[:8]}, environment_{environment}="
+                    f"{actual_protected_paths[:8]}"
+                )
+        expected_relative_paths = tuple(sorted(selected_rows[0])) if selected_rows else ()
+        for environment, row in enumerate(selected_rows[1:], start=1):
+            actual_relative_paths = tuple(sorted(row))
+            if actual_relative_paths != expected_relative_paths:
+                raise ValueError(
+                    "composite unbound rigid-body selection changed across environments; "
+                    f"first_count={len(expected_relative_paths)}, environment_{environment}_count="
+                    f"{len(actual_relative_paths)}, first_sample={expected_relative_paths[:8]}, "
+                    f"environment_{environment}_sample={actual_relative_paths[:8]}"
+                )
+        expected_disabled_joint_paths = tuple(sorted(disabled_joint_rows[0])) if disabled_joint_rows else ()
+        for environment, row in enumerate(disabled_joint_rows[1:], start=1):
+            actual_disabled_joint_paths = tuple(sorted(row))
+            if actual_disabled_joint_paths != expected_disabled_joint_paths:
+                raise ValueError(
+                    "composite private-joint selection changed across environments; "
+                    f"first_count={len(expected_disabled_joint_paths)}, environment_{environment}_count="
+                    f"{len(actual_disabled_joint_paths)}, first_sample={expected_disabled_joint_paths[:8]}, "
+                    f"environment_{environment}_sample={actual_disabled_joint_paths[:8]}"
+                )
+
+        for row in disabled_joint_rows:
+            for relative in expected_disabled_joint_paths:
+                prim = row[relative]
+                joint = self._m.UsdPhysics.Joint(prim)
+                result = joint.CreateJointEnabledAttr().Set(False)
+                if result is False or bool(joint.GetJointEnabledAttr().Get()):
+                    raise RuntimeError(
+                        "failed to author jointEnabled=false on a private composite joint: "
+                        f"{self._prim_path_string(prim)}"
+                    )
+        for row in selected_rows:
+            for relative in expected_relative_paths:
+                prim = row[relative]
+                rigid = self._m.UsdPhysics.RigidBodyAPI(prim)
+                result = rigid.CreateKinematicEnabledAttr().Set(True)
+                if result is False or not bool(rigid.GetKinematicEnabledAttr().Get()):
+                    raise RuntimeError(
+                        "failed to author kinematicEnabled on an unbound composite rigid body: "
+                        f"{self._prim_path_string(prim)}"
+                    )
 
     @staticmethod
     def _prim_path_string(prim: Any) -> str:
@@ -1645,6 +1819,10 @@ class IsaacLabNativeWorld:
                 positions[:, native_index] = entity.initial_joint_positions[public_index]
             velocities = torch.zeros_like(positions)
             self._initial_articulation[path] = (root_pose, positions, velocities)
+            self._initial_articulation_gains[path] = (
+                asset.data.joint_stiffness.torch.clone(),
+                asset.data.joint_damping.torch.clone(),
+            )
 
     def _usd_simulation_view(self) -> Any:
         if self._usd_tensor_view is None:
@@ -1681,7 +1859,27 @@ class IsaacLabNativeWorld:
             for public_index, native_index in enumerate(joint_map):
                 positions[:, native_index] = entity.initial_joint_positions[public_index]
             velocities = self._m.torch.zeros_like(positions)
+            stiffness = view.get_dof_stiffnesses().clone()
+            damping = view.get_dof_dampings().clone()
+            if self._config.position_stiffness is not None:
+                stiffness[:, list(joint_map)] = self._config.position_stiffness
+            if self._config.position_damping is not None:
+                damping[:, list(joint_map)] = self._config.position_damping
+            if self._config.position_stiffness is not None or self._config.position_damping is not None:
+                stiffness_indices = self._m.torch.arange(
+                    view.count,
+                    device=stiffness.device,
+                    dtype=self._m.torch.int64,
+                )
+                damping_indices = self._m.torch.arange(
+                    view.count,
+                    device=damping.device,
+                    dtype=self._m.torch.int64,
+                )
+                view.set_dof_stiffnesses(stiffness[stiffness_indices], stiffness_indices)
+                view.set_dof_dampings(damping[damping_indices], damping_indices)
             self._initial_usd_articulation[path] = (root_pose, root_velocity, positions, velocities)
+            self._initial_usd_articulation_gains[path] = (stiffness, damping)
             self._usd_articulation_views[path] = view
 
     def _initialize_usd_rigids(self) -> None:
@@ -1939,6 +2137,9 @@ class IsaacLabNativeWorld:
             asset.set_joint_velocity_target_index(target=velocities[env_ids], env_ids=env_ids)
             asset.set_joint_effort_target_index(target=self._m.torch.zeros_like(positions[env_ids]), env_ids=env_ids)
             asset.reset(env_ids=env_ids)
+            stiffness, damping = self._initial_articulation_gains[path]
+            asset.write_joint_stiffness_to_sim_index(stiffness=stiffness[env_ids], env_ids=env_ids)
+            asset.write_joint_damping_to_sim_index(damping=damping[env_ids], env_ids=env_ids)
         for path, view in self._usd_articulation_views.items():
             root_pose, root_velocity, positions, velocities = self._initial_usd_articulation[path]
             indices = self._m.torch.tensor(
@@ -1954,12 +2155,7 @@ class IsaacLabNativeWorld:
             view.set_dof_position_targets(positions[indices], indices)
             view.set_dof_velocity_targets(zeros, indices)
             view.set_dof_actuation_forces(zeros, indices)
-            stiffness = view.get_dof_stiffnesses().clone()
-            damping = view.get_dof_dampings().clone()
-            joint_ids = self._joint_maps[path]
-            for environment in environment_indices:
-                stiffness[environment, list(joint_ids)] = self._config.position_stiffness
-                damping[environment, list(joint_ids)] = self._config.position_damping
+            stiffness, damping = self._initial_usd_articulation_gains[path]
             stiffness_indices = self._m.torch.tensor(
                 environment_indices,
                 device=stiffness.device,
@@ -2041,26 +2237,29 @@ class IsaacLabNativeWorld:
         target = self._m.torch.tensor(targets, device=self._sim.device, dtype=self._m.torch.float32)
         zeros = self._m.torch.zeros_like(target)
         if mode is CommandMode.POSITION:
-            stiffness = self._config.position_stiffness
-            damping = self._config.position_damping
+            initial_stiffness, initial_damping = self._initial_articulation_gains[path]
+            stiffness = initial_stiffness[env_ids][:, joint_ids]
+            damping = initial_damping[env_ids][:, joint_ids]
+            stiffness, damping = _position_command_gains(
+                stiffness,
+                damping,
+                fallback_authored_zero=self._config.position_stiffness is None,
+                fallback_authored_damping=self._config.position_damping is None,
+            )
             asset.set_joint_position_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
             asset.set_joint_velocity_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
             asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
         elif mode is CommandMode.VELOCITY:
-            stiffness = 0.0
-            damping = self._config.velocity_damping
+            stiffness = zeros
+            damping = self._m.torch.full_like(target, self._config.velocity_damping)
             asset.set_joint_velocity_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
             asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
         else:
-            stiffness = 0.0
-            damping = 0.0
+            stiffness = zeros
+            damping = zeros
             asset.set_joint_effort_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
-        asset.write_joint_stiffness_to_sim_index(
-            stiffness=self._m.torch.full_like(target, stiffness), joint_ids=joint_ids, env_ids=env_ids
-        )
-        asset.write_joint_damping_to_sim_index(
-            damping=self._m.torch.full_like(target, damping), joint_ids=joint_ids, env_ids=env_ids
-        )
+        asset.write_joint_stiffness_to_sim_index(stiffness=stiffness, joint_ids=joint_ids, env_ids=env_ids)
+        asset.write_joint_damping_to_sim_index(damping=damping, joint_ids=joint_ids, env_ids=env_ids)
         asset.write_data_to_sim()
 
     def _validate_articulation_command(self, command: NativeArticulationCommand) -> None:
@@ -2118,15 +2317,28 @@ class IsaacLabNativeWorld:
         efforts = view.get_dof_actuation_forces().clone()
         stiffness = view.get_dof_stiffnesses().clone()
         damping = view.get_dof_dampings().clone()
+        position_stiffness = None
+        position_damping = None
+        if mode is CommandMode.POSITION:
+            initial_stiffness, initial_damping = self._initial_usd_articulation_gains[path]
+            position_stiffness = initial_stiffness[list(environment_indices)][:, list(joint_ids)]
+            position_damping = initial_damping[list(environment_indices)][:, list(joint_ids)]
+            position_stiffness, position_damping = _position_command_gains(
+                position_stiffness,
+                position_damping,
+                fallback_authored_zero=self._config.position_stiffness is None,
+                fallback_authored_damping=self._config.position_damping is None,
+            )
         for row_index, environment in enumerate(environment_indices):
             for column_index, joint in enumerate(joint_ids):
                 target = float(targets[row_index][column_index])
                 if mode is CommandMode.POSITION:
+                    assert position_stiffness is not None and position_damping is not None
                     positions[environment, joint] = target
                     velocities[environment, joint] = 0.0
                     efforts[environment, joint] = 0.0
-                    stiffness[environment, joint] = self._config.position_stiffness
-                    damping[environment, joint] = self._config.position_damping
+                    stiffness[environment, joint] = position_stiffness[row_index, column_index]
+                    damping[environment, joint] = position_damping[row_index, column_index]
                 elif mode is CommandMode.VELOCITY:
                     velocities[environment, joint] = target
                     efforts[environment, joint] = 0.0
@@ -2546,6 +2758,7 @@ class IsaacLabNativeWorld:
         self._usd_articulations.clear()
         self._usd_articulation_views.clear()
         self._initial_usd_articulation.clear()
+        self._initial_usd_articulation_gains.clear()
         self._rigids.clear()
         self._usd_rigids.clear()
         self._usd_rigid_views.clear()
@@ -2572,6 +2785,7 @@ class IsaacLabNativeWorld:
             self._m.debug_draw.release_debug_draw_interface(self._debug_draw_interface)
             self._debug_draw_interface = None
         self._initial_articulation.clear()
+        self._initial_articulation_gains.clear()
         self._initial_rigid.clear()
         self._initial_deformable.clear()
         try:

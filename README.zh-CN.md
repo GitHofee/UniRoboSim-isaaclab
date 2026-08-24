@@ -165,11 +165,11 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.10.0 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
+Adapter 0.10.1 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
 
-如果 World 同时要求 `planning.scene@2`，当前版本会在创建原生资源前拒绝
-`STATIC_SCENE` 和 `COMPOSITE_SCENE`。该 fail-closed 门禁用于防止规划器静默收到
-缺失房间碰撞体的世界几何。
+静态和复合 USD 场景会提供不可变 planning resource 与实时 world transform。
+少于三个顶点的退化 face 会被跳过；非法索引、不一致的方向数据，以及没有任何
+有效三角面的 mesh 会 fail closed，不会向规划器返回不完整几何。
 
 ## 验证
 

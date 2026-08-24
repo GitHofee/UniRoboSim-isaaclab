@@ -32,6 +32,8 @@ def test_easy_launch_profile_absent_preserves_batch_default(monkeypatch: pytest.
     assert config.render is True
     assert config.render_on_step is False
     assert config.max_render_hz is None
+    assert config.position_stiffness is None
+    assert config.position_damping is None
 
 
 @pytest.mark.parametrize(

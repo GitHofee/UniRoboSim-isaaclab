@@ -33,7 +33,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.0"
+    assert unirobosim_isaaclab.__version__ == "0.10.1"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -97,6 +97,12 @@ def test_valid_config(device: str) -> None:
     assert config.environment_spacing_m == 2.0
     assert config.position_stiffness == 2.0
     assert config.anti_aliasing == "fxaa"
+
+
+def test_default_position_gains_preserve_authored_asset_values() -> None:
+    config = IsaacLabAdapterConfig()
+    assert config.position_stiffness is None
+    assert config.position_damping is None
 
 
 @pytest.mark.parametrize("device", ["", "gpu", "cuda:-1", "CUDA:0", 7])
