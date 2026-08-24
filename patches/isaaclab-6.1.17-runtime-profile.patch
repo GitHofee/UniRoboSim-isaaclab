@@ -1,0 +1,116 @@
+diff --git a/source/isaaclab/isaaclab/cli/commands/install.py b/source/isaaclab/isaaclab/cli/commands/install.py
+index 3c459d2..3ad7ae2 100644
+--- a/source/isaaclab/isaaclab/cli/commands/install.py
++++ b/source/isaaclab/isaaclab/cli/commands/install.py
+@@ -262,8 +262,15 @@ def _ensure_pink_ik_dependencies_installed(python_exe: str, pip_cmd: list[str],
+         )
+ 
+ 
++_TORCH_STACK_VERSIONS = {
++    "torch": "2.11.0",
++    "torchvision": "0.26.0",
++    "torchaudio": "2.11.0",
++}
++
++
+ def _ensure_cuda_torch() -> None:
+-    """Ensure correct PyTorch and CUDA versions are installed."""
++    """Ensure the pinned PyTorch stack and matching CUDA build are installed."""
+     python_exe = extract_python_exe()
+     pip_cmd = get_pip_command(python_exe)
+     using_uv = pip_cmd[0] == "uv"
+@@ -271,10 +278,6 @@ def _ensure_cuda_torch() -> None:
+     # Base index for torch.
+     base_index = "https://download.pytorch.org/whl"
+ 
+-    # Choose pins per arch.
+-    torch_ver = "2.10.0"
+-    tv_ver = "0.25.0"
+-
+     if is_arm():
+         cuda_ver = "130"
+     else:
+@@ -283,41 +286,44 @@ def _ensure_cuda_torch() -> None:
+     cuda_tag = f"cu{cuda_ver}"
+     index_url = f"{base_index}/{cuda_tag}"
+ 
+-    want_torch = f"{torch_ver}+{cuda_tag}"
++    wanted_versions = {package: f"{version}+{cuda_tag}" for package, version in _TORCH_STACK_VERSIONS.items()}
+ 
+-    # Check current torch version using pip show (includes build tags).
+-    current_ver = ""
++    # Check all stack versions using pip show (includes build tags).
++    current_versions: dict[str, str] = {}
+     try:
+         result = run_command(
+-            pip_cmd + ["show", "torch"],
++            pip_cmd + ["show", *_TORCH_STACK_VERSIONS],
+             capture_output=True,
+             text=True,
+             check=False,
+         )
+-        if result.returncode == 0:
+-            for line in result.stdout.split("\n"):
+-                if line.startswith("Version: "):
+-                    current_ver = line.split("Version: ", 1)[1].strip()
+-                    break
++        current_package = ""
++        for line in result.stdout.splitlines():
++            if line.startswith("Name: "):
++                current_package = line.split("Name: ", 1)[1].strip().lower()
++            elif current_package in _TORCH_STACK_VERSIONS and line.startswith("Version: "):
++                current_versions[current_package] = line.split("Version: ", 1)[1].strip()
+     except Exception:
+         pass
+ 
+-    # Skip install if version already matches (including CUDA build tag).
+-    if current_ver == want_torch:
+-        print_info(f"PyTorch {want_torch} already installed.")
++    # Skip install only if every package matches, including its CUDA build tag.
++    if current_versions == wanted_versions:
++        stack_description = ", ".join(f"{package}=={version}" for package, version in wanted_versions.items())
++        print_info(f"PyTorch stack already installed ({stack_description}).")
+         return
+ 
+-    # Clean install torch.
+-    print_info(f"Installing torch=={torch_ver} and torchvision=={tv_ver} ({cuda_tag}) from {index_url}...")
++    # Clean install the complete, mutually compatible stack.
++    stack_requirements = [f"{package}=={version}" for package, version in _TORCH_STACK_VERSIONS.items()]
++    print_info(f"Installing {', '.join(stack_requirements)} ({cuda_tag}) from {index_url}...")
+ 
+     # uv pip uninstall does not accept -y
+     uninstall_flags = ["-y"] if not using_uv else []
+     run_command(
+-        pip_cmd + ["uninstall"] + uninstall_flags + ["torch", "torchvision", "torchaudio"],
++        pip_cmd + ["uninstall"] + uninstall_flags + list(_TORCH_STACK_VERSIONS),
+         check=False,
+     )
+ 
+-    run_command(pip_cmd + ["install", "--index-url", index_url, f"torch=={torch_ver}", f"torchvision=={tv_ver}"])
++    run_command(pip_cmd + ["install", "--index-url", index_url, *stack_requirements])
+ 
+ 
+ # Isaac Sim install settings.
+diff --git a/source/isaaclab/setup.py b/source/isaaclab/setup.py
+index 2bbf207..8469d22 100644
+--- a/source/isaaclab/setup.py
++++ b/source/isaaclab/setup.py
+@@ -19,7 +19,9 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
+ INSTALL_REQUIRES = [
+     # generic
+     "numpy>=2",
+-    "torch>=2.10",
++    "torch==2.11.0",
++    "torchaudio==2.11.0",
++    "torchvision==0.26.0",
+     "onnx>=1.18.0",  # 1.16.2 throws access violation on Windows
+     "prettytable==3.3.0",
+     "toml",
+@@ -48,7 +50,6 @@ INSTALL_REQUIRES = [
+     "pytest",
+     "pytest-mock",
+     "junitparser",
+-    "coverage==7.6.1",
+     "debugpy>=1.8.20",
+     "flatdict>=4.1.0",
+     "flaky",

@@ -78,7 +78,14 @@ def test_source_distribution_manifest_includes_complete_test_support() -> None:
     project_root = Path(__file__).resolve().parents[1]
     manifest = (project_root / "MANIFEST.in").read_text(encoding="utf-8")
     assert "include build_backend.py" in manifest
+    assert "recursive-include patches *.patch" in manifest
     assert "recursive-include tests *.py" in manifest
+    profile_patch = project_root / "patches" / "isaaclab-6.1.17-runtime-profile.patch"
+    patch_text = profile_patch.read_text(encoding="utf-8")
+    assert '"torch==2.11.0"' in patch_text
+    assert '"torchaudio==2.11.0"' in patch_text
+    assert '"torchvision==0.26.0"' in patch_text
+    assert '-    "coverage==7.6.1"' in patch_text
     assert (project_root / "tests" / "__init__.py").is_file()
     assert (project_root / "tests" / "helpers.py").is_file()
 

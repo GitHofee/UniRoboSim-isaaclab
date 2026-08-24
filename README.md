@@ -20,14 +20,31 @@
 
 ## Installation
 
-Install the required NVIDIA Isaac Sim/Isaac Lab stack in a dedicated Python 3.12 Conda environment first. The runtime must provide `torch==2.11.0`, `torchvision==0.26.0`, and `torchaudio==2.11.0`. CUDA wheels with matching public versions and local tags such as `+cu128` are accepted. The adapter intentionally keeps these large optional-backend packages out of its wheel metadata, so install them as part of the NVIDIA stack. Confirm that `import isaaclab` and `import isaacsim` work in that environment, then install Core, the adapter, and the optional USD converter:
+Install the NVIDIA runtime in a dedicated Python 3.12 Conda environment. The upstream
+Isaac Lab 6.1.17 source incorrectly declares the test-only `coverage==7.6.1` as a
+runtime dependency, while Isaac Sim Kernel 6.0.1.0 requires `coverage==7.4.4`. This
+repository provides a small, reviewable patch against the exact tested upstream commit.
+It removes the Isaac Lab runtime pin and aligns its installer with the complete Torch
+2.11 profile.
 
 ```bash
 conda create -n unirobosim-isaaclab3 python=3.12 pip -y
 conda activate unirobosim-isaaclab3
 
-git clone https://github.com/GitHofee/UniRoboSim.git
 git clone https://github.com/GitHofee/UniRoboSim-isaaclab.git
+git clone https://github.com/isaac-sim/IsaacLab.git
+git -C IsaacLab checkout 2e44ddb2e19536579140496023b5ccb060bc4152
+git -C IsaacLab apply ../UniRoboSim-isaaclab/patches/isaaclab-6.1.17-runtime-profile.patch
+
+python -m pip install \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install "isaacsim[all,extscache]==6.0.1.0" \
+  --extra-index-url https://pypi.nvidia.com
+python -m pip install -e ./IsaacLab/source/isaaclab
+python -m pip install -e ./IsaacLab/source/isaaclab_physx
+
+git clone https://github.com/GitHofee/UniRoboSim.git
 git clone https://github.com/GitHofee/UniRoboSim-usd-converter.git
 
 python -m pip install ./UniRoboSim
@@ -42,7 +59,12 @@ python -m pip check
 python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
 ```
 
-The probe reads distribution metadata for Isaac Lab, Isaac Lab PhysX, Isaac Sim, PyTorch, TorchVision, and TorchAudio. It fails closed when any required distribution is missing or its public version differs from the compatibility profile.
+The CUDA 12.8 command above is the tested Linux x86-64 profile. CUDA wheels with the
+same public versions and a compatible local tag are accepted. The adapter intentionally
+keeps the large NVIDIA and Torch packages out of its own wheel metadata. The probe reads
+distribution metadata for Isaac Lab, Isaac Lab PhysX, Isaac Sim, PyTorch, TorchVision,
+and TorchAudio, and fails closed on a missing or incompatible package. `pip check` must
+finish with `No broken requirements found`.
 
 ## EasyAPI
 

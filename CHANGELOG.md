@@ -2,6 +2,8 @@
 
 ## 0.9.3
 
+- Provide a reproducible Isaac Lab 6.1.17 source-profile patch that removes
+  the test-only Coverage runtime pin and keeps the complete Torch 2.11 stack.
 - Align the required PyTorch runtime profile and fail-closed preflight with
   `torch==2.11.0`, `torchvision==0.26.0`, and `torchaudio==2.11.0`.
 - Keep RGB conversion and layout normalization on the GPU, then transfer one

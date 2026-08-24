@@ -20,14 +20,30 @@
 
 ## 安装
 
-先在独立 Python 3.12 Conda 环境中安装要求的 NVIDIA Isaac Sim/Isaac Lab 运行栈。运行环境必须提供 `torch==2.11.0`、`torchvision==0.26.0` 和 `torchaudio==2.11.0`；公开版本相同、带 `+cu128` 等本地版本标签的 CUDA wheel 也可接受。Adapter 会有意将这些大型可选后端包排除在自己的 wheel 元数据之外，因此应当把它们作为 NVIDIA 运行栈的一部分安装。确认 `import isaaclab` 和 `import isaacsim` 成功后，再安装 Core、Adapter 和可选 USD 转换器：
+请在独立的 Python 3.12 Conda 环境中安装 NVIDIA 运行栈。上游 Isaac Lab
+6.1.17 错误地把测试工具 `coverage==7.6.1` 声明成运行时依赖，而 Isaac Sim
+Kernel 6.0.1.0 要求 `coverage==7.4.4`。本仓库提供了一个针对已验证上游提交的
+小型可审查补丁：它会移除 Isaac Lab 的运行时 Coverage 约束，并把安装器统一到
+完整的 Torch 2.11 档位。
 
 ```bash
 conda create -n unirobosim-isaaclab3 python=3.12 pip -y
 conda activate unirobosim-isaaclab3
 
-git clone https://github.com/GitHofee/UniRoboSim.git
 git clone https://github.com/GitHofee/UniRoboSim-isaaclab.git
+git clone https://github.com/isaac-sim/IsaacLab.git
+git -C IsaacLab checkout 2e44ddb2e19536579140496023b5ccb060bc4152
+git -C IsaacLab apply ../UniRoboSim-isaaclab/patches/isaaclab-6.1.17-runtime-profile.patch
+
+python -m pip install \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install "isaacsim[all,extscache]==6.0.1.0" \
+  --extra-index-url https://pypi.nvidia.com
+python -m pip install -e ./IsaacLab/source/isaaclab
+python -m pip install -e ./IsaacLab/source/isaaclab_physx
+
+git clone https://github.com/GitHofee/UniRoboSim.git
 git clone https://github.com/GitHofee/UniRoboSim-usd-converter.git
 
 python -m pip install ./UniRoboSim
@@ -42,7 +58,11 @@ python -m pip check
 python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
 ```
 
-Probe 会读取 Isaac Lab、Isaac Lab PhysX、Isaac Sim、PyTorch、TorchVision 和 TorchAudio 的发行包元数据。任一必需发行包缺失，或公开版本与兼容档位不一致时，检查都会明确失败。
+上面的 CUDA 12.8 命令是已验证的 Linux x86-64 档位。公开版本相同且本地
+CUDA 标签兼容的 Wheel 也可接受。Adapter 会有意将大型 NVIDIA 和 Torch 包排除在
+自身 Wheel 元数据之外。Probe 会读取 Isaac Lab、Isaac Lab PhysX、Isaac Sim、
+PyTorch、TorchVision 和 TorchAudio 的发行包元数据，缺包或版本不兼容都会明确
+失败；`pip check` 必须输出 `No broken requirements found`。
 
 ## EasyAPI
 
