@@ -57,6 +57,10 @@ class FakeSimulation:
     def forward(self) -> None:
         self.forward_count += 1
 
+    @staticmethod
+    def get_physics_dt() -> float:
+        return 1.0 / 120.0
+
 
 class FakeRawRigidView:
     def __init__(self) -> None:
@@ -147,6 +151,19 @@ def test_kinematic_rigid_reset_and_pose_update_never_write_velocity(raw: bool) -
     native.calls.clear()
     world.set_rigid_body_pose(path, (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 0)
     assert native.calls == ["pose"]
+
+
+def test_native_physics_diagnostics_read_live_simulation_context_dt() -> None:
+    world = object.__new__(IsaacLabNativeWorld)
+    world._sim = FakeSimulation()
+    world._spec = SimpleNamespace(physics=SimpleNamespace(time_step_seconds=1.0 / 60.0, substeps=2))
+
+    diagnostics = world.physics_diagnostics()
+
+    assert diagnostics.native_step_dt_seconds == 1.0 / 120.0
+    assert diagnostics.substeps == 2
+    assert diagnostics.world_step_dt_seconds == 1.0 / 60.0
+    assert "SimulationContext.get_physics_dt" in diagnostics.source
 
 
 @pytest.mark.parametrize("raw", [False, True], ids=["high-level", "raw-usd"])

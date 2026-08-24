@@ -30,7 +30,7 @@ from unirobosim import (
 
 from unirobosim_isaaclab import worker as worker_module
 from unirobosim_isaaclab.config import IsaacLabAdapterConfig
-from unirobosim_isaaclab.native_protocols import NativePlanningError
+from unirobosim_isaaclab.native_protocols import NativePhysicsDiagnostics, NativePlanningError
 from unirobosim_isaaclab.worker import (
     IsaacLabWorkerPlanningWorld,
     IsaacLabWorkerRuntime,
@@ -359,6 +359,15 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     assert result is None and not stop and world is runtime.worlds[0]
     assert isinstance(world, FakeNativeWorld)
 
+    world, physics, stop = _dispatch(runtime, world, ("physics_diagnostics", ()))
+    assert not stop
+    assert physics == NativePhysicsDiagnostics(
+        1.0 / 60.0,
+        1,
+        1.0 / 60.0,
+        "fake native context",
+    )
+
     world, result, stop = _dispatch(runtime, world, ("reset", ((0, 1),)))
     assert result is None and not stop
     assert runtime.worlds[0].calls[-1] == ("reset", (0, 1))
@@ -494,6 +503,7 @@ def test_session_member_scan_finds_current_process() -> None:
 
 
 def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> None:
+    physics = NativePhysicsDiagnostics(0.01, 1, 0.01, "fake worker context")
     positions = ((0.2, -0.1), (0.2, -0.1))
     velocities = ((0.0, 0.0), (0.0, 0.0))
     points = (((0.0, 0.0, 1.0),), ((0.0, 0.0, 1.0),))
@@ -510,6 +520,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         [
             ("ok", None),
             ("ok", None),
+            ("ok", physics),
             ("ok", None),
             ("ok", None),
             ("ok", (positions, velocities)),
@@ -538,6 +549,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     with pytest.raises(NativeWorkerError, match="already owns"):
         runtime.build_world(spec)
 
+    assert world.physics_diagnostics() == physics
     world.reset((0, 1))
     world.apply_articulation(EntityPath("/robots/arm"), CommandMode.POSITION, ((0.1,),), (0,), (0,))
     assert world.read_articulation(EntityPath("/robots/arm")) == (positions, velocities)
@@ -578,6 +590,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
     operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
     assert operations == [
         "build_world",
+        "physics_diagnostics",
         "reset",
         "apply_articulation",
         "read_articulation",

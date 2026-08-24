@@ -25,6 +25,7 @@ from unirobosim_isaaclab.native_protocols import (
     Matrix,
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativePhysicsDiagnostics,
     NativeSensorSample,
     PointBatch,
 )
@@ -98,6 +99,14 @@ class FakeNativeWorld:
             for entity in spec.entities
             if entity.kind is EntityKind.RIGID_BODY
         }
+
+    def physics_diagnostics(self) -> NativePhysicsDiagnostics:
+        return NativePhysicsDiagnostics(
+            native_step_dt_seconds=self.spec.physics.time_step_seconds / self.spec.physics.substeps,
+            substeps=self.spec.physics.substeps,
+            world_step_dt_seconds=self.spec.physics.time_step_seconds,
+            source="fake native context",
+        )
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
         if self.reset_error is not None:

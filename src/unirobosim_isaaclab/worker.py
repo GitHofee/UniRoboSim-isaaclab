@@ -24,6 +24,7 @@ from .native_protocols import (
     Matrix,
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativePhysicsDiagnostics,
     NativePlanningCatalog,
     NativePlanningError,
     NativePlanningResource,
@@ -230,6 +231,8 @@ def _dispatch(
         return None, None, True
 
     active = _require_world(world, operation)
+    if operation == "physics_diagnostics":
+        return active, active.physics_diagnostics(), False
     if operation == "reset":
         active.reset(cast(tuple[int, ...], args[0]))
         return active, None, False
@@ -598,6 +601,13 @@ class IsaacLabWorkerWorld:
     def _ensure_open(self, operation: str) -> None:
         if self._closed:
             raise NativeWorkerError(f"native world is closed during {operation}")
+
+    def physics_diagnostics(self) -> NativePhysicsDiagnostics:
+        self._ensure_open("physics_diagnostics")
+        return cast(
+            NativePhysicsDiagnostics,
+            self._runtime._request("physics_diagnostics"),
+        )
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
         self._ensure_open("reset")

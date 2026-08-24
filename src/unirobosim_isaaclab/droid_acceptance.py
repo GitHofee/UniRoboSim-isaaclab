@@ -40,6 +40,7 @@ from unirobosim import (
 from ._droid_asset import resolve_droid_asset_path
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
+from .native_protocols import NativePhysicsDiagnostics
 from .provider import IsaacLabProvider
 
 _ASSET_SHA256 = "50265df8344bca0677dc76ffe3d08fe427bd69ab588213328c2973d86351d71c"
@@ -589,6 +590,7 @@ class _DroidTelemetryProbe:
         self._generation = 0
         self._camera_handle: object | None = None
         self._camera_calibration: tuple[int, Mapping[str, object]] | None = None
+        self._physics_diagnostics: tuple[int, Mapping[str, object]] | None = None
         self._ee_frame_id: str | None = None
         self._last_sample: tuple[int, int, Mapping[str, object]] | None = None
 
@@ -625,10 +627,28 @@ class _DroidTelemetryProbe:
             raise RuntimeError("Isaac effective camera calibration is unavailable before reset")
         return calibration[1]
 
+    def physics_diagnostics(self) -> Mapping[str, object]:
+        snapshot = self._kernel.snapshot
+        generation = getattr(snapshot, "generation", None)
+        tick = getattr(snapshot, "tick", None)
+        if type(generation) is not int or generation <= 0 or type(tick) is not int or tick < 0:
+            raise RuntimeError("Isaac runtime state is unavailable for physics diagnostics")
+        with self._lock:
+            diagnostics = self._physics_diagnostics
+        if diagnostics is not None and diagnostics[0] == generation:
+            return diagnostics[1]
+        self._submit(generation, tick)
+        with self._lock:
+            diagnostics = self._physics_diagnostics
+        if diagnostics is None or diagnostics[0] != generation:
+            raise RuntimeError("Isaac effective physics diagnostics are unavailable before reset")
+        return diagnostics[1]
+
     def close(self) -> None:
         with self._lock:
             self._camera_handle = None
             self._camera_calibration = None
+            self._physics_diagnostics = None
             self._ee_frame_id = None
             self._last_sample = None
 
@@ -664,6 +684,7 @@ class _DroidTelemetryProbe:
                 self._generation = generation
                 self._camera_handle = None
                 self._camera_calibration = None
+                self._physics_diagnostics = None
                 self._ee_frame_id = None
                 self._last_sample = None
 
@@ -674,6 +695,20 @@ class _DroidTelemetryProbe:
                 "Isaac adapter tick differs from the FastSim runtime tick",
             )
         world = adapter._required_world()
+        with self._lock:
+            cached_physics = self._physics_diagnostics
+        if cached_physics is None:
+            native_physics = cast(NativePhysicsDiagnostics, world._native.physics_diagnostics())
+            effective_physics = MappingProxyType(
+                {
+                    "native_step_dt_seconds": native_physics.native_step_dt_seconds,
+                    "substeps": native_physics.substeps,
+                    "world_step_dt_seconds": native_physics.world_step_dt_seconds,
+                    "native_timing_source": native_physics.source,
+                }
+            )
+            with self._lock:
+                self._physics_diagnostics = (generation, effective_physics)
         articulation = adapter._projection.articulations[0]
         joint_state = world.read_articulation(adapter._live[articulation.entity_id].handle)
         with self._lock:
@@ -859,9 +894,14 @@ class DroidAcceptanceBackendRun:
 
     @property
     def physics_diagnostics(self) -> Mapping[str, object]:
+        probe = getattr(self._adapter, "_droid_telemetry_probe", None)
+        if type(probe) is not _DroidTelemetryProbe:
+            raise RuntimeError("Isaac native physics diagnostics are unavailable")
+        native = probe.physics_diagnostics()
         return MappingProxyType(
             {
                 "gravity_m_s2": self._gravity_m_s2,
+                **native,
                 "source": "effective UniRoboSim WorldSpec used for native build",
             }
         )

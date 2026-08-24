@@ -37,6 +37,16 @@ NativeDebugReport = tuple[int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
+class NativePhysicsDiagnostics:
+    """Effective native timing read back from an initialized simulator."""
+
+    native_step_dt_seconds: float
+    substeps: int
+    world_step_dt_seconds: float
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
 class NativeCameraCalibration:
     """Effective calibration read back from one initialized native camera."""
 
@@ -123,6 +133,8 @@ class NativeArticulationCommand:
 
 
 class NativeWorldDriver(Protocol):
+    def physics_diagnostics(self) -> NativePhysicsDiagnostics: ...
+
     def reset(self, environment_indices: tuple[int, ...]) -> None: ...
 
     def apply_articulation(

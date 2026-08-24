@@ -36,6 +36,7 @@ from .native_protocols import (
     NativeArticulationCommand,
     NativeCameraCalibration,
     NativeDebugReport,
+    NativePhysicsDiagnostics,
     NativeSensorSample,
     PointBatch,
 )
@@ -1907,3 +1908,26 @@ class IsaacLabNativeWorld:
 
     def close(self) -> None:
         self._close(notify_runtime=True)
+
+    def physics_diagnostics(self) -> NativePhysicsDiagnostics:
+        """Read the effective timestep from the live Isaac Lab context."""
+
+        assert self._sim is not None
+        native_dt = float(self._sim.get_physics_dt())
+        substeps = self._spec.physics.substeps
+        world_dt = native_dt * substeps
+        if (
+            not math.isfinite(native_dt)
+            or native_dt <= 0.0
+            or type(substeps) is not int
+            or substeps <= 0
+            or not math.isfinite(world_dt)
+            or world_dt <= 0.0
+        ):
+            raise RuntimeError("Isaac Lab reported invalid effective physics timing")
+        return NativePhysicsDiagnostics(
+            native_step_dt_seconds=native_dt,
+            substeps=substeps,
+            world_step_dt_seconds=world_dt,
+            source="Isaac Lab SimulationContext.get_physics_dt() after native world build",
+        )

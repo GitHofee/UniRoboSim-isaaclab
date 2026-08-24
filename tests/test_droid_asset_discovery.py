@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import ast
 import inspect
+import threading
 import tomllib
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 import unirobosim_isaaclab.droid_acceptance as droid_acceptance
 from unirobosim_isaaclab._droid_asset import DROID_ASSET_ENV, resolve_droid_asset_path
-from unirobosim_isaaclab.droid_acceptance import create_backend_run
+from unirobosim_isaaclab.droid_acceptance import DroidAcceptanceBackendRun, create_backend_run
 
 
 def _asset(root: Path, name: str) -> Path:
@@ -73,6 +75,42 @@ def test_acceptance_asset_path_is_optional_keyword_only() -> None:
 
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is None
+
+
+def test_acceptance_physics_diagnostics_preserve_gravity_source_and_add_native_timing(
+    tmp_path: Path,
+) -> None:
+    probe = object.__new__(droid_acceptance._DroidTelemetryProbe)
+    probe._kernel = SimpleNamespace(snapshot=SimpleNamespace(generation=3, tick=0))
+    probe._lock = threading.Lock()
+    probe._physics_diagnostics = (
+        3,
+        MappingProxyType(
+            {
+                "native_step_dt_seconds": 1.0 / 60.0,
+                "substeps": 1,
+                "world_step_dt_seconds": 1.0 / 60.0,
+                "native_timing_source": ("Isaac Lab SimulationContext.get_physics_dt() after native world build"),
+            }
+        ),
+    )
+    backend = DroidAcceptanceBackendRun(
+        bundle=object(),
+        _adapter=SimpleNamespace(_droid_telemetry_probe=probe),
+        _gravity_m_s2=(0.0, 0.0, -9.81),
+        _visible_window=False,
+        _display=None,
+        _baseline_window_ids=frozenset(),
+        _output_dir=tmp_path,
+        _run_kind="rulebased_blocking",
+    )
+
+    diagnostics = backend.physics_diagnostics
+
+    assert diagnostics["gravity_m_s2"] == (0.0, 0.0, -9.81)
+    assert diagnostics["source"] == "effective UniRoboSim WorldSpec used for native build"
+    assert diagnostics["native_step_dt_seconds"] == 1.0 / 60.0
+    assert "SimulationContext.get_physics_dt" in diagnostics["native_timing_source"]
 
 
 def test_acceptance_forwards_explicit_and_config_asset_paths(
