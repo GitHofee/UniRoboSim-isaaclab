@@ -65,7 +65,30 @@ _SYSTEM_GROUND_GEOMETRY_ID = "geometry.system.ground"
 _DEFAULT_COLLISION_GROUP = 1
 _DEFAULT_COLLISION_MASK = 2**32 - 1
 _MAX_GEOMETRY_RESOURCE_BYTES = 64 * 1024 * 1024
-_PROVENANCE_PROFILE = "isaaclab-3.0-physx-convex-canonical-v1"
+_MAX_FILTERED_COLLISION_BODIES = 128
+_MAX_FILTER_CLIQUE_SEARCH_STATES = 1_000_000
+_COLLISION_FILTER_PROFILE = "usd-effective-owner-pairs-to-bilateral-bitmask-v1"
+_PROVENANCE_PROFILE = "isaaclab-3.0-complete-collision-forest-v3"
+_MESH_CANONICALIZATION = "float32-le-vertices-then-uint32-le-triangles-v1"
+_COMPOSITE_ENTITY_POSE = "__container_entity_pose__"
+_SUPPORTED_COLLISION_SCHEMAS = frozenset(
+    {
+        "PhysicsCollisionAPI",
+        "PhysicsMeshCollisionAPI",
+        "PhysxCollisionAPI",
+        "PhysxContactReportAPI",
+        # Isaac Sim 6 materializes these effective cooking schemas on the
+        # runtime stage from PhysicsMeshCollisionAPI:approximation.  The
+        # approximation token remains the authoritative representation below;
+        # accepting only this closed set keeps unknown collision behavior
+        # fail-closed without rejecting the simulator's effective stage.
+        "PhysxConvexDecompositionCollisionAPI",
+        "PhysxConvexHullCollisionAPI",
+        "PhysxSDFMeshCollisionAPI",
+        "PhysxTriangleMeshCollisionAPI",
+        "PhysxTriangleMeshSimplificationCollisionAPI",
+    }
+)
 _IDENTITY_POSE = PlanningPose(_WORLD_FRAME_ID, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
 _ZERO_TWIST = PlanningTwist(_WORLD_FRAME_ID)
 
@@ -96,6 +119,12 @@ class _GeometryBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class _TensorBodyBinding:
+    view: Any
+    row_by_environment_and_name: tuple[dict[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _EntityBinding:
     path: EntityPath
     entity_id: str
@@ -103,6 +132,21 @@ class _EntityBinding:
     root_link_id: str
     link_id_by_name: dict[str, str]
     joint_bindings: tuple[_JointBinding, ...]
+    state_source: str = "asset"
+    tensor_bodies: _TensorBodyBinding | None = None
+    static_poses: tuple[dict[str, PlanningPose], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _MeshInput:
+    vertices: tuple[tuple[float, float, float], ...]
+    face_counts: tuple[int, ...]
+    face_indices: tuple[int, ...]
+    triangles: tuple[tuple[int, int, int], ...]
+    hole_faces: tuple[int, ...]
+    subdivision: str
+    orientation: str
+    source_sha256: str
 
 
 def _stable_id(prefix: str, *parts: str) -> str:
@@ -199,16 +243,287 @@ def _compose_pose(parent: PlanningPose, local: PlanningGeometryLocalPose) -> Pla
     )
 
 
-def _matrix_local_pose(modules: Any, matrix: Any) -> tuple[PlanningGeometryLocalPose, tuple[float, float, float]]:
-    transform = modules.Gf.Transform(matrix)
-    translation = _float_tuple(transform.GetTranslation(), 3)
-    raw_scale = _float_tuple(transform.GetScale(), 3)
-    scale = (raw_scale[0], raw_scale[1], raw_scale[2])
-    if any(item <= 0.0 for item in scale):
+def _compose_scaled_local_pose(
+    parent: PlanningGeometryLocalPose,
+    scale: tuple[float, float, float],
+    offset: tuple[float, float, float],
+) -> PlanningGeometryLocalPose:
+    scaled_offset = (scale[0] * offset[0], scale[1] * offset[1], scale[2] * offset[2])
+    rotated = _rotate(scaled_offset, parent.orientation_xyzw)
+    return PlanningGeometryLocalPose(
+        tuple(parent.position_m[index] + rotated[index] for index in range(3)),  # type: ignore[arg-type]
+        parent.orientation_xyzw,
+    )
+
+
+def _cylinder_pose_scale(
+    pose: PlanningGeometryLocalPose,
+    scale: tuple[float, float, float],
+    axis: str,
+) -> tuple[PlanningGeometryLocalPose, tuple[float, float, float]]:
+    half_sqrt_two = math.sqrt(0.5)
+    if axis == "Z":
+        axis_orientation = (0.0, 0.0, 0.0, 1.0)
+        cylinder_scale = scale
+    elif axis == "X":
+        axis_orientation = (0.0, half_sqrt_two, 0.0, half_sqrt_two)
+        cylinder_scale = (scale[2], scale[1], scale[0])
+    elif axis == "Y":
+        axis_orientation = (-half_sqrt_two, 0.0, 0.0, half_sqrt_two)
+        cylinder_scale = (scale[0], scale[2], scale[1])
+    else:
         raise NativePlanningError("collision_geometry_unsupported")
-    scale_orientation = _xyzw(transform.GetPivotOrientation().GetQuat())
-    pivot = _float_tuple(transform.GetPivotPosition(), 3)
-    if scale_orientation != (0.0, 0.0, 0.0, 1.0) or any(abs(item) > 1.0e-10 for item in pivot):
+    return (
+        PlanningGeometryLocalPose(
+            pose.position_m,
+            _quat_multiply(pose.orientation_xyzw, axis_orientation),
+        ),
+        cylinder_scale,
+    )
+
+
+def _path_is_at_or_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(f"{root}/")
+
+
+def _canonical_body_pair(left: str, right: str) -> tuple[str, str]:
+    if left == right:
+        raise NativePlanningError("collision_filter_unsupported")
+    return (left, right) if left < right else (right, left)
+
+
+def _maximum_filtered_clique(
+    body_paths: tuple[str, ...],
+    filtered_pairs: frozenset[tuple[str, str]],
+) -> tuple[str, ...]:
+    """Return the largest lexicographically first clique with bounded search."""
+
+    best: tuple[str, ...] = ()
+    search_states = 0
+
+    def visit(clique: tuple[str, ...], candidates: tuple[str, ...]) -> None:
+        nonlocal best, search_states
+        search_states += 1
+        if search_states > _MAX_FILTER_CLIQUE_SEARCH_STATES:
+            raise NativePlanningError("collision_filter_unsupported")
+        if len(clique) > len(best) or (len(clique) == len(best) and clique < best):
+            best = clique
+        remaining = candidates
+        while remaining:
+            if len(clique) + len(remaining) < len(best):
+                return
+            vertex = remaining[0]
+            tail = remaining[1:]
+            visit(
+                (*clique, vertex),
+                tuple(item for item in tail if _canonical_body_pair(vertex, item) in filtered_pairs),
+            )
+            remaining = tail
+
+    visit((), body_paths)
+    if not best:
+        raise NativePlanningError("collision_filter_unsupported")
+    return best
+
+
+def _exact_filtered_pair_encoding(
+    body_paths: tuple[str, ...],
+    filtered_pairs: frozenset[tuple[str, str]],
+    *,
+    first_class_bit: int,
+    self_filtered_bodies: frozenset[str] = frozenset(),
+) -> tuple[dict[str, tuple[int, int]], int, tuple[tuple[str, ...], ...]]:
+    """Encode one articulation's filtered-body graph exactly into group/mask bits."""
+
+    bodies = tuple(sorted(set(body_paths)))
+    if len(bodies) > _MAX_FILTERED_COLLISION_BODIES or not 1 <= first_class_bit <= 31:
+        raise NativePlanningError("collision_filter_unsupported")
+    body_set = frozenset(bodies)
+    if (
+        not self_filtered_bodies.issubset(body_set)
+        or any(left not in body_set or right not in body_set or left >= right for left, right in filtered_pairs)
+    ):
+        raise NativePlanningError("collision_filter_unsupported")
+    participants = tuple(sorted({item for pair in filtered_pairs for item in pair} | set(self_filtered_bodies)))
+    if not participants:
+        return {}, first_class_bit, ()
+
+    classes: list[tuple[str, ...]] = []
+    remaining = participants
+    while remaining:
+        clique = _maximum_filtered_clique(remaining, filtered_pairs)
+        classes.append(clique)
+        claimed = frozenset(clique)
+        remaining = tuple(item for item in remaining if item not in claimed)
+    classes.sort(key=lambda item: item[0])
+
+    def allowed(left: str, right: str) -> bool:
+        if left == right:
+            return left not in participants
+        return _canonical_body_pair(left, right) not in filtered_pairs
+
+    while True:
+        class_by_body = {body: index for index, members in enumerate(classes) for body in members}
+        allowed_classes = {
+            body: frozenset(class_by_body[other] for other in participants if allowed(body, other))
+            for body in participants
+        }
+        mismatch: tuple[str, str] | None = None
+        for left_index, left in enumerate(participants):
+            for right in participants[left_index + 1 :]:
+                predicted = (
+                    class_by_body[right] in allowed_classes[left]
+                    and class_by_body[left] in allowed_classes[right]
+                )
+                if predicted != allowed(left, right):
+                    mismatch = (left, right)
+                    break
+            if mismatch is not None:
+                break
+        if mismatch is None:
+            break
+        left, right = mismatch
+        right_class = class_by_body[right]
+        members = classes[right_class]
+        filtered_members = tuple(item for item in members if not allowed(left, item))
+        allowed_members = tuple(item for item in members if allowed(left, item))
+        if not filtered_members or not allowed_members:
+            raise NativePlanningError("collision_filter_unsupported")
+        classes[right_class : right_class + 1] = [filtered_members, allowed_members]
+        classes.sort(key=lambda item: item[0])
+
+    if first_class_bit + len(classes) > 32:
+        raise NativePlanningError("collision_filter_unsupported")
+    class_by_body = {body: index for index, members in enumerate(classes) for body in members}
+    group_by_class = tuple(1 << (first_class_bit + index) for index in range(len(classes)))
+    encoding: dict[str, tuple[int, int]] = {}
+    for body in participants:
+        mask = _DEFAULT_COLLISION_MASK
+        for class_index, members in enumerate(classes):
+            if not any(allowed(body, other) for other in members):
+                mask &= ~group_by_class[class_index]
+        encoding[body] = (group_by_class[class_by_body[body]], mask)
+
+    def encoded(body: str) -> tuple[int, int]:
+        return encoding.get(body, (_DEFAULT_COLLISION_GROUP, _DEFAULT_COLLISION_MASK))
+
+    for left_index, left in enumerate(bodies):
+        left_group, left_mask = encoded(left)
+        if bool(left_group & left_mask) != allowed(left, left):
+            raise NativePlanningError("collision_filter_unsupported")
+        for right in bodies[left_index + 1 :]:
+            right_group, right_mask = encoded(right)
+            predicted = bool(left_group & right_mask) and bool(right_group & left_mask)
+            if predicted != allowed(left, right):
+                raise NativePlanningError("collision_filter_unsupported")
+        if not (left_group & _DEFAULT_COLLISION_MASK) or not (_DEFAULT_COLLISION_GROUP & left_mask):
+            raise NativePlanningError("collision_filter_unsupported")
+    return encoding, first_class_bit + len(classes), tuple(classes)
+
+
+def _triangulate_faces(
+    counts: tuple[int, ...],
+    indices: tuple[int, ...],
+    *,
+    vertex_count: int,
+    orientation: str,
+    hole_faces: frozenset[int] = frozenset(),
+) -> tuple[tuple[int, int, int], ...]:
+    if not counts or sum(counts) != len(indices) or any(count < 3 for count in counts):
+        raise NativePlanningError("collision_cooking_failed")
+    if any(face < 0 or face >= len(counts) for face in hole_faces):
+        raise NativePlanningError("collision_cooking_failed")
+    if any(index < 0 or index >= vertex_count for index in indices):
+        raise NativePlanningError("collision_cooking_failed")
+    if orientation not in {"rightHanded", "leftHanded"}:
+        raise NativePlanningError("collision_cooking_failed")
+    triangles: list[tuple[int, int, int]] = []
+    cursor = 0
+    for face_index, count in enumerate(counts):
+        face = indices[cursor : cursor + count]
+        cursor += count
+        if face_index in hole_faces:
+            continue
+        for offset in range(1, count - 1):
+            triangle = (face[0], face[offset], face[offset + 1])
+            triangles.append(triangle if orientation == "rightHanded" else (triangle[0], triangle[2], triangle[1]))
+    if not triangles:
+        raise NativePlanningError("collision_cooking_failed")
+    return tuple(triangles)
+
+
+def _reflect_mesh_input(
+    mesh_input: _MeshInput,
+    reflection: tuple[int, int, int],
+) -> _MeshInput:
+    if reflection == (1, 1, 1):
+        return mesh_input
+    if reflection not in {(-1, 1, 1), (1, -1, 1), (1, 1, -1)}:
+        raise NativePlanningError("collision_geometry_unsupported")
+    vertices = tuple(
+        tuple(vertex[axis] * reflection[axis] for axis in range(3))
+        for vertex in mesh_input.vertices
+    )
+    return _MeshInput(
+        vertices,  # type: ignore[arg-type]
+        mesh_input.face_counts,
+        mesh_input.face_indices,
+        mesh_input.triangles,
+        mesh_input.hole_faces,
+        mesh_input.subdivision,
+        mesh_input.orientation,
+        _json_sha256(
+            {
+                "mesh_source_sha256": mesh_input.source_sha256,
+                "baked_reflection": reflection,
+            }
+        ),
+    )
+
+
+def _bake_mesh_linear_transform(
+    mesh_input: _MeshInput,
+    linear: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+) -> _MeshInput:
+    vertices = tuple(
+        tuple(
+            sum(vertex[axis] * linear[axis][component] for axis in range(3))
+            for component in range(3)
+        )
+        for vertex in mesh_input.vertices
+    )
+    if any(not math.isfinite(component) for vertex in vertices for component in vertex):
+        raise NativePlanningError("collision_geometry_unsupported")
+    return _MeshInput(
+        vertices,  # type: ignore[arg-type]
+        mesh_input.face_counts,
+        mesh_input.face_indices,
+        mesh_input.triangles,
+        mesh_input.hole_faces,
+        mesh_input.subdivision,
+        mesh_input.orientation,
+        _json_sha256(
+            {
+                "mesh_source_sha256": mesh_input.source_sha256,
+                "baked_linear_transform": linear,
+            }
+        ),
+    )
+
+
+def _matrix_origin_basis(
+    modules: Any,
+    matrix: Any,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+]:
+    if any(abs(float(matrix[row][3])) > 1.0e-10 for row in range(3)) or not math.isclose(
+        float(matrix[3][3]),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-10,
+    ):
         raise NativePlanningError("collision_geometry_unsupported")
     origin = _float_tuple(matrix.Transform(modules.Gf.Vec3d(0.0, 0.0, 0.0)), 3)
     basis = tuple(
@@ -229,19 +544,101 @@ def _matrix_local_pose(modules: Any, matrix: Any) -> tuple[PlanningGeometryLocal
         )
         for axis in range(3)
     )
-    lengths = tuple(math.sqrt(sum(component * component for component in vector)) for vector in basis)
-    tolerance = 1.0e-7 * max(1.0, *scale)
-    if any(abs(origin[index] - translation[index]) > tolerance for index in range(3)) or any(
-        abs(lengths[index] - scale[index]) > tolerance for index in range(3)
-    ):
+    return origin, basis  # type: ignore[return-value]
+
+
+def _matrix_pose_scale_reflection(
+    modules: Any,
+    matrix: Any,
+) -> tuple[PlanningGeometryLocalPose, tuple[float, float, float], tuple[int, int, int]]:
+    origin, basis = _matrix_origin_basis(modules, matrix)
+    scale = (
+        math.sqrt(sum(component * component for component in basis[0])),
+        math.sqrt(sum(component * component for component in basis[1])),
+        math.sqrt(sum(component * component for component in basis[2])),
+    )
+    if any(not math.isfinite(item) or item <= 0.0 for item in scale):
         raise NativePlanningError("collision_geometry_unsupported")
+    tolerance = 1.0e-7 * max(1.0, *scale)
     if any(
         abs(sum(basis[left][axis] * basis[right][axis] for axis in range(3))) > tolerance
         for left, right in ((0, 1), (0, 2), (1, 2))
     ):
         raise NativePlanningError("collision_geometry_unsupported")
-    orientation = _xyzw(transform.GetRotation().GetQuat())
-    return PlanningGeometryLocalPose(translation, orientation), scale  # type: ignore[arg-type]
+    normalized_basis = tuple(
+        tuple(component / scale[axis] for component in basis[axis])
+        for axis in range(3)
+    )
+    determinant = (
+        normalized_basis[0][0]
+        * (normalized_basis[1][1] * normalized_basis[2][2] - normalized_basis[1][2] * normalized_basis[2][1])
+        - normalized_basis[0][1]
+        * (normalized_basis[1][0] * normalized_basis[2][2] - normalized_basis[1][2] * normalized_basis[2][0])
+        + normalized_basis[0][2]
+        * (normalized_basis[1][0] * normalized_basis[2][1] - normalized_basis[1][1] * normalized_basis[2][0])
+    )
+    reflection = (1, 1, 1)
+    if math.isclose(determinant, -1.0, rel_tol=0.0, abs_tol=1.0e-6):
+        # The public geometry contract requires a proper quaternion and
+        # positive scale.  Canonically move one reflection into the geometry
+        # payload; callers that cannot bake geometry reject it below.
+        reflection = (-1, 1, 1)
+        normalized_basis = (
+            tuple(-component for component in normalized_basis[0]),
+            normalized_basis[1],
+            normalized_basis[2],
+        )
+    elif not math.isclose(determinant, 1.0, rel_tol=0.0, abs_tol=1.0e-6):
+        raise NativePlanningError("collision_geometry_unsupported")
+    rotation_matrix = modules.Gf.Matrix3d(*(component for row in normalized_basis for component in row))
+    orientation = _xyzw(rotation_matrix.ExtractRotation().GetQuat())
+    for axis, unit in enumerate(((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))):
+        rotated = _rotate(unit, orientation)
+        if any(abs(rotated[index] - normalized_basis[axis][index]) > 1.0e-6 for index in range(3)):
+            raise NativePlanningError("collision_geometry_unsupported")
+    return PlanningGeometryLocalPose(origin, orientation), scale, reflection
+
+
+def _collision_pose_scale_bake(
+    modules: Any,
+    matrix: Any,
+    *,
+    mesh_capable: bool,
+) -> tuple[
+    PlanningGeometryLocalPose,
+    tuple[float, float, float],
+    tuple[int, int, int],
+    tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None,
+]:
+    try:
+        pose, scale, reflection = _matrix_pose_scale_reflection(modules, matrix)
+        return pose, scale, reflection, None
+    except NativePlanningError:
+        if not mesh_capable:
+            raise
+    origin, basis = _matrix_origin_basis(modules, matrix)
+    determinant = (
+        basis[0][0] * (basis[1][1] * basis[2][2] - basis[1][2] * basis[2][1])
+        - basis[0][1] * (basis[1][0] * basis[2][2] - basis[1][2] * basis[2][0])
+        + basis[0][2] * (basis[1][0] * basis[2][1] - basis[1][1] * basis[2][0])
+    )
+    if not math.isfinite(determinant) or abs(determinant) <= 1.0e-12:
+        raise NativePlanningError("collision_geometry_unsupported")
+    return (
+        PlanningGeometryLocalPose(origin, (0.0, 0.0, 0.0, 1.0)),
+        (1.0, 1.0, 1.0),
+        (1, 1, 1),
+        basis,
+    )
+
+
+def _matrix_local_pose(modules: Any, matrix: Any) -> tuple[PlanningGeometryLocalPose, tuple[float, float, float]]:
+    pose, scale, reflection = _matrix_pose_scale_reflection(modules, matrix)
+    if reflection != (1, 1, 1):
+        # Frames and entity poses have no geometry payload in which a mirror can
+        # be represented.  Only collision geometry uses the baking path.
+        raise NativePlanningError("collision_geometry_unsupported")
+    return pose, scale
 
 
 def _relationship_target(relationship: Any) -> str | None:
@@ -285,9 +682,14 @@ class _PlanningAdmission:
         self._frames: dict[str, _FrameBinding] = {}
         self._geometries: dict[str, _GeometryBinding] = {}
         self._source_sha_by_entity: dict[EntityPath, str] = {}
+        self._mesh_inputs: dict[tuple[str, str], _MeshInput] = {}
+        self._convex_cache: dict[tuple[str, str], tuple[tuple[bytes, int, int], ...]] = {}
+        self._triangle_cache: dict[str, tuple[bytes, int, int]] = {}
         self._accounted_bodies: set[str] = set()
         self._accounted_colliders: set[str] = set()
         self._accounted_constraints: set[str] = set()
+        self._accounted_filtered_pair_sources: set[str] = set()
+        self._next_collision_filter_bit = 1
         self._catalog = self._build_catalog()
 
     @property
@@ -323,6 +725,90 @@ class _PlanningAdmission:
         self._source_sha_by_entity[spec.path] = digest
         return digest
 
+    def _articulation_collision_filter_projection(
+        self,
+        root: Any,
+        bodies: dict[str, Any],
+        body_name_by_path: dict[str, str],
+        collision_owner_paths: tuple[str, ...],
+    ) -> tuple[dict[str, tuple[int, int]], str, str, int, int, bool]:
+        """Project one articulation's effective body filters without approximation."""
+
+        articulation_roots = tuple(
+            prim for prim in self._walk(root) if prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI)
+        )
+        if len(articulation_roots) != 1:
+            raise NativePlanningError("collision_filter_unsupported")
+        physx_articulation = self._m.PhysxSchema.PhysxArticulationAPI(articulation_roots[0])
+        enabled_self_collisions = physx_articulation.GetEnabledSelfCollisionsAttr().Get()
+        if type(enabled_self_collisions) is not bool:
+            raise NativePlanningError("collision_filter_unsupported")
+
+        authored_pairs: set[tuple[str, str]] = set()
+        for prim in self._walk(root):
+            filtered = self._m.UsdPhysics.FilteredPairsAPI(prim)
+            if not filtered:
+                continue
+            targets = tuple(filtered.GetFilteredPairsRel().GetTargets())
+            if not targets:
+                continue
+            source_path = str(prim.GetPath())
+            if source_path not in bodies:
+                raise NativePlanningError("collision_filter_unsupported")
+            for target in targets:
+                target_prim = self._stage.GetPrimAtPath(target)
+                target_path = str(target)
+                if (
+                    not target_prim
+                    or not target_prim.IsValid()
+                    or target_path not in bodies
+                    or not target_prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                ):
+                    raise NativePlanningError("collision_filter_unsupported")
+                authored_pairs.add(_canonical_body_pair(source_path, target_path))
+            self._accounted_filtered_pair_sources.add(source_path)
+
+        owner_paths = tuple(sorted(set(collision_owner_paths)))
+        owner_set = frozenset(owner_paths)
+        if enabled_self_collisions:
+            effective_pairs = frozenset(
+                pair for pair in authored_pairs if pair[0] in owner_set and pair[1] in owner_set
+            )
+        else:
+            effective_pairs = frozenset(
+                (left, right)
+                for left_index, left in enumerate(owner_paths)
+                for right in owner_paths[left_index + 1 :]
+            )
+        collider_count_by_owner = {path: collision_owner_paths.count(path) for path in owner_paths}
+        self_filtered_bodies = frozenset(
+            path for path, count in collider_count_by_owner.items() if count > 1
+        )
+        encoding, next_bit, _classes = _exact_filtered_pair_encoding(
+            owner_paths,
+            effective_pairs,
+            first_class_bit=self._next_collision_filter_bit,
+            self_filtered_bodies=self_filtered_bodies,
+        )
+        self._next_collision_filter_bit = next_bit
+
+        named_pairs = tuple(
+            sorted(
+                tuple(sorted((body_name_by_path[left], body_name_by_path[right])))
+                for left, right in effective_pairs
+            )
+        )
+        self_owner_names = tuple(sorted(body_name_by_path[path] for path in self_filtered_bodies))
+        effective_graph = tuple(sorted((*named_pairs, *((name, name) for name in self_owner_names))))
+        return (
+            encoding,
+            _json_sha256(effective_graph),
+            _json_sha256(named_pairs),
+            len(named_pairs),
+            len(self_owner_names),
+            enabled_self_collisions,
+        )
+
     def _build_catalog(self) -> NativePlanningCatalog:
         frames: list[PlanningFrameDescriptor] = [
             PlanningFrameDescriptor(_WORLD_FRAME_ID, PlanningFrameKind.WORLD, None, None, None)
@@ -333,44 +819,59 @@ class _PlanningAdmission:
         geometries: list[PlanningGeometryDescriptor] = []
 
         system_geometry = self._ground_geometry()
-        frames.append(
-            PlanningFrameDescriptor(
-                _SYSTEM_FRAME_ID,
-                PlanningFrameKind.ENTITY,
-                _WORLD_FRAME_ID,
-                PLANNING_SYSTEM_ENTITY_ID,
-                None,
+        if system_geometry is not None:
+            frames.append(
+                PlanningFrameDescriptor(
+                    _SYSTEM_FRAME_ID,
+                    PlanningFrameKind.ENTITY,
+                    _WORLD_FRAME_ID,
+                    PLANNING_SYSTEM_ENTITY_ID,
+                    None,
+                )
             )
-        )
-        entities.append(
-            PlanningEntityDescriptor(
-                PLANNING_SYSTEM_ENTITY_ID,
-                PLANNING_SYSTEM_ENTITY_PATH,
-                PlanningEntityKind.OTHER,
-                True,
-                _SYSTEM_FRAME_ID,
-                (),
-                (_SYSTEM_FRAME_ID,),
-                (_SYSTEM_GROUND_GEOMETRY_ID,),
+            entities.append(
+                PlanningEntityDescriptor(
+                    PLANNING_SYSTEM_ENTITY_ID,
+                    PLANNING_SYSTEM_ENTITY_PATH,
+                    PlanningEntityKind.OTHER,
+                    True,
+                    _SYSTEM_FRAME_ID,
+                    (),
+                    (_SYSTEM_FRAME_ID,),
+                    (_SYSTEM_GROUND_GEOMETRY_ID,),
+                )
             )
-        )
-        geometries.append(system_geometry)
-        self._geometries[system_geometry.geometry_id] = _GeometryBinding(system_geometry, None, None)
+            geometries.append(system_geometry)
+            self._geometries[system_geometry.geometry_id] = _GeometryBinding(system_geometry, None, None)
         self._frames[_WORLD_FRAME_ID] = _FrameBinding(_WORLD_FRAME_ID, None, "world")
-        self._frames[_SYSTEM_FRAME_ID] = _FrameBinding(_SYSTEM_FRAME_ID, None, "system")
+        if system_geometry is not None:
+            self._frames[_SYSTEM_FRAME_ID] = _FrameBinding(_SYSTEM_FRAME_ID, None, "system")
 
-        for spec in self._world._spec.entities:
+        ordered_specs = tuple(
+            sorted(
+                self._world._spec.entities,
+                key=lambda item: (
+                    0 if item.kind is EntityKind.COMPOSITE_SCENE else 1 if item.embedded_binding is not None else 2,
+                    item.path.value,
+                ),
+            )
+        )
+        for spec in ordered_specs:
             if spec.kind is EntityKind.CAMERA_SENSOR:
                 self._verify_nonphysical_entity(spec)
                 continue
-            if spec.kind in {EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE}:
-                # Public preflight rejects this today. Keep the native admission
-                # fail-closed as defense in depth so its colliders can never be
-                # silently omitted if a caller bypasses the public facade.
+            if spec.kind is EntityKind.STATIC_SCENE:
+                # Static scenes deliberately retain the old fail-closed contract.
                 raise NativePlanningError("topology_unsupported")
             if spec.kind not in {EntityKind.ARTICULATION, EntityKind.RIGID_BODY}:
-                raise NativePlanningError("soft_matter_unsupported")
-            result = self._entity_catalog(spec)
+                if spec.kind is not EntityKind.COMPOSITE_SCENE:
+                    raise NativePlanningError("soft_matter_unsupported")
+            if spec.kind is EntityKind.COMPOSITE_SCENE:
+                result = self._composite_catalog(spec)
+            elif spec.embedded_binding is not None:
+                result = self._embedded_entity_catalog(spec)
+            else:
+                result = self._entity_catalog(spec)
             entity, entity_links, entity_joints, entity_frames, entity_geometries, binding = result
             entities.append(entity)
             links.extend(entity_links)
@@ -404,8 +905,12 @@ class _PlanningAdmission:
                 ):
                     raise NativePlanningError("catalog_invalid")
 
-    def _ground_geometry(self) -> PlanningGeometryDescriptor:
+    def _ground_geometry(self) -> PlanningGeometryDescriptor | None:
         root = self._stage.GetPrimAtPath("/World/unirobosimGround")
+        if not root or not root.IsValid():
+            if any(item.kind is EntityKind.COMPOSITE_SCENE for item in self._world._spec.entities):
+                return None
+            raise NativePlanningError("collision_geometry_unsupported")
         candidates = tuple(
             prim
             for prim in self._walk(root)
@@ -529,7 +1034,7 @@ class _PlanningAdmission:
         elif movable_names:
             raise NativePlanningError("topology_unsupported")
 
-        geometry_by_link: dict[str, list[PlanningGeometryDescriptor]] = {name: [] for name in link_id_by_name}
+        collision_models: list[tuple[Any, str]] = []
         for prim in self._walk(root):
             if not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
                 continue
@@ -539,17 +1044,56 @@ class _PlanningAdmission:
             owner_path = _nearest_body(str(prim.GetPath()), bodies)
             if owner_path is None:
                 raise NativePlanningError("catalog_invalid")
+            collision_models.append((prim, owner_path))
+        if spec.kind is EntityKind.ARTICULATION:
+            (
+                filter_encoding,
+                filter_graph_sha256,
+                filter_distinct_pairs_sha256,
+                filter_pair_count,
+                filter_self_owner_count,
+                enabled_self_collisions,
+            ) = (
+                self._articulation_collision_filter_projection(
+                    root,
+                    bodies,
+                    body_name_by_path,
+                    tuple(owner_path for _prim, owner_path in collision_models),
+                )
+            )
+        else:
+            filter_encoding = {}
+            filter_graph_sha256 = None
+            filter_distinct_pairs_sha256 = None
+            filter_pair_count = 0
+            filter_self_owner_count = 0
+            enabled_self_collisions = True
+
+        geometry_by_link: dict[str, list[PlanningGeometryDescriptor]] = {name: [] for name in link_id_by_name}
+        for prim, owner_path in collision_models:
             owner_name = body_name_by_path[owner_path]
-            geometry = self._collision_geometry(
+            collision_group, collision_mask = filter_encoding.get(
+                owner_path,
+                (_DEFAULT_COLLISION_GROUP, _DEFAULT_COLLISION_MASK),
+            )
+            collision_geometries = self._collision_geometry(
                 spec,
                 entity_id,
                 prim,
                 bodies[owner_path],
                 link_id_by_name[owner_name],
                 link_frame_by_name[owner_name],
+                collision_group=collision_group,
+                collision_mask=collision_mask,
+                collision_filter_graph_sha256=filter_graph_sha256,
+                collision_filter_distinct_pairs_sha256=filter_distinct_pairs_sha256,
+                collision_filter_pair_count=filter_pair_count,
+                collision_filter_self_owner_count=filter_self_owner_count,
+                enabled_self_collisions=enabled_self_collisions,
             )
-            geometry_by_link[owner_name].append(geometry)
-            self._geometries[geometry.geometry_id] = _GeometryBinding(geometry, spec.path, owner_name)
+            geometry_by_link[owner_name].extend(collision_geometries)
+            for geometry in collision_geometries:
+                self._geometries[geometry.geometry_id] = _GeometryBinding(geometry, spec.path, owner_name)
             self._accounted_colliders.add(str(prim.GetPath()))
 
         frame_descriptors: list[PlanningFrameDescriptor] = [
@@ -600,9 +1144,9 @@ class _PlanningAdmission:
 
         link_descriptors: list[PlanningLinkDescriptor] = []
         for name in sorted(link_id_by_name):
-            parent_name = parent_name_by_child.get(name)
+            parent_of_link = parent_name_by_child.get(name)
             frame_id = link_frame_by_name[name]
-            frame_parent = entity_frame_id if parent_name is None else joint_frame_by_child[name]
+            frame_parent = entity_frame_id if parent_of_link is None else joint_frame_by_child[name]
             geometry_ids = tuple(sorted(item.geometry_id for item in geometry_by_link[name]))
             link_descriptors.append(
                 PlanningLinkDescriptor(
@@ -610,7 +1154,7 @@ class _PlanningAdmission:
                     entity_id,
                     name,
                     frame_id,
-                    None if parent_name is None else link_id_by_name[parent_name],
+                    None if parent_of_link is None else link_id_by_name[parent_of_link],
                     geometry_ids,
                 )
             )
@@ -673,6 +1217,420 @@ class _PlanningAdmission:
             ),
         )
 
+    def _tensor_body_binding(
+        self,
+        rows: tuple[dict[str, str], ...],
+    ) -> _TensorBodyBinding:
+        requested = tuple(path for row in rows for path in row.values())
+        if not requested or len(set(requested)) != len(requested):
+            raise NativePlanningError("topology_unsupported")
+        view = self._world._usd_simulation_view().create_rigid_body_view(list(requested))
+        actual = tuple(str(path) for path in view.prim_paths)
+        if view.count != len(requested) or len(set(actual)) != len(actual) or set(actual) != set(requested):
+            raise NativePlanningError("topology_unsupported")
+        index_by_path = {path: index for index, path in enumerate(actual)}
+        return _TensorBodyBinding(
+            view,
+            tuple({name: index_by_path[path] for name, path in row.items()} for row in rows),
+        )
+
+    def _composite_catalog(
+        self,
+        spec: Any,
+    ) -> tuple[
+        PlanningEntityDescriptor,
+        tuple[PlanningLinkDescriptor, ...],
+        tuple[PlanningJointDescriptor, ...],
+        tuple[PlanningFrameDescriptor, ...],
+        tuple[PlanningGeometryDescriptor, ...],
+        _EntityBinding,
+    ]:
+        root = self._entity_root(spec, 0)
+        root_path = str(root.GetPath())
+        entity_id = _stable_id("entity", spec.path.value)
+        entity_frame_id = _stable_id("frame.entity", spec.path.value)
+        embedded = tuple(
+            item
+            for item in self._world._spec.entities
+            if item.embedded_binding is not None and item.embedded_binding.container_path == spec.path
+        )
+        moving_relative_roots = tuple(
+            sorted(item.embedded_binding.root_body_prim_path for item in embedded if item.embedded_binding is not None)
+        )
+        moving_absolute_roots = tuple(f"{root_path}/{relative}" for relative in moving_relative_roots)
+        all_body_prims = tuple(prim for prim in self._walk(root) if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI))
+        bodies = {str(prim.GetPath()): prim for prim in all_body_prims}
+        retained_bodies = {
+            path: prim
+            for path, prim in bodies.items()
+            if not any(_path_is_at_or_under(path, moving) for moving in moving_absolute_roots)
+        }
+        body_name_by_path = {path: path.removeprefix(f"{root_path}/") for path in retained_bodies}
+        if any(not name or name == path for path, name in body_name_by_path.items()):
+            raise NativePlanningError("topology_unsupported")
+        link_names = tuple(sorted(body_name_by_path.values()))
+        link_id_by_name = {name: _stable_id("link", spec.path.value, name) for name in link_names}
+        link_frame_by_name = {name: _stable_id("frame.link", spec.path.value, name) for name in link_names}
+        geometry_by_link: dict[str | None, list[PlanningGeometryDescriptor]] = {
+            None: [],
+            **{name: [] for name in link_names},
+        }
+        for prim in self._walk(root):
+            if prim.IsA(self._m.UsdPhysics.Joint):
+                self._accounted_constraints.add(str(prim.GetPath()))
+            if not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
+                continue
+            collision = self._m.UsdPhysics.CollisionAPI(prim)
+            if collision.GetCollisionEnabledAttr().Get() is False:
+                continue
+            path = str(prim.GetPath())
+            if any(_path_is_at_or_under(path, moving) for moving in moving_absolute_roots):
+                continue
+            owner_path = _nearest_body(path, bodies)
+            if owner_path is None:
+                owner_name = None
+                owner_prim = root
+                motion = PlanningGeometryMotionClass.STATIC
+            else:
+                if owner_path not in retained_bodies:
+                    raise NativePlanningError("catalog_invalid")
+                owner_name = body_name_by_path[owner_path]
+                owner_prim = retained_bodies[owner_path]
+                motion = _motion_class(self._m, owner_prim)
+            collision_geometries = self._collision_geometry(
+                spec,
+                entity_id,
+                prim,
+                owner_prim,
+                None if owner_name is None else link_id_by_name[owner_name],
+                entity_frame_id if owner_name is None else link_frame_by_name[owner_name],
+                motion=motion,
+            )
+            geometry_by_link[owner_name].extend(collision_geometries)
+            for geometry in collision_geometries:
+                self._geometries[geometry.geometry_id] = _GeometryBinding(geometry, spec.path, owner_name)
+            self._accounted_colliders.add(path)
+        self._accounted_bodies.update(retained_bodies)
+
+        frame_descriptors = [
+            PlanningFrameDescriptor(entity_frame_id, PlanningFrameKind.ENTITY, _WORLD_FRAME_ID, entity_id, None)
+        ]
+        link_descriptors: list[PlanningLinkDescriptor] = []
+        for name in link_names:
+            geometry_ids = tuple(sorted(item.geometry_id for item in geometry_by_link[name]))
+            link_descriptors.append(
+                PlanningLinkDescriptor(
+                    link_id_by_name[name],
+                    entity_id,
+                    name,
+                    link_frame_by_name[name],
+                    None,
+                    geometry_ids,
+                )
+            )
+            frame_descriptors.append(
+                PlanningFrameDescriptor(
+                    link_frame_by_name[name],
+                    PlanningFrameKind.LINK,
+                    entity_frame_id,
+                    entity_id,
+                    link_id_by_name[name],
+                )
+            )
+            self._frames[link_frame_by_name[name]] = _FrameBinding(link_frame_by_name[name], spec.path, "link", name)
+        self._frames[entity_frame_id] = _FrameBinding(
+            entity_frame_id,
+            spec.path,
+            "static_entity",
+            _COMPOSITE_ENTITY_POSE,
+        )
+        if parse_planning_frame_declarations(spec.metadata.get("planning_frame_declarations")) is not None:
+            raise NativePlanningError("frame_ambiguous")
+
+        reference_names = tuple(sorted(body_name_by_path.values()))
+        tensor_rows: list[dict[str, str]] = []
+        static_poses: list[dict[str, PlanningPose]] = []
+        cache = self._m.UsdGeom.XformCache()
+        for environment_index in range(self._world._spec.environments.count):
+            environment_root = self._entity_root(spec, environment_index)
+            environment_root_path = str(environment_root.GetPath())
+            row = {
+                str(prim.GetPath()).removeprefix(f"{environment_root_path}/"): str(prim.GetPath())
+                for prim in self._walk(environment_root)
+                if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                and not any(
+                    _path_is_at_or_under(
+                        str(prim.GetPath()),
+                        f"{environment_root_path}/{relative}",
+                    )
+                    for relative in moving_relative_roots
+                )
+            }
+            if tuple(sorted(row)) != reference_names:
+                raise NativePlanningError("topology_unsupported")
+            tensor_rows.append(row)
+            root_local, root_scale = _matrix_local_pose(self._m, cache.GetLocalToWorldTransform(environment_root))
+            if any(abs(value - 1.0) > 1.0e-8 for value in root_scale):
+                raise NativePlanningError("collision_geometry_unsupported")
+            origin = self._world._origins_cpu[environment_index]
+            static_poses.append(
+                {
+                    _COMPOSITE_ENTITY_POSE: PlanningPose(
+                        _WORLD_FRAME_ID,
+                        tuple(root_local.position_m[axis] - origin[axis] for axis in range(3)),  # type: ignore[arg-type]
+                        root_local.orientation_xyzw,
+                    )
+                }
+            )
+        tensor_binding = self._tensor_body_binding(tuple(tensor_rows)) if reference_names else None
+        entity_geometries = tuple(
+            sorted(
+                (geometry for values in geometry_by_link.values() for geometry in values),
+                key=lambda item: item.geometry_id,
+            )
+        )
+        entity_frames = tuple(sorted(frame_descriptors, key=lambda item: item.frame_id))
+        entity_links = tuple(sorted(link_descriptors, key=lambda item: item.link_id))
+        entity = PlanningEntityDescriptor(
+            entity_id,
+            spec.path.value,
+            PlanningEntityKind(spec.metadata.get("planning_entity_kind", "other")),
+            True,
+            entity_frame_id,
+            tuple(item.link_id for item in entity_links),
+            tuple(item.frame_id for item in entity_frames),
+            tuple(item.geometry_id for item in entity_geometries),
+        )
+        return (
+            entity,
+            entity_links,
+            (),
+            entity_frames,
+            entity_geometries,
+            _EntityBinding(
+                spec.path,
+                entity_id,
+                _COMPOSITE_ENTITY_POSE,
+                "",
+                link_id_by_name,
+                (),
+                "tensor",
+                tensor_binding,
+                tuple(static_poses),
+            ),
+        )
+
+    def _embedded_entity_catalog(
+        self,
+        spec: Any,
+    ) -> tuple[
+        PlanningEntityDescriptor,
+        tuple[PlanningLinkDescriptor, ...],
+        tuple[PlanningJointDescriptor, ...],
+        tuple[PlanningFrameDescriptor, ...],
+        tuple[PlanningGeometryDescriptor, ...],
+        _EntityBinding,
+    ]:
+        binding = spec.embedded_binding
+        if binding is None:
+            raise NativePlanningError("catalog_invalid")
+        container_spec = next(
+            (
+                item
+                for item in self._world._spec.entities
+                if item.path == binding.container_path and item.kind is EntityKind.COMPOSITE_SCENE
+            ),
+            None,
+        )
+        if container_spec is None:
+            raise NativePlanningError("catalog_invalid")
+        root = self._entity_root(container_spec, 0)
+        root_path = str(root.GetPath())
+        entity_id = _stable_id("entity", spec.path.value)
+        entity_frame_id = _stable_id("frame.entity", spec.path.value)
+        logical_by_path = {f"{root_path}/{item.relative_prim_path}": item.logical_name for item in binding.link_prims}
+        bodies: dict[str, Any] = {}
+        for path in logical_by_path:
+            prim = self._stage.GetPrimAtPath(path)
+            if not prim or not prim.IsValid() or not prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
+                raise NativePlanningError("topology_unsupported")
+            bodies[path] = prim
+        if len(bodies) != len(binding.link_prims):
+            raise NativePlanningError("topology_unsupported")
+        self._accounted_bodies.update(bodies)
+        link_id_by_name = {
+            item.logical_name: _stable_id("link", spec.path.value, item.relative_prim_path)
+            for item in binding.link_prims
+        }
+        link_frame_by_name = {
+            item.logical_name: _stable_id("frame.link", spec.path.value, item.relative_prim_path)
+            for item in binding.link_prims
+        }
+        joint_models: list[tuple[Any, str, str, str | None, PlanningJointType]] = []
+        for item in binding.joint_prims:
+            path = f"{root_path}/{item.relative_prim_path}"
+            prim = self._stage.GetPrimAtPath(path)
+            if not prim or not prim.IsValid():
+                raise NativePlanningError("topology_unsupported")
+            joint_type = self._joint_type(prim)
+            if joint_type is None:
+                raise NativePlanningError("constraint_unsupported")
+            joint = self._m.UsdPhysics.Joint(prim)
+            body0 = _nearest_body(_relationship_target(joint.GetBody0Rel()), bodies)
+            body1 = _nearest_body(_relationship_target(joint.GetBody1Rel()), bodies)
+            if body0 is None or body1 is None or body0 == body1:
+                raise NativePlanningError("constraint_unsupported")
+            joint_models.append((prim, logical_by_path[body0], logical_by_path[body1], item.logical_name, joint_type))
+            self._accounted_constraints.add(path)
+        child_names = {item[2] for item in joint_models}
+        root_names = tuple(sorted(set(link_id_by_name) - child_names))
+        if len(root_names) != 1:
+            raise NativePlanningError("topology_unsupported")
+        root_name = root_names[0]
+        ordered_joint_models = self._order_joints(root_name, joint_models)
+        if spec.kind is EntityKind.ARTICULATION:
+            if len(ordered_joint_models) != len(link_id_by_name) - 1:
+                raise NativePlanningError("topology_unsupported")
+            if tuple(model[3] for model in ordered_joint_models) != tuple(spec.joint_names):
+                raise NativePlanningError("topology_unsupported")
+        elif joint_models:
+            raise NativePlanningError("topology_unsupported")
+
+        moving_root = f"{root_path}/{binding.root_body_prim_path}"
+        geometry_by_link: dict[str, list[PlanningGeometryDescriptor]] = {name: [] for name in link_id_by_name}
+        for prim in self._walk(self._stage.GetPrimAtPath(moving_root)):
+            if not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
+                continue
+            collision = self._m.UsdPhysics.CollisionAPI(prim)
+            if collision.GetCollisionEnabledAttr().Get() is False:
+                continue
+            owner_path = _nearest_body(str(prim.GetPath()), bodies)
+            if owner_path is None:
+                raise NativePlanningError("catalog_invalid")
+            owner_name = logical_by_path[owner_path]
+            collision_geometries = self._collision_geometry(
+                spec,
+                entity_id,
+                prim,
+                bodies[owner_path],
+                link_id_by_name[owner_name],
+                link_frame_by_name[owner_name],
+                source_spec=container_spec,
+            )
+            geometry_by_link[owner_name].extend(collision_geometries)
+            for geometry in collision_geometries:
+                self._geometries[geometry.geometry_id] = _GeometryBinding(geometry, spec.path, owner_name)
+            self._accounted_colliders.add(str(prim.GetPath()))
+
+        frame_descriptors: list[PlanningFrameDescriptor] = [
+            PlanningFrameDescriptor(entity_frame_id, PlanningFrameKind.ENTITY, _WORLD_FRAME_ID, entity_id, None)
+        ]
+        joint_bindings: list[_JointBinding] = []
+        parent_name_by_child = {model[2]: model[1] for model in ordered_joint_models}
+        joint_frame_by_child: dict[str, str] = {}
+        joint_descriptors: list[PlanningJointDescriptor] = []
+        for prim, parent_name, child_name, movable, joint_type in ordered_joint_models:
+            joint_id = _stable_id("joint", spec.path.value, str(prim.GetPath()).removeprefix(root_path))
+            joint_frame_id = _stable_id("frame.joint", spec.path.value, str(prim.GetPath()).removeprefix(root_path))
+            joint_frame_by_child[child_name] = joint_frame_id
+            local_pose = self._joint_local_pose(prim)
+            descriptor = self._joint_descriptor(
+                prim,
+                joint_id,
+                entity_id,
+                link_id_by_name[parent_name],
+                link_id_by_name[child_name],
+                joint_frame_id,
+                joint_type,
+                authored_name=movable,
+            )
+            joint_descriptors.append(descriptor)
+            joint_bindings.append(_JointBinding(descriptor, parent_name, child_name, local_pose, movable))
+            frame_descriptors.append(
+                PlanningFrameDescriptor(
+                    joint_frame_id,
+                    PlanningFrameKind.JOINT,
+                    link_frame_by_name[parent_name],
+                    entity_id,
+                    link_id_by_name[child_name],
+                )
+            )
+            self._frames[joint_frame_id] = _FrameBinding(joint_frame_id, spec.path, "joint_id", joint_id, local_pose)
+        link_descriptors: list[PlanningLinkDescriptor] = []
+        for name in sorted(link_id_by_name):
+            parent_of_link = parent_name_by_child.get(name)
+            frame_id = link_frame_by_name[name]
+            link_descriptors.append(
+                PlanningLinkDescriptor(
+                    link_id_by_name[name],
+                    entity_id,
+                    name,
+                    frame_id,
+                    None if parent_of_link is None else link_id_by_name[parent_of_link],
+                    tuple(sorted(item.geometry_id for item in geometry_by_link[name])),
+                )
+            )
+            frame_descriptors.append(
+                PlanningFrameDescriptor(
+                    frame_id,
+                    PlanningFrameKind.LINK,
+                    entity_frame_id if parent_of_link is None else joint_frame_by_child[name],
+                    entity_id,
+                    link_id_by_name[name],
+                )
+            )
+            self._frames[frame_id] = _FrameBinding(frame_id, spec.path, "link", name)
+        self._frames[entity_frame_id] = _FrameBinding(entity_frame_id, spec.path, "entity", root_name)
+        if parse_planning_frame_declarations(spec.metadata.get("planning_frame_declarations")) is not None:
+            raise NativePlanningError("frame_ambiguous")
+
+        tensor_rows = tuple(
+            {
+                item.logical_name: (
+                    f"{self._entity_root(container_spec, environment_index).GetPath()}/{item.relative_prim_path}"
+                )
+                for item in binding.link_prims
+            }
+            for environment_index in range(self._world._spec.environments.count)
+        )
+        tensor_binding = self._tensor_body_binding(tensor_rows)
+        entity_geometries = tuple(
+            sorted(
+                (geometry for values in geometry_by_link.values() for geometry in values),
+                key=lambda item: item.geometry_id,
+            )
+        )
+        entity_frames = tuple(sorted(frame_descriptors, key=lambda item: item.frame_id))
+        entity_links = tuple(sorted(link_descriptors, key=lambda item: item.link_id))
+        entity = PlanningEntityDescriptor(
+            entity_id,
+            spec.path.value,
+            self._entity_kind(spec),
+            True,
+            entity_frame_id,
+            tuple(item.link_id for item in entity_links),
+            tuple(item.frame_id for item in entity_frames),
+            tuple(item.geometry_id for item in entity_geometries),
+            tuple(item.joint_id for item in joint_descriptors),
+        )
+        return (
+            entity,
+            entity_links,
+            tuple(joint_descriptors),
+            entity_frames,
+            entity_geometries,
+            _EntityBinding(
+                spec.path,
+                entity_id,
+                root_name,
+                link_id_by_name[root_name],
+                link_id_by_name,
+                tuple(joint_bindings),
+                "usd_articulation" if spec.kind is EntityKind.ARTICULATION else "tensor",
+                tensor_binding,
+            ),
+        )
+
     def _entity_kind(self, spec: Any) -> PlanningEntityKind:
         locked = spec.metadata.get("planning_entity_kind")
         if locked is not None:
@@ -727,12 +1685,15 @@ class _PlanningAdmission:
         child_link_id: str,
         frame_id: str,
         joint_type: PlanningJointType,
+        *,
+        authored_name: str | None = None,
     ) -> PlanningJointDescriptor:
+        public_name = prim.GetName() if authored_name is None else authored_name
         if joint_type is PlanningJointType.FIXED:
             return PlanningJointDescriptor(
                 joint_id,
                 entity_id,
-                prim.GetName(),
+                public_name,
                 parent_link_id,
                 child_link_id,
                 joint_type,
@@ -761,7 +1722,7 @@ class _PlanningAdmission:
         return PlanningJointDescriptor(
             joint_id,
             entity_id,
-            prim.GetName(),
+            public_name,
             parent_link_id,
             child_link_id,
             joint_type,
@@ -777,20 +1738,20 @@ class _PlanningAdmission:
         if collision.GetCollisionEnabledAttr().Get() is False:
             raise NativePlanningError("catalog_invalid")
         applied = set(prim.GetAppliedSchemas())
-        allowed = {
-            "PhysicsCollisionAPI",
-            "PhysicsMeshCollisionAPI",
-            "PhysxContactReportAPI",
-        }
         unexpected = {
             schema
             for schema in applied
-            if ("Collision" in schema or "FilteredPairs" in schema) and schema not in allowed
+            if ("Collision" in schema or "FilteredPairs" in schema)
+            and schema not in _SUPPORTED_COLLISION_SCHEMAS
         }
         if unexpected:
             raise NativePlanningError("collision_geometry_unsupported")
         filtered = self._m.UsdPhysics.FilteredPairsAPI(prim)
-        if filtered and tuple(filtered.GetFilteredPairsRel().GetTargets()):
+        if (
+            filtered
+            and tuple(filtered.GetFilteredPairsRel().GetTargets())
+            and str(prim.GetPath()) not in self._accounted_filtered_pair_sources
+        ):
             raise NativePlanningError("collision_filter_unsupported")
         physx = self._m.PhysxSchema.PhysxCollisionAPI(prim)
         if physx:
@@ -806,163 +1767,335 @@ class _PlanningAdmission:
         entity_id: str,
         prim: Any,
         owner_body: Any,
-        owner_link_id: str,
+        owner_link_id: str | None,
         owner_frame_id: str,
-    ) -> PlanningGeometryDescriptor:
+        *,
+        motion: PlanningGeometryMotionClass | None = None,
+        source_spec: Any | None = None,
+        collision_group: int = _DEFAULT_COLLISION_GROUP,
+        collision_mask: int = _DEFAULT_COLLISION_MASK,
+        collision_filter_graph_sha256: str | None = None,
+        collision_filter_distinct_pairs_sha256: str | None = None,
+        collision_filter_pair_count: int = 0,
+        collision_filter_self_owner_count: int = 0,
+        enabled_self_collisions: bool = True,
+    ) -> tuple[PlanningGeometryDescriptor, ...]:
         self._validate_collision_common(prim)
         cache = self._m.UsdGeom.XformCache()
         matrix, resets = cache.ComputeRelativeTransform(prim, owner_body)
         if resets:
             raise NativePlanningError("collision_geometry_unsupported")
-        local_pose, scale = _matrix_local_pose(self._m, matrix)
+        mesh_capable = not any(
+            prim.IsA(schema)
+            for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
+        )
+        local_pose, scale, reflection, baked_linear = _collision_pose_scale_bake(
+            self._m,
+            matrix,
+            mesh_capable=mesh_capable,
+        )
         geometry_id = _stable_id("geometry", spec.path.value, str(prim.GetPath()))
-        motion = _motion_class(self._m, owner_body)
-        source_sha = self._source_sha256(spec)
+        motion = _motion_class(self._m, owner_body) if motion is None else motion
+        source_spec = spec if source_spec is None else source_spec
+        source_sha = self._source_sha256(source_spec)
         common = {
             "adapter": _PROVENANCE_PROFILE,
             "source_sha256": source_sha,
-            "native_path": str(prim.GetPath()).removeprefix(f"/World/env_0/{_native_name(spec.path)}"),
+            "native_path": str(prim.GetPath()).removeprefix(f"/World/env_0/{_native_name(source_spec.path)}"),
             "applied_schemas": sorted(prim.GetAppliedSchemas()),
             "local_pose": [local_pose.position_m, local_pose.orientation_xyzw],
             "scale": scale,
+            "baked_reflection": reflection,
+            "baked_linear_transform": baked_linear,
+            "collision_filter_profile": _COLLISION_FILTER_PROFILE,
+            "collision_filter_graph_sha256": collision_filter_graph_sha256,
+            "collision_filter_distinct_owner_pairs_sha256": collision_filter_distinct_pairs_sha256,
+            "collision_filter_distinct_owner_pair_count": collision_filter_pair_count,
+            "collision_filter_self_owner_count": collision_filter_self_owner_count,
+            "collision_group": collision_group,
+            "collision_mask": collision_mask,
+            "enabled_self_collisions": enabled_self_collisions,
         }
         if prim.IsA(self._m.UsdGeom.Cube):
             size = float(self._m.UsdGeom.Cube(prim).GetSizeAttr().Get())
             if not math.isfinite(size) or size <= 0.0:
                 raise NativePlanningError("collision_geometry_unsupported")
             inline = PlanningPrimitiveGeometry(PlanningGeometryRepresentation.BOX, (size, size, size))
-            return PlanningGeometryDescriptor(
-                geometry_id,
-                entity_id,
-                owner_link_id,
-                owner_frame_id,
-                PlanningGeometryPurpose.COLLISION,
-                PlanningGeometryRepresentation.BOX,
-                local_pose,
-                scale,
-                motion,
-                _DEFAULT_COLLISION_GROUP,
-                _DEFAULT_COLLISION_MASK,
-                _json_sha256({**common, "representation": "box", "dimensions": inline.dimensions_m}),
-                inline=inline,
+            return (
+                PlanningGeometryDescriptor(
+                    geometry_id,
+                    entity_id,
+                    owner_link_id,
+                    owner_frame_id,
+                    PlanningGeometryPurpose.COLLISION,
+                    PlanningGeometryRepresentation.BOX,
+                    local_pose,
+                    scale,
+                    motion,
+                    collision_group,
+                    collision_mask,
+                    _json_sha256({**common, "representation": "box", "dimensions": inline.dimensions_m}),
+                    inline=inline,
+                ),
             )
         if prim.IsA(self._m.UsdGeom.Sphere):
             radius = float(self._m.UsdGeom.Sphere(prim).GetRadiusAttr().Get())
             if not math.isfinite(radius) or radius <= 0.0:
                 raise NativePlanningError("collision_geometry_unsupported")
             inline = PlanningPrimitiveGeometry(PlanningGeometryRepresentation.SPHERE, (radius,))
-            return PlanningGeometryDescriptor(
-                geometry_id,
-                entity_id,
-                owner_link_id,
-                owner_frame_id,
-                PlanningGeometryPurpose.COLLISION,
-                PlanningGeometryRepresentation.SPHERE,
-                local_pose,
-                scale,
-                motion,
-                _DEFAULT_COLLISION_GROUP,
-                _DEFAULT_COLLISION_MASK,
-                _json_sha256({**common, "representation": "sphere", "dimensions": inline.dimensions_m}),
-                inline=inline,
+            return (
+                PlanningGeometryDescriptor(
+                    geometry_id,
+                    entity_id,
+                    owner_link_id,
+                    owner_frame_id,
+                    PlanningGeometryPurpose.COLLISION,
+                    PlanningGeometryRepresentation.SPHERE,
+                    local_pose,
+                    scale,
+                    motion,
+                    collision_group,
+                    collision_mask,
+                    _json_sha256({**common, "representation": "sphere", "dimensions": inline.dimensions_m}),
+                    inline=inline,
+                ),
+            )
+        if prim.IsA(self._m.UsdGeom.Cylinder):
+            cylinder = self._m.UsdGeom.Cylinder(prim)
+            radius = float(cylinder.GetRadiusAttr().Get())
+            height = float(cylinder.GetHeightAttr().Get())
+            axis = str(cylinder.GetAxisAttr().Get() or "Z").upper()
+            if not math.isfinite(radius) or radius <= 0.0 or not math.isfinite(height) or height <= 0.0:
+                raise NativePlanningError("collision_geometry_unsupported")
+            cylinder_pose, cylinder_scale = _cylinder_pose_scale(local_pose, scale, axis)
+            inline = PlanningPrimitiveGeometry(PlanningGeometryRepresentation.CYLINDER, (radius, height))
+            return (
+                PlanningGeometryDescriptor(
+                    geometry_id,
+                    entity_id,
+                    owner_link_id,
+                    owner_frame_id,
+                    PlanningGeometryPurpose.COLLISION,
+                    PlanningGeometryRepresentation.CYLINDER,
+                    cylinder_pose,
+                    cylinder_scale,
+                    motion,
+                    collision_group,
+                    collision_mask,
+                    _json_sha256(
+                        {
+                            **common,
+                            "representation": "cylinder",
+                            "dimensions": inline.dimensions_m,
+                            "axis": axis,
+                            "canonical_axis": "Z",
+                        }
+                    ),
+                    inline=inline,
+                ),
             )
 
         mesh_api = self._m.UsdPhysics.MeshCollisionAPI(prim)
         approximation = str(mesh_api.GetApproximationAttr().Get()) if mesh_api else ""
-        if approximation != "convexHull":
+        if approximation not in {
+            "boundingCube",
+            "convexHull",
+            "convexDecomposition",
+            "meshSimplification",
+            "sdf",
+            "none",
+        }:
             raise NativePlanningError("collision_geometry_unsupported")
-        content, vertex_count, triangle_count, input_sha = self._cook_exact_convex(prim)
-        if len(content) > _MAX_GEOMETRY_RESOURCE_BYTES:
-            raise NativePlanningError("collision_cooking_failed")
-        digest = hashlib.sha256(content).hexdigest()
-        layout = PlanningGeometryResourceLayout(
-            PlanningGeometryRepresentation.CONVEX_MESH,
-            PlanningGeometryContentProfile.MESH_TRIANGLES_RAW_LE_V1,
-            PlanningGeometryDType.FLOAT32,
-            (vertex_count, 3),
-            PlanningGeometryDType.UINT32,
-            (triangle_count, 3),
-        )
-        provenance = _json_sha256(
-            {
-                **common,
-                "representation": "convex_mesh",
-                "approximation": approximation,
-                "cooked_sha256": digest,
-                "cooking_input_sha256": input_sha,
-                "canonicalization": "float32-le-vertices-then-uint32-le-triangles-v1",
-            }
-        )
-        descriptor = PlanningGeometryDescriptor(
-            geometry_id,
-            entity_id,
-            owner_link_id,
-            owner_frame_id,
-            PlanningGeometryPurpose.COLLISION,
-            PlanningGeometryRepresentation.CONVEX_MESH,
-            local_pose,
-            scale,
-            motion,
-            _DEFAULT_COLLISION_GROUP,
-            _DEFAULT_COLLISION_MASK,
-            provenance,
-            resource_id=_stable_id("resource", spec.path.value, str(prim.GetPath()), digest),
-            sha256=digest,
-            content_profile=PlanningGeometryContentProfile.MESH_TRIANGLES_RAW_LE_V1,
-            resource_layout=layout,
-        )
-        self._resources[geometry_id] = NativePlanningResource(
-            geometry_id,
-            PlanningGeometryRepresentation.CONVEX_MESH,
-            content,
-            digest,
-        )
-        return descriptor
+        mesh_input = _reflect_mesh_input(self._mesh_input(prim), reflection)
+        if baked_linear is not None:
+            mesh_input = _bake_mesh_linear_transform(mesh_input, baked_linear)
+        if approximation == "boundingCube":
+            lower = tuple(min(vertex[axis] for vertex in mesh_input.vertices) for axis in range(3))
+            upper = tuple(max(vertex[axis] for vertex in mesh_input.vertices) for axis in range(3))
+            dimensions = (upper[0] - lower[0], upper[1] - lower[1], upper[2] - lower[2])
+            if any(not math.isfinite(value) or value <= 0.0 for value in dimensions):
+                raise NativePlanningError("collision_geometry_unsupported")
+            center = (
+                (lower[0] + upper[0]) * 0.5,
+                (lower[1] + upper[1]) * 0.5,
+                (lower[2] + upper[2]) * 0.5,
+            )
+            box_pose = _compose_scaled_local_pose(local_pose, scale, center)
+            inline = PlanningPrimitiveGeometry(PlanningGeometryRepresentation.BOX, dimensions)
+            return (
+                PlanningGeometryDescriptor(
+                    geometry_id,
+                    entity_id,
+                    owner_link_id,
+                    owner_frame_id,
+                    PlanningGeometryPurpose.COLLISION,
+                    PlanningGeometryRepresentation.BOX,
+                    box_pose,
+                    scale,
+                    motion,
+                    collision_group,
+                    collision_mask,
+                    _json_sha256(
+                        {
+                            **common,
+                            "representation": "box",
+                            "approximation": approximation,
+                            "mesh_source_sha256": mesh_input.source_sha256,
+                            "bounds": [lower, upper],
+                            "center": center,
+                        }
+                    ),
+                    inline=inline,
+                ),
+            )
 
-    def _cook_exact_convex(self, carrier: Any) -> tuple[bytes, int, int, str]:
+        if approximation in {"convexHull", "convexDecomposition"}:
+            components = self._cook_convex_components(mesh_input, approximation)
+            if approximation == "convexHull" and len(components) != 1:
+                raise NativePlanningError("collision_cooking_failed")
+            representation = PlanningGeometryRepresentation.CONVEX_MESH
+        else:
+            components = (self._canonical_triangle_mesh(mesh_input),)
+            representation = PlanningGeometryRepresentation.TRIANGLE_MESH
+
+        descriptors: list[PlanningGeometryDescriptor] = []
+        for component_index, (content, vertex_count, triangle_count) in enumerate(components):
+            if len(content) > _MAX_GEOMETRY_RESOURCE_BYTES:
+                raise NativePlanningError("collision_cooking_failed")
+            digest = hashlib.sha256(content).hexdigest()
+            component_geometry_id = (
+                geometry_id
+                if len(components) == 1
+                else _stable_id("geometry", spec.path.value, str(prim.GetPath()), f"component:{component_index}")
+            )
+            layout = PlanningGeometryResourceLayout(
+                representation,
+                PlanningGeometryContentProfile.MESH_TRIANGLES_RAW_LE_V1,
+                PlanningGeometryDType.FLOAT32,
+                (vertex_count, 3),
+                PlanningGeometryDType.UINT32,
+                (triangle_count, 3),
+            )
+            provenance = _json_sha256(
+                {
+                    **common,
+                    "representation": representation.value,
+                    "approximation": approximation,
+                    "mesh_source_sha256": mesh_input.source_sha256,
+                    "component_index": component_index,
+                    "component_count": len(components),
+                    "content_sha256": digest,
+                    "canonicalization": _MESH_CANONICALIZATION,
+                }
+            )
+            descriptor = PlanningGeometryDescriptor(
+                component_geometry_id,
+                entity_id,
+                owner_link_id,
+                owner_frame_id,
+                PlanningGeometryPurpose.COLLISION,
+                representation,
+                local_pose,
+                scale,
+                motion,
+                collision_group,
+                collision_mask,
+                provenance,
+                resource_id=_stable_id("resource", representation.value, digest),
+                sha256=digest,
+                content_profile=PlanningGeometryContentProfile.MESH_TRIANGLES_RAW_LE_V1,
+                resource_layout=layout,
+            )
+            self._resources[component_geometry_id] = NativePlanningResource(
+                component_geometry_id,
+                representation,
+                content,
+                digest,
+            )
+            descriptors.append(descriptor)
+        return tuple(descriptors)
+
+    def _mesh_input(self, carrier: Any) -> _MeshInput:
         mesh_prim = single_exact_convex_mesh(self._m, carrier, self._walk(carrier))
         mesh = self._m.UsdGeom.Mesh(mesh_prim)
         points = tuple(mesh.GetPointsAttr().Get() or ())
         counts = tuple(int(value) for value in (mesh.GetFaceVertexCountsAttr().Get() or ()))
         indices = tuple(int(value) for value in (mesh.GetFaceVertexIndicesAttr().Get() or ()))
-        if (
-            not points
-            or not counts
-            or sum(counts) != len(indices)
-            or not any(count >= 3 for count in counts)
-            or any(count in {1, 2} for count in counts)
-        ):
+        if not points:
             raise NativePlanningError("collision_cooking_failed")
         matrix, resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(mesh_prim, carrier)
         if resets:
             raise NativePlanningError("collision_cooking_failed")
         transformed = tuple(matrix.Transform(point) for point in points)
-        vertices = tuple(_float_tuple(point, 3) for point in transformed)
-        if any(index < 0 or index >= len(vertices) for index in indices):
-            raise NativePlanningError("collision_cooking_failed")
+        vertices = tuple(
+            (float(value[0]), float(value[1]), float(value[2]))
+            for value in (_float_tuple(point, 3) for point in transformed)
+        )
+        orientation = str(mesh.GetOrientationAttr().Get() or "rightHanded")
+        hole_faces = tuple(int(value) for value in (mesh.GetHoleIndicesAttr().Get() or ()))
+        triangles = _triangulate_faces(
+            counts,
+            indices,
+            vertex_count=len(vertices),
+            orientation=orientation,
+            hole_faces=frozenset(hole_faces),
+        )
         input_sha = _json_sha256(
             {
                 "vertices": vertices,
                 "face_counts": counts,
                 "face_indices": indices,
+                "hole_faces": hole_faces,
                 "subdivision": str(mesh.GetSubdivisionSchemeAttr().Get() or "none"),
-                "orientation": str(mesh.GetOrientationAttr().Get() or "rightHanded"),
+                "orientation": orientation,
             }
         )
+        return _MeshInput(
+            vertices,
+            counts,
+            indices,
+            triangles,
+            hole_faces,
+            str(mesh.GetSubdivisionSchemeAttr().Get() or "none"),
+            orientation,
+            input_sha,
+        )
+
+    def _canonical_triangle_mesh(self, mesh_input: _MeshInput) -> tuple[bytes, int, int]:
+        cached = self._triangle_cache.get(mesh_input.source_sha256)
+        if cached is not None:
+            return cached
+        vertex_bytes = b"".join(struct.pack("<fff", *vertex) for vertex in mesh_input.vertices)
+        index_bytes = b"".join(struct.pack("<III", *triangle) for triangle in mesh_input.triangles)
+        result = (vertex_bytes + index_bytes, len(mesh_input.vertices), len(mesh_input.triangles))
+        self._triangle_cache[mesh_input.source_sha256] = result
+        return result
+
+    def _cook_convex_components(
+        self,
+        mesh_input: _MeshInput,
+        approximation: str,
+    ) -> tuple[tuple[bytes, int, int], ...]:
+        cache_key = (approximation, mesh_input.source_sha256)
+        cached = self._convex_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         import omni.physx  # type: ignore[import-not-found]
         from pxr import PhysicsSchemaTools, Usd, UsdGeom, UsdPhysics, UsdUtils, Vt  # type: ignore[import-not-found]
 
         temporary = Usd.Stage.CreateInMemory()
         clone = UsdGeom.Mesh.Define(temporary, "/collision")
-        clone.GetPointsAttr().Set(Vt.Vec3fArray(vertices))
-        clone.GetFaceVertexCountsAttr().Set(Vt.IntArray(counts))
-        clone.GetFaceVertexIndicesAttr().Set(Vt.IntArray(indices))
+        clone.GetPointsAttr().Set(Vt.Vec3fArray(mesh_input.vertices))
+        clone.GetFaceVertexCountsAttr().Set(Vt.IntArray(mesh_input.face_counts))
+        clone.GetFaceVertexIndicesAttr().Set(Vt.IntArray(mesh_input.face_indices))
+        if mesh_input.hole_faces:
+            clone.GetHoleIndicesAttr().Set(Vt.IntArray(mesh_input.hole_faces))
         clone.GetSubdivisionSchemeAttr().Set("none")
-        clone.GetOrientationAttr().Set(str(mesh.GetOrientationAttr().Get() or "rightHanded"))
+        clone.GetOrientationAttr().Set(mesh_input.orientation)
         UsdPhysics.CollisionAPI.Apply(clone.GetPrim())
         mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(clone.GetPrim())
-        mesh_collision.GetApproximationAttr().Set("convexHull")
+        mesh_collision.GetApproximationAttr().Set(approximation)
         cache = UsdUtils.StageCache.Get()
         stage_id_object = cache.Insert(temporary)
         result_values: list[object] = []
@@ -981,29 +2114,34 @@ class _PlanningAdmission:
             )
         finally:
             cache.Erase(stage_id_object)
-        if len(result_values) != 1 or "RESULT_VALID" not in repr(result_values[0]) or len(convex_values) != 1:
+        if len(result_values) != 1 or "RESULT_VALID" not in repr(result_values[0]) or not convex_values:
             raise NativePlanningError("collision_cooking_failed")
-        cooked: Any = convex_values[0]
-        cooked_vertices = tuple(_float_tuple(value, 3) for value in cooked.vertices)
-        cooked_indices = tuple(int(value) for value in cooked.indices)
-        triangles: list[tuple[int, int, int]] = []
-        for polygon in cooked.polygons:
-            start = int(polygon.index_base)
-            count = int(polygon.num_vertices)
-            polygon_indices = cooked_indices[start : start + count]
-            if count < 3 or len(polygon_indices) != count:
+        components: list[tuple[bytes, int, int]] = []
+        for cooked_value in convex_values:
+            cooked: Any = cooked_value
+            cooked_vertices = tuple(_float_tuple(value, 3) for value in cooked.vertices)
+            cooked_indices = tuple(int(value) for value in cooked.indices)
+            triangles: list[tuple[int, int, int]] = []
+            for polygon in cooked.polygons:
+                start = int(polygon.index_base)
+                count = int(polygon.num_vertices)
+                polygon_indices = cooked_indices[start : start + count]
+                if count < 3 or len(polygon_indices) != count:
+                    raise NativePlanningError("collision_cooking_failed")
+                for offset in range(1, count - 1):
+                    triangles.append((polygon_indices[0], polygon_indices[offset], polygon_indices[offset + 1]))
+            if (
+                not cooked_vertices
+                or not triangles
+                or any(index < 0 or index >= len(cooked_vertices) for triangle in triangles for index in triangle)
+            ):
                 raise NativePlanningError("collision_cooking_failed")
-            for offset in range(1, count - 1):
-                triangles.append((polygon_indices[0], polygon_indices[offset], polygon_indices[offset + 1]))
-        if (
-            not cooked_vertices
-            or not triangles
-            or any(index < 0 or index >= len(cooked_vertices) for triangle in triangles for index in triangle)
-        ):
-            raise NativePlanningError("collision_cooking_failed")
-        vertex_bytes = b"".join(struct.pack("<fff", *vertex) for vertex in cooked_vertices)
-        index_bytes = b"".join(struct.pack("<III", *triangle) for triangle in triangles)
-        return vertex_bytes + index_bytes, len(cooked_vertices), len(triangles), input_sha
+            vertex_bytes = b"".join(struct.pack("<fff", *vertex) for vertex in cooked_vertices)
+            index_bytes = b"".join(struct.pack("<III", *triangle) for triangle in triangles)
+            components.append((vertex_bytes + index_bytes, len(cooked_vertices), len(triangles)))
+        result = tuple(sorted(components, key=lambda item: (hashlib.sha256(item[0]).digest(), item[0])))
+        self._convex_cache[cache_key] = result
+        return result
 
     def _declared_frames(
         self,
@@ -1159,37 +2297,63 @@ class _PlanningAdmission:
             result[relative] = prim
         return result
 
-    def _collision_clone_signature(self, prim: Any, owner_body: Any, root_path: str) -> tuple[object, ...]:
+    def _collision_clone_signature(
+        self,
+        prim: Any,
+        owner_body: Any,
+        root_path: str,
+        *,
+        motion: PlanningGeometryMotionClass | None = None,
+    ) -> tuple[object, ...]:
         self._validate_collision_common(prim)
         matrix, resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(prim, owner_body)
         if resets:
             raise NativePlanningError("collision_geometry_unsupported")
-        local_pose, scale = _matrix_local_pose(self._m, matrix)
+        mesh_capable = not any(
+            prim.IsA(schema)
+            for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
+        )
+        local_pose, scale, reflection, baked_linear = _collision_pose_scale_bake(
+            self._m,
+            matrix,
+            mesh_capable=mesh_capable,
+        )
         common: tuple[object, ...] = (
             self._prim_signature(prim, root_path),
             local_pose,
             scale,
-            _motion_class(self._m, owner_body),
+            reflection,
+            baked_linear,
+            _motion_class(self._m, owner_body) if motion is None else motion,
         )
         if prim.IsA(self._m.UsdGeom.Cube):
             return (*common, "box", float(self._m.UsdGeom.Cube(prim).GetSizeAttr().Get()))
         if prim.IsA(self._m.UsdGeom.Sphere):
             return (*common, "sphere", float(self._m.UsdGeom.Sphere(prim).GetRadiusAttr().Get()))
+        if prim.IsA(self._m.UsdGeom.Cylinder):
+            cylinder = self._m.UsdGeom.Cylinder(prim)
+            return (
+                *common,
+                "cylinder",
+                float(cylinder.GetRadiusAttr().Get()),
+                float(cylinder.GetHeightAttr().Get()),
+                str(cylinder.GetAxisAttr().Get() or "Z").upper(),
+            )
         mesh_api = self._m.UsdPhysics.MeshCollisionAPI(prim)
         approximation = str(mesh_api.GetApproximationAttr().Get()) if mesh_api else ""
-        if approximation != "convexHull":
+        if approximation not in {
+            "boundingCube",
+            "convexHull",
+            "convexDecomposition",
+            "meshSimplification",
+            "sdf",
+            "none",
+        }:
             raise NativePlanningError("collision_geometry_unsupported")
-        mesh = single_exact_convex_mesh(self._m, prim, self._walk(prim))
-        child_matrix, child_resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(mesh, prim)
-        if child_resets:
-            raise NativePlanningError("collision_cooking_failed")
-        child_pose, child_scale = _matrix_local_pose(self._m, child_matrix)
-        mesh_source: object
-        if mesh.IsInstanceProxy():
-            mesh_source = ("prototype", str(mesh.GetPrimInPrototype().GetPath()))
-        else:
-            mesh_source = ("authored", self._prim_signature(mesh, root_path))
-        return (*common, "convexHull", child_pose, child_scale, mesh_source)
+        mesh_input = _reflect_mesh_input(self._mesh_input(prim), reflection)
+        if baked_linear is not None:
+            mesh_input = _bake_mesh_linear_transform(mesh_input, baked_linear)
+        return (*common, approximation, mesh_input.source_sha256)
 
     def _verify_declared_clone_frames(self, spec: Any, reference_root: Any, clone_root: Any) -> None:
         declarations = parse_planning_frame_declarations(spec.metadata.get("planning_frame_declarations"))
@@ -1252,7 +2416,7 @@ class _PlanningAdmission:
 
     def _verify_cloned_environments(self) -> None:
         for spec in self._world._spec.entities:
-            if spec.kind is EntityKind.CAMERA_SENSOR:
+            if spec.kind is EntityKind.CAMERA_SENSOR or spec.embedded_binding is not None:
                 continue
             reference_root = self._entity_root(spec, 0)
             reference_prims = self._walk(reference_root)
@@ -1298,6 +2462,9 @@ class _PlanningAdmission:
                     ):
                         raise NativePlanningError("topology_unsupported")
                     self._accounted_bodies.add(str(clone.GetPath()))
+                    reference_path = str(reference.GetPath())
+                    if reference_path in self._accounted_filtered_pair_sources:
+                        self._accounted_filtered_pair_sources.add(str(clone.GetPath()))
                 for relative, reference in reference_colliders.items():
                     clone = clone_colliders[relative]
                     reference_enabled = (
@@ -1310,26 +2477,42 @@ class _PlanningAdmission:
                         continue
                     reference_owner_path = _nearest_body(str(reference.GetPath()), reference_body_paths)
                     clone_owner_path = _nearest_body(str(clone.GetPath()), clone_body_paths)
-                    if reference_owner_path is None or clone_owner_path is None:
-                        raise NativePlanningError("catalog_invalid")
-                    if reference_body_paths[reference_owner_path] != clone_body_paths[clone_owner_path]:
+                    if (reference_owner_path is None) != (clone_owner_path is None):
                         raise NativePlanningError("topology_unsupported")
+                    if reference_owner_path is None:
+                        if spec.kind is not EntityKind.COMPOSITE_SCENE:
+                            raise NativePlanningError("catalog_invalid")
+                        reference_owner = reference_root
+                        clone_owner = clone_root
+                        motion = PlanningGeometryMotionClass.STATIC
+                    else:
+                        assert clone_owner_path is not None
+                        if reference_body_paths[reference_owner_path] != clone_body_paths[clone_owner_path]:
+                            raise NativePlanningError("topology_unsupported")
+                        reference_owner = reference_bodies[reference_body_paths[reference_owner_path]]
+                        clone_owner = clone_bodies[clone_body_paths[clone_owner_path]]
+                        motion = None
                     if self._collision_clone_signature(
                         reference,
-                        reference_bodies[reference_body_paths[reference_owner_path]],
+                        reference_owner,
                         str(reference_root.GetPath()),
+                        motion=motion,
                     ) != self._collision_clone_signature(
                         clone,
-                        clone_bodies[clone_body_paths[clone_owner_path]],
+                        clone_owner,
                         str(clone_root.GetPath()),
+                        motion=motion,
                     ):
                         raise NativePlanningError("collision_geometry_unsupported")
                     self._accounted_colliders.add(str(clone.GetPath()))
                 for relative, reference in reference_joints.items():
                     clone = clone_joints[relative]
-                    reference_type = self._joint_type(reference)
-                    clone_type = self._joint_type(clone)
-                    if reference_type is not clone_type or self._prim_signature(
+                    type_matches = (
+                        reference.GetTypeName() == clone.GetTypeName()
+                        if spec.kind is EntityKind.COMPOSITE_SCENE
+                        else self._joint_type(reference) is self._joint_type(clone)
+                    )
+                    if not type_matches or self._prim_signature(
                         reference, str(reference_root.GetPath())
                     ) != self._prim_signature(clone, str(clone_root.GetPath())):
                         raise NativePlanningError("constraint_unsupported")
@@ -1342,12 +2525,25 @@ class _PlanningAdmission:
         collision_groups = tuple(prim for prim in all_prims if prim.IsA(self._m.UsdPhysics.CollisionGroup))
         if collision_groups:
             raise NativePlanningError("collision_filter_unsupported")
+        rigid_body_paths = frozenset(
+            str(prim.GetPath()) for prim in all_prims if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+        )
         live_bodies: set[str] = set()
         live_colliders: set[str] = set()
         for prim in all_prims:
             filtered = self._m.UsdPhysics.FilteredPairsAPI(prim)
-            if filtered and tuple(filtered.GetFilteredPairsRel().GetTargets()):
-                raise NativePlanningError("collision_filter_unsupported")
+            if filtered:
+                targets = tuple(filtered.GetFilteredPairsRel().GetTargets())
+                if targets:
+                    target_prims = tuple(self._stage.GetPrimAtPath(target) for target in targets)
+                    target_paths = tuple(str(target.GetPath()) for target in target_prims if target.IsValid())
+                    if (
+                        str(prim.GetPath()) not in self._accounted_filtered_pair_sources
+                        or str(prim.GetPath()) not in rigid_body_paths
+                        or len(target_paths) != len(targets)
+                        or any(path not in rigid_body_paths for path in target_paths)
+                    ):
+                        raise NativePlanningError("collision_filter_unsupported")
             if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
                 live_bodies.add(str(prim.GetPath()))
             if prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
@@ -1369,29 +2565,46 @@ class _PlanningAdmission:
         poses: dict[tuple[EntityPath, str], PlanningPose] = {}
         twists: dict[tuple[EntityPath, str], PlanningTwist] = {}
         articulations: list[PlanningArticulationState] = []
-        entity_states: list[PlanningEntityState] = [
-            PlanningEntityState(PLANNING_SYSTEM_ENTITY_ID, _IDENTITY_POSE, _ZERO_TWIST)
-        ]
+        entity_states: list[PlanningEntityState] = []
+        if _SYSTEM_FRAME_ID in self._frames:
+            entity_states.append(PlanningEntityState(PLANNING_SYSTEM_ENTITY_ID, _IDENTITY_POSE, _ZERO_TWIST))
         link_states: list[PlanningLinkState] = []
+        entity_pose_by_path: dict[EntityPath, PlanningPose] = {}
 
         for path, binding in self._entities.items():
-            asset = self._world._articulations.get(path) or self._world._rigids.get(path)
-            if asset is None:
-                raise NativePlanningError("native_failure")
-            body_names = tuple(asset.body_names)
-            if set(body_names) != set(binding.link_id_by_name):
-                raise NativePlanningError("topology_unsupported")
-            body_poses = asset.data.body_link_pose_w.torch[environment_index].detach().cpu().tolist()
-            body_velocities = asset.data.body_link_vel_w.torch[environment_index].detach().cpu().tolist()
             origin = self._world._origins_cpu[environment_index]
-            for index, name in enumerate(body_names):
-                row = body_poses[index]
+            asset = None
+            if binding.state_source == "asset":
+                asset = self._world._articulations.get(path) or self._world._rigids.get(path)
+                if asset is None:
+                    raise NativePlanningError("native_failure")
+                body_names = tuple(asset.body_names)
+                if set(body_names) != set(binding.link_id_by_name):
+                    raise NativePlanningError("topology_unsupported")
+                body_poses = asset.data.body_link_pose_w.torch[environment_index].detach().cpu().tolist()
+                body_velocities = asset.data.body_link_vel_w.torch[environment_index].detach().cpu().tolist()
+                body_rows = {name: (body_poses[index], body_velocities[index]) for index, name in enumerate(body_names)}
+            else:
+                tensor_bodies = binding.tensor_bodies
+                if tensor_bodies is None and binding.link_id_by_name:
+                    raise NativePlanningError("native_failure")
+                if tensor_bodies is None:
+                    body_rows = {}
+                else:
+                    transforms = tensor_bodies.view.get_transforms().detach().cpu().tolist()
+                    velocities = tensor_bodies.view.get_velocities().detach().cpu().tolist()
+                    body_rows = {
+                        name: (transforms[index], velocities[index])
+                        for name, index in tensor_bodies.row_by_environment_and_name[environment_index].items()
+                    }
+                if set(body_rows) != set(binding.link_id_by_name):
+                    raise NativePlanningError("topology_unsupported")
+            for name, (row, velocity) in body_rows.items():
                 pose = PlanningPose(
                     _WORLD_FRAME_ID,
                     tuple(float(row[axis]) - origin[axis] for axis in range(3)),  # type: ignore[arg-type]
                     _xyzw(row[3:7]),
                 )
-                velocity = body_velocities[index]
                 twist = PlanningTwist(
                     _WORLD_FRAME_ID,
                     _float_tuple(velocity, 3),  # type: ignore[arg-type]
@@ -1400,10 +2613,18 @@ class _PlanningAdmission:
                 poses[path, name] = pose
                 twists[path, name] = twist
                 link_states.append(PlanningLinkState(binding.link_id_by_name[name], pose, twist))
-            root_pose = poses[path, binding.root_link_name]
-            root_twist = twists[path, binding.root_link_name]
+            if binding.static_poses:
+                root_pose = binding.static_poses[environment_index][_COMPOSITE_ENTITY_POSE]
+                root_twist = _ZERO_TWIST
+                poses[path, _COMPOSITE_ENTITY_POSE] = root_pose
+                twists[path, _COMPOSITE_ENTITY_POSE] = root_twist
+            else:
+                root_pose = poses[path, binding.root_link_name]
+                root_twist = twists[path, binding.root_link_name]
+            entity_pose_by_path[path] = root_pose
             entity_states.append(PlanningEntityState(binding.entity_id, root_pose, root_twist))
-            if path in self._world._articulations:
+            if binding.state_source == "asset" and path in self._world._articulations:
+                assert asset is not None
                 joint_names = tuple(asset.joint_names)
                 positions = asset.data.joint_pos.torch[environment_index].detach().cpu().tolist()
                 velocities = asset.data.joint_vel.torch[environment_index].detach().cpu().tolist()
@@ -1434,22 +2655,41 @@ class _PlanningAdmission:
                         tuple(units),
                     )
                 )
+            elif binding.state_source == "usd_articulation":
+                view = self._world._usd_articulation_views.get(path)
+                joint_map = self._world._joint_maps.get(path)
+                if view is None or joint_map is None or len(joint_map) != len(binding.joint_bindings):
+                    raise NativePlanningError("topology_unsupported")
+                native_positions = view.get_dof_positions()[environment_index].detach().cpu().tolist()
+                native_velocities = view.get_dof_velocities()[environment_index].detach().cpu().tolist()
+                articulations.append(
+                    PlanningArticulationState(
+                        binding.entity_id,
+                        tuple(joint.descriptor.joint_id for joint in binding.joint_bindings),
+                        tuple(float(native_positions[index]) for index in joint_map),
+                        tuple(float(native_velocities[index]) for index in joint_map),
+                        tuple(joint.descriptor.position_unit for joint in binding.joint_bindings),
+                    )
+                )
 
-        frame_poses: dict[str, PlanningPose] = {
-            _WORLD_FRAME_ID: _IDENTITY_POSE,
-            _SYSTEM_FRAME_ID: _IDENTITY_POSE,
-        }
+        frame_poses: dict[str, PlanningPose] = {_WORLD_FRAME_ID: _IDENTITY_POSE}
+        if _SYSTEM_FRAME_ID in self._frames:
+            frame_poses[_SYSTEM_FRAME_ID] = _IDENTITY_POSE
         for frame_id, frame in self._frames.items():
             if frame.entity_path is None:
                 continue
             binding = self._entities[frame.entity_path]
-            if frame.source in {"entity", "link"}:
+            if frame.source in {"entity", "link", "static_entity"}:
                 assert frame.source_name is not None
                 frame_poses[frame_id] = poses[frame.entity_path, frame.source_name]
             elif frame.source == "joint":
                 joint = next(
                     item for item in binding.joint_bindings if item.descriptor.authored_name == frame.source_name
                 )
+                parent_pose = poses[frame.entity_path, joint.parent_name]
+                frame_poses[frame_id] = _compose_pose(parent_pose, joint.local_pose)
+            elif frame.source == "joint_id":
+                joint = next(item for item in binding.joint_bindings if item.descriptor.joint_id == frame.source_name)
                 parent_pose = poses[frame.entity_path, joint.parent_name]
                 frame_poses[frame_id] = _compose_pose(parent_pose, joint.local_pose)
             elif frame.source == "native":
@@ -1465,8 +2705,9 @@ class _PlanningAdmission:
         for geometry_id, geometry_binding in sorted(self._geometries.items()):
             if geometry_binding.entity_path is None:
                 parent_pose = _IDENTITY_POSE
+            elif geometry_binding.owner_link_name is None:
+                parent_pose = entity_pose_by_path[geometry_binding.entity_path]
             else:
-                assert geometry_binding.owner_link_name is not None
                 parent_pose = poses[geometry_binding.entity_path, geometry_binding.owner_link_name]
             geometry_transforms.append(
                 PlanningGeometryTransform(

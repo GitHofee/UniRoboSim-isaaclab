@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -19,6 +21,8 @@ from unirobosim import (
     BuildResourceEntry,
     BuildResourceManifest,
     BuildSourceEntry,
+    CapabilityId,
+    CapabilityRequirement,
     CommandMode,
     EmbeddedEntityBinding,
     EmbeddedPrimBinding,
@@ -105,7 +109,7 @@ def _build_input(inventory: dict[str, Any]) -> tuple[BuildInput, Path]:
     return BuildInput(manifest=manifest, sources=tuple(sources)), selected_asset
 
 
-def _world(asset: Path, build_input: BuildInput) -> WorldSpec:
+def _world(asset: Path, build_input: BuildInput, *, planning: bool = False) -> WorldSpec:
     scene = EntitySpec(_CONTAINER, EntityKind.COMPOSITE_SCENE, asset_uri=asset.as_uri())
     door = EntitySpec(
         _DOOR,
@@ -126,12 +130,13 @@ def _world(asset: Path, build_input: BuildInput) -> WorldSpec:
     return WorldSpec(
         "scene005-composite-door-acceptance",
         (scene, door),
+        requirements=(CapabilityRequirement(CapabilityId("planning.scene@2")),) if planning else (),
         schema_version=COMPOSITE_WORLD_SCHEMA_VERSION,
         build_resource_manifest_sha256=build_input.manifest.sha256,
     )
 
 
-def run(inventory_path: Path, *, steps: int, target_rad: float) -> dict[str, Any]:
+def run(inventory_path: Path, *, steps: int, target_rad: float, planning: bool = False) -> dict[str, Any]:
     started = time.monotonic()
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
     build_input, asset = _build_input(inventory)
@@ -147,8 +152,52 @@ def run(inventory_path: Path, *, steps: int, target_rad: float) -> dict[str, Any
     )
     with provider.open() as session:
         worker_ready = time.monotonic()
-        with session.build(_world(asset, build_input), build_input=build_input) as world:
+        with session.build(_world(asset, build_input, planning=planning), build_input=build_input) as world:
             world_ready = time.monotonic()
+            planning_result: dict[str, Any] | None = None
+            if planning:
+                catalog = world.planning_scene_catalog()
+                state = world.planning_scene_state()
+                resource_geometries = tuple(item for item in catalog.geometries if item.resource_id is not None)
+                if not resource_geometries:
+                    raise RuntimeError("planning catalog did not publish any resource-backed collision geometry")
+                sample = resource_geometries[0]
+                lease = world.resolve_planning_geometry(sample.geometry_id)
+                try:
+                    sample_size = lease.descriptor.byte_size
+                    sample_prefix_sha256 = hashlib.sha256(lease.read(0, min(sample_size, 4096))).hexdigest()
+                finally:
+                    lease.close()
+                planning_result = {
+                    "catalog": {
+                        "entities": len(catalog.entities),
+                        "links": len(catalog.links),
+                        "joints": len(catalog.joints),
+                        "frames": len(catalog.frames),
+                        "geometries": len(catalog.geometries),
+                        "representations": dict(
+                            sorted(Counter(item.representation.value for item in catalog.geometries).items())
+                        ),
+                        "resource_geometries": len(resource_geometries),
+                        "content_sha256": catalog.content_sha256,
+                    },
+                    "state": {
+                        "entities": len(state.entities),
+                        "links": len(state.links),
+                        "frames": len(state.frames),
+                        "articulations": len(state.articulations),
+                        "geometry_transforms": len(state.geometry_transforms),
+                        "world_revision": state.world_revision,
+                        "transform_revision": state.transform_revision,
+                        "geometry_revision": state.geometry_revision,
+                    },
+                    "sample_resource": {
+                        "geometry_id": sample.geometry_id,
+                        "representation": sample.representation.value,
+                        "byte_size": sample_size,
+                        "prefix_sha256": sample_prefix_sha256,
+                    },
+                }
             handle = world.resolve(_DOOR)
             initial = float(world.read_articulation(handle).joint_positions.rows()[0][0])
             world.apply_articulation_command(
@@ -186,6 +235,7 @@ def run(inventory_path: Path, *, steps: int, target_rad: float) -> dict[str, Any
             "reset_once_rad": reset_once,
             "reset_twice_rad": reset_twice,
         },
+        "planning": planning_result,
         "timing_seconds": {
             "manifest": manifest_ready - started,
             "worker_start": worker_ready - manifest_ready,
@@ -203,9 +253,10 @@ def main() -> int:
     parser.add_argument("inventory", type=Path)
     parser.add_argument("--steps", type=int, default=120)
     parser.add_argument("--target-rad", type=float, default=0.55)
+    parser.add_argument("--planning", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = run(args.inventory, steps=args.steps, target_rad=args.target_rad)
+    result = run(args.inventory, steps=args.steps, target_rad=args.target_rad, planning=args.planning)
     payload = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
