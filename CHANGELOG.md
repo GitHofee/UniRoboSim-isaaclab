@@ -2,6 +2,8 @@
 
 ## 0.9.3
 
+- Align the required PyTorch runtime profile and fail-closed preflight with
+  `torch==2.11.0`, `torchvision==0.26.0`, and `torchaudio==2.11.0`.
 - Keep RGB conversion and layout normalization on the GPU, then transfer one
   contiguous packed byte buffer across the native worker boundary instead of
   millions of Python integers.

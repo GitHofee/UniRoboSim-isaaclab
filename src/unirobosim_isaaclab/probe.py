@@ -15,8 +15,11 @@ _EXPECTED = {
     "isaaclab": "6.1.17",
     "isaaclab_physx": "1.1.3",
     "isaacsim": "6.0.1.0",
-    "torch": "2.10.0",
+    "torch": "2.11.0",
+    "torchvision": "0.26.0",
+    "torchaudio": "2.11.0",
 }
+_PYTORCH_DISTRIBUTIONS = frozenset({"torch", "torchvision", "torchaudio"})
 
 
 def _distribution_version(name: str) -> str | None:
@@ -42,7 +45,7 @@ def probe_environment(
         actual = versions[name]
         if actual is None:
             issues.append(f"required distribution {name} is not installed")
-        elif actual != expected and not (name == "torch" and actual.split("+", 1)[0] == expected):
+        elif actual != expected and not (name in _PYTORCH_DISTRIBUTIONS and actual.split("+", 1)[0] == expected):
             issues.append(f"{name}=={expected} is required; found {actual}")
 
     gpu = None

@@ -178,7 +178,9 @@ def test_probe_cpu_success_and_version_failures() -> None:
         "isaaclab": "6.1.17",
         "isaaclab_physx": "1.1.3",
         "isaacsim": "6.0.1.0",
-        "torch": "2.10.0",
+        "torch": "2.11.0",
+        "torchvision": "0.26.0",
+        "torchaudio": "2.11.0",
     }
     report = probe_environment(IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get)
     assert report.available
@@ -187,14 +189,26 @@ def test_probe_cpu_success_and_version_failures() -> None:
 
     versions["isaacsim"] = "5.1.0.0"
     versions["isaaclab_physx"] = None
-    versions["torch"] = "2.11.0"
+    versions["torch"] = "2.10.0"
+    versions["torchvision"] = "0.25.0"
+    versions["torchaudio"] = "2.10.0"
     report = probe_environment(IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get)
     assert not report.available
     assert "isaacsim==6.0.1.0" in (report.reason or "")
     assert "isaaclab_physx is not installed" in (report.reason or "")
-    assert "torch==2.10.0" in (report.reason or "")
+    assert "torch==2.11.0" in (report.reason or "")
+    assert "torchvision==0.26.0" in (report.reason or "")
+    assert "torchaudio==2.11.0" in (report.reason or "")
 
-    versions.update({"isaacsim": "6.0.1.0", "isaaclab_physx": "1.1.3", "torch": "2.10.0+cu128"})
+    versions.update(
+        {
+            "isaacsim": "6.0.1.0",
+            "isaaclab_physx": "1.1.3",
+            "torch": "2.11.0+cu128",
+            "torchvision": "0.26.0+cu128",
+            "torchaudio": "2.11.0+cu128",
+        }
+    )
     assert probe_environment(IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get).available
 
 
@@ -208,7 +222,7 @@ def test_probe_rejects_other_python(monkeypatch: pytest.MonkeyPatch) -> None:
             assert item == slice(None, 2)
             return (self.major, self.minor)
 
-    versions = {**probe_module._EXPECTED, "torch": "2.10.0"}
+    versions = dict(probe_module._EXPECTED)
     monkeypatch.setattr(sys, "version_info", Version())
     report = probe_environment(IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get)
     assert not report.available
@@ -216,7 +230,7 @@ def test_probe_rejects_other_python(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_probe_cuda_success_and_command_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    versions = {**probe_module._EXPECTED, "torch": "2.10.0"}
+    versions = dict(probe_module._EXPECTED)
 
     def successful(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout="RTX 5090, 580.1\n", stderr="")
@@ -268,7 +282,7 @@ def test_default_runtime_factory_is_lazy(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_lightweight_modules_have_no_top_level_native_imports() -> None:
     package = Path(unirobosim_isaaclab.__file__).parent
-    forbidden = {"isaaclab", "isaacsim", "omni", "pxr", "torch"}
+    forbidden = {"isaaclab", "isaacsim", "omni", "pxr", "torch", "torchvision", "torchaudio"}
     for name in ("__init__.py", "config.py", "descriptor.py", "probe.py", "provider.py", "world.py"):
         tree = ast.parse((package / name).read_text(encoding="utf-8"))
         for node in tree.body:

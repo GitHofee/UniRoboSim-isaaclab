@@ -6,19 +6,21 @@
 
 ## 兼容矩阵
 
-| 项目 | 已验证版本 |
+| 项目 | 要求档位 |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
 | UniRoboSim | `>=0.9.1,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
-| PyTorch | `2.10.0+cu128` |
+| PyTorch | `torch==2.11.0` |
+| TorchVision | `torchvision==0.26.0` |
+| TorchAudio | `torchaudio==2.11.0` |
 | Runtime contract | `v0alpha5` |
 
 ## 安装
 
-先在独立 Python 3.12 Conda 环境中安装已验证的 NVIDIA Isaac Sim/Isaac Lab 运行栈，并确认 `import isaaclab` 和 `import isaacsim` 成功，再安装 Core、Adapter 和可选 USD 转换器：
+先在独立 Python 3.12 Conda 环境中安装要求的 NVIDIA Isaac Sim/Isaac Lab 运行栈。运行环境必须提供 `torch==2.11.0`、`torchvision==0.26.0` 和 `torchaudio==2.11.0`；公开版本相同、带 `+cu128` 等本地版本标签的 CUDA wheel 也可接受。Adapter 会有意将这些大型可选后端包排除在自己的 wheel 元数据之外，因此应当把它们作为 NVIDIA 运行栈的一部分安装。确认 `import isaaclab` 和 `import isaacsim` 成功后，再安装 Core、Adapter 和可选 USD 转换器：
 
 ```bash
 conda create -n unirobosim-isaaclab3 python=3.12 pip -y
@@ -33,11 +35,14 @@ python -m pip install ./UniRoboSim-isaaclab
 python -m pip install ./UniRoboSim-usd-converter
 ```
 
-不启动 Kit 检查环境：
+不启动 Kit，检查已安装的依赖图和完整运行档位：
 
 ```bash
+python -m pip check
 python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
 ```
+
+Probe 会读取 Isaac Lab、Isaac Lab PhysX、Isaac Sim、PyTorch、TorchVision 和 TorchAudio 的发行包元数据。任一必需发行包缺失，或公开版本与兼容档位不一致时，检查都会明确失败。
 
 ## EasyAPI
 

@@ -9,7 +9,7 @@ from unirobosim import ValidationError
 import unirobosim_isaaclab
 from unirobosim_isaaclab import IsaacLabAdapterConfig
 
-_NATIVE_SDK_ROOTS = {"isaaclab", "isaacsim", "omni", "pxr", "torch"}
+_NATIVE_SDK_ROOTS = {"isaaclab", "isaacsim", "omni", "pxr", "torch", "torchvision", "torchaudio"}
 
 
 def _easy_config() -> IsaacLabAdapterConfig:

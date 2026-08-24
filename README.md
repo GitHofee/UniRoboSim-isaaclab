@@ -6,19 +6,21 @@
 
 ## Compatibility
 
-| Item | Verified version |
+| Item | Required profile |
 | --- | --- |
 | Python | `>=3.12,<3.13` |
 | UniRoboSim | `>=0.9.1,<0.10` |
 | Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
 | Isaac Lab PhysX | `1.1.3` |
 | Isaac Sim | `6.0.1.0` |
-| PyTorch | `2.10.0+cu128` |
+| PyTorch | `torch==2.11.0` |
+| TorchVision | `torchvision==0.26.0` |
+| TorchAudio | `torchaudio==2.11.0` |
 | Runtime contract | `v0alpha5` |
 
 ## Installation
 
-Install the verified NVIDIA Isaac Sim/Isaac Lab stack in a dedicated Python 3.12 Conda environment first. Confirm that `import isaaclab` and `import isaacsim` work in that environment, then install Core, the adapter, and the optional USD converter:
+Install the required NVIDIA Isaac Sim/Isaac Lab stack in a dedicated Python 3.12 Conda environment first. The runtime must provide `torch==2.11.0`, `torchvision==0.26.0`, and `torchaudio==2.11.0`. CUDA wheels with matching public versions and local tags such as `+cu128` are accepted. The adapter intentionally keeps these large optional-backend packages out of its wheel metadata, so install them as part of the NVIDIA stack. Confirm that `import isaaclab` and `import isaacsim` work in that environment, then install Core, the adapter, and the optional USD converter:
 
 ```bash
 conda create -n unirobosim-isaaclab3 python=3.12 pip -y
@@ -33,11 +35,14 @@ python -m pip install ./UniRoboSim-isaaclab
 python -m pip install ./UniRoboSim-usd-converter
 ```
 
-Validate the environment without launching Kit:
+Validate the installed dependency graph and the complete runtime profile without launching Kit:
 
 ```bash
+python -m pip check
 python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
 ```
+
+The probe reads distribution metadata for Isaac Lab, Isaac Lab PhysX, Isaac Sim, PyTorch, TorchVision, and TorchAudio. It fails closed when any required distribution is missing or its public version differs from the compatibility profile.
 
 ## EasyAPI
 

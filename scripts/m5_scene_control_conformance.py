@@ -31,6 +31,8 @@ def _versions() -> dict[str, str]:
         "isaaclab",
         "isaacsim",
         "torch",
+        "torchvision",
+        "torchaudio",
         "opencv-python-headless",
     )
     return {name: importlib.metadata.version(name) for name in names}

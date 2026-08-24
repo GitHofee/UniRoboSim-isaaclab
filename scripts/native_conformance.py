@@ -38,7 +38,16 @@ from unirobosim_isaaclab import IsaacLabAdapterConfig, create_provider
 def _versions() -> dict[str, str]:
     return {
         name: importlib.metadata.version(name)
-        for name in ("unirobosim", "unirobosim-isaaclab", "isaaclab", "isaaclab_physx", "isaacsim", "torch")
+        for name in (
+            "unirobosim",
+            "unirobosim-isaaclab",
+            "isaaclab",
+            "isaaclab_physx",
+            "isaacsim",
+            "torch",
+            "torchvision",
+            "torchaudio",
+        )
     }
 
 
