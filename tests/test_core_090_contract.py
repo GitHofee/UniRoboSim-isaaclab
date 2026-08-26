@@ -239,14 +239,18 @@ def test_droid_acceptance_world_pins_cross_backend_zero_gravity() -> None:
 
 def test_droid_acceptance_entry_point_closes_metadata_and_factory() -> None:
     provider = object()
-    entry_point = droid_acceptance._entry_point(provider)
+    entry_point = droid_acceptance._entry_point(provider, "visible")
     assert entry_point.name == "isaaclab"
     assert entry_point.group == "unirobosim.backends"
     assert entry_point.value == "unirobosim_isaaclab:create_easy_provider"
-    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.2")
+    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.3")
     factory = entry_point.load()
     assert callable(factory)
     assert factory() is provider
+    assert factory(launch_profile="visible") is provider
+    with pytest.raises(ValidationError) as caught:
+        factory(launch_profile="headless")
+    assert caught.value.operation == "isaaclab.droid.entry_point"
 
 
 def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None:
@@ -258,7 +262,7 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
     aliases_module = pytest.importorskip("fastsim.integrations.unirobosim.aliases", exc_type=ImportError)
     projection_module = pytest.importorskip("fastsim.integrations.unirobosim.projection", exc_type=ImportError)
     provider = object()
-    entry_point = droid_acceptance._entry_point(provider)
+    entry_point = droid_acceptance._entry_point(provider, "headless")
     world = WorldSpec(
         "entry-point-discovery",
         (
@@ -296,9 +300,17 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
         "group": "unirobosim.backends",
         "value": "unirobosim_isaaclab:create_easy_provider",
         "distribution": "unirobosim-isaaclab",
-        "version": "0.10.2",
+        "version": "0.10.3",
     }
     assert entry_point.load()() is provider
+    assert (
+        adapter_module._invoke_provider_factory(
+            "isaaclab",
+            entry_point.load(),
+            launch_profile="headless",
+        )
+        is provider
+    )
 
 
 def test_droid_effective_camera_metadata_is_derived_from_native_calibration() -> None:

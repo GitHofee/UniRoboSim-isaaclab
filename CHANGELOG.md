@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.10.3
+
+- Share one global RTX render across every camera read at the same world
+  revision. A visible physics-step render is reused, while reset, direct pose,
+  particle, debug, and non-rendering physics mutations invalidate the cached
+  revision before the next camera capture.
+- Report a fixed, strictly ordered native-worker startup phase sequence before,
+  during, and after Kit launch. Phase progress cannot act as a heartbeat and
+  cannot extend the existing 30-second hard startup limit.
+- Fail and clean up a worker after 8 seconds without pre-Kit progress, while
+  retaining a 15-second Kit-launch idle allowance. The latter leaves almost
+  7 seconds of margin above the 8.136-second maximum across seven instrumented
+  visible launches on the 2026-08-26 acceptance host.
+- Execute the stdlib-only worker bootstrap by exact file path so it can report
+  interpreter connectivity before importing the adapter or Isaac SDK. Timeout
+  diagnostics now identify the last completed phase, and retry still creates
+  exactly one clean replacement worker.
+- Forward the frozen FastSim launch profile through the DROID acceptance plan
+  and make its injected provider factory accept and verify FastSim's
+  `launch_profile` keyword contract.
+
 ## 0.10.2
 
 - Bound the isolated native-worker startup wait to 30 seconds and retry once

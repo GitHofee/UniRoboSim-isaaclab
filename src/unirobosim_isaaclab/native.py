@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import math
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -664,15 +664,28 @@ def _render_step_enabled(
 class IsaacLabNativeRuntime:
     """Own exactly one Kit application and at most one native world."""
 
-    def __init__(self, config: IsaacLabAdapterConfig, *, process_isolated: bool = False) -> None:
+    def __init__(
+        self,
+        config: IsaacLabAdapterConfig,
+        *,
+        process_isolated: bool = False,
+        startup_progress: Callable[[str], None] | None = None,
+    ) -> None:
         if config.enable_cameras:
             # The installed RTX 5090 profile is stable with one renderer device and no frame generation.
             for setting in _camera_launcher_settings(config):
                 _ensure_launcher_setting(setting)
+        if startup_progress is not None:
+            startup_progress("sdk_importing")
         from isaaclab.app import AppLauncher  # type: ignore[import-not-found]
 
+        if startup_progress is not None:
+            startup_progress("kit_launching")
         self._launcher = AppLauncher(**_launcher_kwargs(config, process_isolated=process_isolated))
         self._app = self._launcher.app
+        if startup_progress is not None:
+            startup_progress("kit_ready")
+            startup_progress("runtime_importing")
 
         import carb  # type: ignore[import-not-found]
 
@@ -784,6 +797,8 @@ class IsaacLabNativeRuntime:
         self._config = config
         self._active_world: IsaacLabNativeWorld | None = None
         self._closed = False
+        if startup_progress is not None:
+            startup_progress("runtime_ready")
 
     def build_world(self, spec: WorldSpec) -> IsaacLabNativeWorld:
         if self._closed:
@@ -870,6 +885,8 @@ class IsaacLabNativeWorld:
         self._debug_expirations: dict[tuple[str, str, str], int | None] = {}
         self._debug_lifetimes: dict[tuple[str, str, str], DebugLifetimeMode] = {}
         self._step_index = 0
+        self._render_revision = 0
+        self._rendered_revision = -1
         self._joint_maps: dict[EntityPath, tuple[int, ...]] = {}
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
         self._initial_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
@@ -1017,7 +1034,7 @@ class IsaacLabNativeWorld:
         self._initialize_deformables()
         self.reset(tuple(range(self._spec.environments.count)))
         if self._cameras:
-            self._sim.render()
+            self._ensure_camera_render()
             for camera in self._cameras.values():
                 camera.update(0.0, force_recompute=True)
 
@@ -1801,6 +1818,24 @@ class IsaacLabNativeWorld:
         for path in self._mounted_cameras:
             self._sync_mounted_camera(path)
 
+    def _invalidate_render(self) -> None:
+        self._render_revision = getattr(self, "_render_revision", 0) + 1
+
+    def _mark_rendered(self) -> None:
+        self._rendered_revision = getattr(self, "_render_revision", 0)
+
+    def _ensure_camera_render(self) -> None:
+        revision = getattr(self, "_render_revision", 0)
+        if getattr(self, "_rendered_revision", -1) == revision:
+            return
+        assert self._sim is not None
+        # A render is global to the USD stage, not local to one Camera object.
+        # Synchronize every mounted camera before that shared render so all
+        # camera reads at this simulation revision consume one coherent frame.
+        self._sync_all_mounted_cameras()
+        self._sim.render()
+        self._rendered_revision = revision
+
     def _initialize_articulations(self) -> None:
         torch = self._m.torch
         assert self._sim is not None
@@ -2218,6 +2253,7 @@ class IsaacLabNativeWorld:
         self._sim.forward()
         self._update_assets(0.0)
         self._sync_all_mounted_cameras()
+        self._invalidate_render()
 
     def apply_articulation(
         self,
@@ -2493,6 +2529,7 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         self._sim.forward()
         self._update_assets(0.0)
+        self._invalidate_render()
 
     def read_contact(self, path: EntityPath) -> Matrix:
         if path in self._usd_rigids:
@@ -2559,6 +2596,7 @@ class IsaacLabNativeWorld:
                 raise RuntimeError("native particle force commands are unsupported")
         assert self._sim is not None
         self._sim.forward()
+        self._invalidate_render()
 
     def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]:
         positions: list[tuple[tuple[float, float, float], ...]] = []
@@ -2581,8 +2619,7 @@ class IsaacLabNativeWorld:
         entity = next(item for item in self._spec.entities if item.path == path)
         assert entity.camera is not None
         assert self._sim is not None
-        self._sync_mounted_camera(path)
-        self._sim.render()
+        self._ensure_camera_render()
         camera.update(0.0, force_recompute=True)
         channels = []
         for modality in entity.camera.modalities:
@@ -2673,10 +2710,12 @@ class IsaacLabNativeWorld:
         return len(batch.primitives), 0, overlay.active_count
 
     def _flush_debug_render(self) -> None:
+        self._invalidate_render()
         if self._config.render:
             assert self._sim is not None
             self._sync_all_mounted_cameras()
             self._sim.render()
+            self._mark_rendered()
 
     def _remove_debug_keys(self, keys: tuple[tuple[str, str, str], ...]) -> None:
         for key in keys:
@@ -2728,6 +2767,9 @@ class IsaacLabNativeWorld:
                 if render:
                     self._sync_all_mounted_cameras()
                 self._sim.step(render=render)
+                self._invalidate_render()
+                if render:
+                    self._mark_rendered()
                 self._update_assets(self._native_dt)
             self._step_index += 1
             expired = tuple(

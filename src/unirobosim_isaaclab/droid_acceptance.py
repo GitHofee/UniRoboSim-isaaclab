@@ -34,6 +34,7 @@ from unirobosim import (
     EntitySpec,
     FrozenMap,
     Pose,
+    ValidationError,
     WorldSpec,
 )
 
@@ -311,7 +312,13 @@ def _look_at_xyzw(
     return cast(tuple[float, float, float, float], _normalize(result))
 
 
-def _compile_plan(spec: Mapping[str, object], output_dir: Path, asset_path: Path) -> object:
+def _compile_plan(
+    spec: Mapping[str, object],
+    output_dir: Path,
+    asset_path: Path,
+    *,
+    launch_profile: str,
+) -> object:
     config = import_module("fastsim.config")
     assets = import_module("fastsim.assets")
     robot = _mapping(spec.get("robot"), "acceptance robot")
@@ -358,6 +365,7 @@ def _compile_plan(spec: Mapping[str, object], output_dir: Path, asset_path: Path
             "name": "droid-three-backend-equivalence-isaaclab",
             "backend": "isaaclab",
             "runtime": {
+                "launch_profile": launch_profile,
                 "physics_hz": 240.0,
                 "control_hz": 240.0,
                 "sensor_hz": {},
@@ -519,13 +527,22 @@ def _acceptance_world_spec(
     )
 
 
-def _entry_point(provider: IsaacLabProvider) -> object:
+def _entry_point(provider: IsaacLabProvider, expected_launch_profile: str) -> object:
+    def factory(*, launch_profile: str | None = None) -> IsaacLabProvider:
+        effective_profile = expected_launch_profile if launch_profile is None else launch_profile
+        if effective_profile != expected_launch_profile:
+            raise ValidationError(
+                "FastSim launch profile differs from the prepared DROID acceptance provider",
+                operation="isaaclab.droid.entry_point",
+            )
+        return provider
+
     return SimpleNamespace(
         name="isaaclab",
         group="unirobosim.backends",
         value="unirobosim_isaaclab:create_easy_provider",
         dist=SimpleNamespace(name="unirobosim-isaaclab", version=DISTRIBUTION_VERSION),
-        load=lambda: lambda: provider,
+        load=lambda: factory,
     )
 
 
@@ -797,7 +814,7 @@ def _compose(
 
     adapter = adapter_module._UniRoboSimAdapter(
         projection,
-        entry_points=lambda: (_entry_point(provider),),
+        entry_points=lambda: (_entry_point(provider, projection.launch_profile),),
     )
     simulation_root = simulation_query_module._SimulationQueryRoot(
         run_id="droid-equivalence-isaaclab",
@@ -1017,7 +1034,8 @@ def create_backend_run(
     if visible_window and (display is None or not display.strip()):
         raise RuntimeError("visible Isaac window requires a non-empty DISPLAY")
     baseline_window_ids = frozenset(_x11_window_snapshot(display)) if display is not None else frozenset()
-    plan = _compile_plan(canonical, destination, asset)
+    launch_profile = "visible" if visible_window else "headless"
+    plan = _compile_plan(canonical, destination, asset, launch_profile=launch_profile)
     projection = _enriched_projection(plan, canonical, asset_sha256)
     provider = IsaacLabProvider(
         IsaacLabAdapterConfig(

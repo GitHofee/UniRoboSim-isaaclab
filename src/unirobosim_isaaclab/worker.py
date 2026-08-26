@@ -8,9 +8,11 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import traceback
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -44,8 +46,44 @@ _CALL_TIMEOUT_SECONDS = 300.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
 _STARTUP_ATTEMPTS = 2
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
-_WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/1"
-_WORKER_PROTOCOL_VERSION = 1
+_WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/2"
+_WORKER_PROGRESS_SCHEMA = "unirobosim-isaaclab-worker-progress/1"
+_WORKER_PROTOCOL_VERSION = 2
+
+# Visible Kit startup took 6.809--8.136 seconds across all seven instrumented
+# launches on the acceptance host on 2026-08-26.  A 15 second Kit-phase idle
+# limit preserves almost 7 seconds of margin above that observed maximum.  A
+# SIGUSR1 stack placed the failed acceptance worker inside Kit's native startup
+# call before its first Carbonite event; that phase receives the 15 second
+# allowance.  Earlier interpreter/import phases normally complete in well under
+# a second and use an 8 second idle limit.  Progress is a fixed, strictly ordered
+# sequence: it can never act as an unbounded heartbeat or extend the 30 second
+# per-worker hard limit.
+_STARTUP_PHASES = (
+    "bootstrap_connected",
+    "config_received",
+    "worker_imported",
+    "native_module_loading",
+    "native_module_loaded",
+    "sdk_importing",
+    "kit_launching",
+    "kit_ready",
+    "runtime_importing",
+    "runtime_ready",
+)
+_STARTUP_PHASE_IDLE_TIMEOUT_SECONDS = {
+    "process_spawned": 8.0,
+    "bootstrap_connected": 8.0,
+    "config_received": 8.0,
+    "worker_imported": 8.0,
+    "native_module_loading": 8.0,
+    "native_module_loaded": 8.0,
+    "sdk_importing": 8.0,
+    "kit_launching": 15.0,
+    "kit_ready": 10.0,
+    "runtime_importing": 10.0,
+    "runtime_ready": 5.0,
+}
 
 Request = tuple[str, tuple[Any, ...]]
 Reply = tuple[str, Any]
@@ -57,6 +95,11 @@ class NativeWorkerError(RuntimeError):
 
 class _NativeWorkerTimeout(NativeWorkerError):
     """An otherwise-live worker did not reply before its operation deadline."""
+
+
+@dataclass(frozen=True)
+class _WorkerStartupProgress:
+    phase: str
 
 
 def _module_origin(module: object, name: str) -> Path:
@@ -90,6 +133,30 @@ def _worker_startup_fingerprint() -> dict[str, object]:
             "origin": str(_module_origin(adapter, "unirobosim_isaaclab")),
         },
     }
+
+
+def _startup_progress_reply(phase: str) -> Reply:
+    """Return one bounded, versioned startup progress event."""
+
+    if phase not in _STARTUP_PHASES:
+        raise ValueError(f"unknown native worker startup phase {phase!r}")
+    return (
+        "startup_progress",
+        {
+            "schema": _WORKER_PROGRESS_SCHEMA,
+            "phase": phase,
+        },
+    )
+
+
+def _validate_startup_progress(value: object) -> _WorkerStartupProgress:
+    if type(value) is not dict or set(value) != {"schema", "phase"}:
+        raise NativeWorkerError(f"invalid native worker startup progress payload: {value!r}")
+    schema = value.get("schema")
+    phase = value.get("phase")
+    if schema != _WORKER_PROGRESS_SCHEMA or type(phase) is not str or phase not in _STARTUP_PHASES:
+        raise NativeWorkerError(f"invalid native worker startup progress payload: {value!r}")
+    return _WorkerStartupProgress(phase)
 
 
 def _worker_package_roots() -> tuple[Path, ...]:
@@ -130,12 +197,14 @@ def _worker_environment(environ: dict[str, str] | None = None) -> dict[str, str]
 
 
 def _worker_command(connection_descriptor: int) -> tuple[str, ...]:
+    bootstrap = Path(__file__).resolve().with_name("worker_bootstrap.py")
+    if not bootstrap.is_file():
+        raise NativeWorkerError(f"native worker bootstrap is missing: {bootstrap}")
     return (
         sys.executable,
         "-P",
         "-B",
-        "-m",
-        "unirobosim_isaaclab.worker_bootstrap",
+        str(bootstrap),
         str(connection_descriptor),
     )
 
@@ -352,9 +421,15 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
     world: NativeWorldDriver | None = None
     try:
         try:
+            connection.send(_startup_progress_reply("native_module_loading"))
             from .native import IsaacLabNativeRuntime
 
-            runtime = IsaacLabNativeRuntime(config, process_isolated=True)
+            connection.send(_startup_progress_reply("native_module_loaded"))
+            runtime = IsaacLabNativeRuntime(
+                config,
+                process_isolated=True,
+                startup_progress=lambda phase: connection.send(_startup_progress_reply(phase)),
+            )
         except Exception as exc:
             connection.send(_error_reply(exc))
             return
@@ -389,6 +464,15 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
             runtime.close()
 
 
+def _spawned_worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:  # pragma: no cover
+    """Supply the same progress contract for the non-POSIX spawn fallback."""
+
+    connection.send(_startup_progress_reply("bootstrap_connected"))
+    connection.send(_startup_progress_reply("config_received"))
+    connection.send(_startup_progress_reply("worker_imported"))
+    _worker_main(connection, config)
+
+
 def _spawn_worker(config: IsaacLabAdapterConfig) -> tuple[Connection, _ProcessHandle]:  # pragma: no cover
     if os.name == "posix":
         # A multiprocessing "spawn" child imports the parent's __main__ module
@@ -421,7 +505,7 @@ def _spawn_worker(config: IsaacLabAdapterConfig) -> tuple[Connection, _ProcessHa
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=True)
     spawned_process: BaseProcess = context.Process(
-        target=_worker_main,
+        target=_spawned_worker_main,
         args=(child, config),
         name="unirobosim-isaaclab",
         daemon=False,
@@ -508,22 +592,17 @@ class IsaacLabWorkerRuntime:
         for attempt in range(1, _STARTUP_ATTEMPTS + 1):
             self._connection, self._process = worker_factory(config)
             try:
-                startup = self._receive(
-                    "worker startup",
-                    timeout_seconds=_STARTUP_TIMEOUT_SECONDS,
-                )
+                startup = self._receive_startup()
                 _validate_worker_startup(startup)
                 break
             except _NativeWorkerTimeout as exc:
                 self._abort()
                 if attempt == _STARTUP_ATTEMPTS:
                     raise NativeWorkerError(
-                        "native worker startup timed out after "
-                        f"{_STARTUP_ATTEMPTS} attempts of {_STARTUP_TIMEOUT_SECONDS:g}s"
+                        f"native worker startup timed out after {_STARTUP_ATTEMPTS} attempts; last timeout: {exc}"
                     ) from exc
                 warnings.warn(
-                    "Isaac Kit did not complete native startup within "
-                    f"{_STARTUP_TIMEOUT_SECONDS:g}s; the isolated worker was cleaned up "
+                    f"Isaac Kit worker {exc}; the isolated worker was cleaned up "
                     f"and startup will be retried ({attempt + 1}/{_STARTUP_ATTEMPTS})",
                     RuntimeWarning,
                     stacklevel=2,
@@ -532,7 +611,58 @@ class IsaacLabWorkerRuntime:
                 self._abort()
                 raise
 
-    def _receive(self, operation: str, *, timeout_seconds: float | None = None) -> Any:
+    def _receive_startup(self) -> Any:
+        started = time.monotonic()
+        hard_deadline = started + _STARTUP_TIMEOUT_SECONDS
+        phase = "process_spawned"
+        next_phase_index = 0
+        while True:
+            now = time.monotonic()
+            idle_limit = _STARTUP_PHASE_IDLE_TIMEOUT_SECONDS[phase]
+            timeout = min(idle_limit, max(0.0, hard_deadline - now))
+            if timeout <= 0.0:
+                raise _NativeWorkerTimeout(
+                    f"stalled in startup phase {phase!r} at the {_STARTUP_TIMEOUT_SECONDS:g}s hard limit"
+                )
+            try:
+                value = self._receive(
+                    "worker startup",
+                    timeout_seconds=timeout,
+                    allow_startup_progress=True,
+                )
+            except _NativeWorkerTimeout as exc:
+                elapsed = time.monotonic() - started
+                limit_kind = "hard" if elapsed >= _STARTUP_TIMEOUT_SECONDS else "idle"
+                raise _NativeWorkerTimeout(
+                    f"stalled in startup phase {phase!r} after {elapsed:.3f}s "
+                    f"({limit_kind} limit, phase idle limit {idle_limit:g}s, "
+                    f"hard limit {_STARTUP_TIMEOUT_SECONDS:g}s)"
+                ) from exc
+            if isinstance(value, _WorkerStartupProgress):
+                expected_phase = _STARTUP_PHASES[next_phase_index] if next_phase_index < len(_STARTUP_PHASES) else None
+                if value.phase != expected_phase:
+                    raise NativeWorkerError(
+                        "native worker startup progress is not strictly ordered: "
+                        f"expected {expected_phase!r}, got {value.phase!r}"
+                    )
+                phase = value.phase
+                next_phase_index += 1
+                continue
+            if next_phase_index != len(_STARTUP_PHASES):
+                expected_phase = _STARTUP_PHASES[next_phase_index]
+                raise NativeWorkerError(
+                    "native worker returned its startup fingerprint before completing progress: "
+                    f"expected phase {expected_phase!r}"
+                )
+            return value
+
+    def _receive(
+        self,
+        operation: str,
+        *,
+        timeout_seconds: float | None = None,
+        allow_startup_progress: bool = False,
+    ) -> Any:
         timeout = _CALL_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         try:
             if not self._connection.poll(timeout):
@@ -545,6 +675,8 @@ class IsaacLabWorkerRuntime:
         status, payload = reply
         if status == "ok":
             return payload
+        if status == "startup_progress" and allow_startup_progress:
+            return _validate_startup_progress(payload)
         if status == "planning_error" and isinstance(payload, dict):
             raise NativePlanningError(cast(str, payload.get("code", "native_failure"))) from None
         if status != "error" or not isinstance(payload, dict):

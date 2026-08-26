@@ -29,9 +29,11 @@ from unirobosim import (
 )
 
 from unirobosim_isaaclab import worker as worker_module
+from unirobosim_isaaclab import worker_bootstrap as worker_bootstrap_module
 from unirobosim_isaaclab.config import IsaacLabAdapterConfig
 from unirobosim_isaaclab.native_protocols import NativePhysicsDiagnostics, NativePlanningError
 from unirobosim_isaaclab.worker import (
+    _STARTUP_PHASES,
     IsaacLabWorkerPlanningWorld,
     IsaacLabWorkerRuntime,
     IsaacLabWorkerWorld,
@@ -43,6 +45,8 @@ from unirobosim_isaaclab.worker import (
     _proc_stat_session,
     _session_member_pids,
     _spawn_worker,
+    _spawned_worker_main,
+    _startup_progress_reply,
     _SubprocessHandle,
     _terminate_worker_tree,
     _validate_worker_startup,
@@ -127,10 +131,11 @@ class FakeConnection:
         self.sent: list[object] = []
         self.closed = False
         self.send_error: OSError | None = None
+        self.poll_calls: list[float] = []
 
     def poll(self, timeout: float) -> bool:
-        del timeout
-        return self.poll_result
+        self.poll_calls.append(timeout)
+        return bool(self.replies) or self.poll_result
 
     def recv(self) -> object:
         reply = self.replies.pop(0)
@@ -190,6 +195,8 @@ def fake_worker_factory(
     normalized = list(replies)
     if normalize_startup and normalized and normalized[0] == ("ok", None):
         normalized[0] = ("ok", _worker_startup_fingerprint())
+    if normalize_startup:
+        normalized = [*(_startup_progress_reply(phase) for phase in _STARTUP_PHASES), *normalized]
     connection = FakeConnection(normalized, handle, poll_result=poll_result)
 
     def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
@@ -222,8 +229,7 @@ def test_worker_command_and_environment_anchor_loaded_packages(tmp_path: Path) -
         sys.executable,
         "-P",
         "-B",
-        "-m",
-        "unirobosim_isaaclab.worker_bootstrap",
+        str(Path(worker_module.__file__).resolve().with_name("worker_bootstrap.py")),
         "37",
     )
 
@@ -308,12 +314,30 @@ def test_spawn_worker_failure_closes_both_pipe_ends(monkeypatch: pytest.MonkeyPa
     assert parent.closed and child.closed
 
 
+def test_non_posix_spawn_fallback_emits_the_same_progress_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeProcess()
+    connection = FakeConnection([], process)
+    config = IsaacLabAdapterConfig()
+    called: list[tuple[object, IsaacLabAdapterConfig]] = []
+    monkeypatch.setattr(worker_module, "_worker_main", lambda active, selected: called.append((active, selected)))
+
+    _spawned_worker_main(cast(Any, connection), config)
+
+    assert connection.sent == [
+        _startup_progress_reply("bootstrap_connected"),
+        _startup_progress_reply("config_received"),
+        _startup_progress_reply("worker_imported"),
+    ]
+    assert called == [(connection, config)]
+
+
 def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     fingerprint = _worker_startup_fingerprint()
-    assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/1"
-    assert fingerprint["worker_protocol"] == 1
+    assert worker_bootstrap_module._WORKER_PROGRESS_SCHEMA == worker_module._WORKER_PROGRESS_SCHEMA
+    assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/2"
+    assert fingerprint["worker_protocol"] == 2
     assert fingerprint["adapter"] == {
-        "version": "0.10.2",
+        "version": "0.10.3",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
     }
     core = cast(dict[str, object], fingerprint["core"])
@@ -322,7 +346,8 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     _validate_worker_startup(deepcopy(fingerprint))
 
     factory, connection, process = fake_worker_factory(
-        [("ok", deepcopy(fingerprint)), ("ok", None)], normalize_startup=False
+        [*(_startup_progress_reply(phase) for phase in _STARTUP_PHASES), ("ok", deepcopy(fingerprint)), ("ok", None)],
+        normalize_startup=False,
     )
     runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
     runtime.close()
@@ -345,7 +370,10 @@ def test_worker_startup_rejects_wrong_protocol_version_or_origin(field: tuple[st
     for name in field[:-1]:
         target = cast(dict[str, object], target[name])
     target[field[-1]] = bad_value
-    factory, connection, process = fake_worker_factory([("ok", fingerprint)], normalize_startup=False)
+    factory, connection, process = fake_worker_factory(
+        [*(_startup_progress_reply(phase) for phase in _STARTUP_PHASES), ("ok", fingerprint)],
+        normalize_startup=False,
+    )
     with pytest.raises(NativeWorkerError, match="startup fingerprint differs"):
         IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
     assert connection.closed and not process.alive
@@ -666,7 +694,7 @@ def test_worker_planning_failure_maps_only_bounded_code(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("startup_reply", "message"),
     [
-        (("ok", None), "startup fingerprint differs"),
+        (("ok", None), "before completing progress"),
         (("error", {"type": "ValueError", "message": "boom", "traceback": "remote trace"}), "ValueError"),
         (("unexpected", None), "invalid native worker reply"),
         (EOFError(), "disconnected"),
@@ -692,7 +720,7 @@ def test_worker_startup_timeout_aborts() -> None:
         return connection, process
 
     with pytest.warns(RuntimeWarning, match="startup will be retried"):
-        with pytest.raises(NativeWorkerError, match="timed out after 2 attempts of 30s"):
+        with pytest.raises(NativeWorkerError, match="2 attempts.*process_spawned"):
             IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
     assert len(connections) == len(processes) == 2
     assert all(connection.closed for connection in connections)
@@ -704,7 +732,11 @@ def test_worker_startup_timeout_retries_one_clean_worker() -> None:
     first_connection = FakeConnection([], first_process, poll_result=False)
     second_process = FakeProcess()
     second_connection = FakeConnection(
-        [("ok", _worker_startup_fingerprint()), ("ok", None)],
+        [
+            *(_startup_progress_reply(phase) for phase in _STARTUP_PHASES),
+            ("ok", _worker_startup_fingerprint()),
+            ("ok", None),
+        ],
         second_process,
     )
     attempts = iter(((first_connection, first_process), (second_connection, second_process)))
@@ -722,10 +754,93 @@ def test_worker_startup_timeout_retries_one_clean_worker() -> None:
     assert second_connection.closed and not second_process.alive
 
 
+def test_worker_startup_timeout_identifies_last_strict_phase() -> None:
+    connections: list[FakeConnection] = []
+    processes: list[FakeProcess] = []
+
+    def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
+        del config
+        process = FakeProcess()
+        connection = FakeConnection(
+            [
+                _startup_progress_reply("bootstrap_connected"),
+                _startup_progress_reply("config_received"),
+                _startup_progress_reply("worker_imported"),
+                _startup_progress_reply("native_module_loading"),
+                _startup_progress_reply("native_module_loaded"),
+                _startup_progress_reply("sdk_importing"),
+                _startup_progress_reply("kit_launching"),
+            ],
+            process,
+            poll_result=False,
+        )
+        connections.append(connection)
+        processes.append(process)
+        return connection, process
+
+    with pytest.warns(RuntimeWarning, match="phase 'kit_launching'.*phase idle limit 15s"):
+        with pytest.raises(NativeWorkerError, match="phase 'kit_launching'.*phase idle limit 15s"):
+            IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert all(connection.poll_calls[-1] == pytest.approx(15.0, abs=0.01) for connection in connections)
+    assert all(connection.closed for connection in connections)
+    assert all(not process.alive for process in processes)
+
+
+def test_worker_startup_progress_cannot_extend_hard_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = 0.0
+    connections: list[FakeConnection] = []
+
+    class SlowProgressConnection(FakeConnection):
+        def poll(self, timeout: float) -> bool:
+            nonlocal clock
+            self.poll_calls.append(timeout)
+            clock += 4.0
+            return True
+
+    def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
+        del config
+        process = FakeProcess()
+        connection = SlowProgressConnection(
+            [_startup_progress_reply(phase) for phase in _STARTUP_PHASES],
+            process,
+        )
+        connections.append(connection)
+        return connection, process
+
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock)
+    with pytest.warns(RuntimeWarning, match="30s hard limit"):
+        with pytest.raises(NativeWorkerError, match="30s hard limit"):
+            IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert len(connections) == 2
+    assert all(connection.closed and not connection.process.alive for connection in connections)
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        _startup_progress_reply("config_received"),
+        _startup_progress_reply("bootstrap_connected"),
+        ("startup_progress", {"schema": "wrong", "phase": "bootstrap_connected"}),
+        ("startup_progress", {"schema": "unirobosim-isaaclab-worker-progress/1", "phase": "unknown"}),
+    ],
+)
+def test_worker_startup_progress_must_be_valid_and_strictly_monotonic(progress: object) -> None:
+    replies = [progress]
+    if progress == _startup_progress_reply("bootstrap_connected"):
+        replies.append(progress)
+    factory, connection, process = fake_worker_factory(replies, normalize_startup=False)
+    with pytest.raises(NativeWorkerError, match="progress"):
+        IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert connection.closed and not process.alive
+
+
 def test_worker_startup_deterministic_error_is_not_retried() -> None:
     process = FakeProcess()
     connection = FakeConnection(
-        [("error", {"type": "ValueError", "message": "bad config", "traceback": "remote trace"})],
+        [
+            *(_startup_progress_reply(phase) for phase in _STARTUP_PHASES[:7]),
+            ("error", {"type": "ValueError", "message": "bad config", "traceback": "remote trace"}),
+        ],
         process,
     )
     attempts = 0

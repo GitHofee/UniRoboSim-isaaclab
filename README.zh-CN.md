@@ -4,6 +4,11 @@
 
 `unirobosim-isaaclab` 将 UniRoboSim `0.10.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
 
+Worker 启动只上报一组固定且严格有序的阶段。若启动前 8 秒没有任何
+pre-Kit 进展，或 Kit launch 阶段连续 15 秒没有进展，Adapter 会记录诊断、
+完整清理该 worker，并且只重试一次。阶段进度不能延长单 worker 30 秒的硬上限；
+配置、协议和 package fingerprint 等确定性错误仍然立即失败。
+
 ## 兼容矩阵
 
 | 项目 | 要求档位 |
@@ -157,7 +162,7 @@ with Sim(provider=provider) as sim:
 
 EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分辨率纹理。`anti_aliasing` 支持 `off`、`taa`、`fxaa`、`dlss`、`dlaa`。只有在显存收益高于材质清晰度时才应启用 `texture_streaming=True`。
 
-无头相机档位只在读取传感器时渲染，不再每个物理 tick 都渲染。RGB 帧以连续 C-order NHWC 字节跨越 worker 边界；录制器应使用 `camera.read("rgb").to_bytes()`，避免把一帧展开成数百万个 Python 整数。程序化可视运行还可以通过 `max_render_hz` 独立限制视口渲染频率。
+无头相机档位只在读取传感器时渲染，不再每个物理 tick 都渲染。同一 world revision 的所有相机读取共享一次全局 RTX 渲染；可视运行若已在物理步完成渲染，也会直接复用。RGB 帧以连续 C-order NHWC 字节跨越 worker 边界；录制器应使用 `camera.read("rgb").to_bytes()`，避免把一帧展开成数百万个 Python 整数。程序化可视运行还可以通过 `max_render_hz` 独立限制视口渲染频率。
 
 ## 明确限制
 
@@ -165,7 +170,7 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.10.2 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
+Adapter 0.10.3 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
 
 静态和复合 USD 场景会提供不可变 planning resource 与实时 world transform。
 少于三个顶点的退化 face 会被跳过；非法索引、不一致的方向数据，以及没有任何

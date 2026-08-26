@@ -4,6 +4,12 @@
 
 `unirobosim-isaaclab` connects UniRoboSim `0.10.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
 
+Worker startup reports one fixed, strictly ordered phase sequence. A worker that
+makes no pre-Kit progress for 8 seconds, or remains inside Kit launch for 15
+seconds, is diagnosed, fully cleaned up, and retried once. Progress never extends
+the 30-second per-worker hard limit; deterministic configuration, protocol, and
+package-fingerprint failures remain fail-fast.
+
 ## Compatibility
 
 | Item | Required profile |
@@ -161,7 +167,7 @@ Articulations, skinned meshes, and empty stages are rejected by the rigid normal
 
 The EasyAPI profile defaults to FXAA and disables texture streaming so camera sensors keep full-resolution textures. `anti_aliasing` accepts `off`, `taa`, `fxaa`, `dlss`, or `dlaa`. Enable `texture_streaming=True` only when the memory saving is worth reduced texture fidelity.
 
-The headless camera profile renders on sensor reads instead of every physics tick. RGB frames cross the worker boundary as compact C-order NHWC bytes; use `camera.read("rgb").to_bytes()` in recorders to avoid expanding a frame into Python integers. Programmatic visible runs can set `max_render_hz` to cap viewport rendering independently of physics frequency.
+The headless camera profile renders on sensor reads instead of every physics tick. All camera reads at one world revision share that global RTX render, and visible runs reuse a render already produced by the physics step. RGB frames cross the worker boundary as compact C-order NHWC bytes; use `camera.read("rgb").to_bytes()` in recorders to avoid expanding a frame into Python integers. Programmatic visible runs can set `max_render_hz` to cap viewport rendering independently of physics frequency.
 
 ## Explicit limitations
 
@@ -169,7 +175,7 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.10.2 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
+Adapter 0.10.3 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
 Static and composite USD scenes expose immutable planning resources plus live world
 transforms. Degenerate faces with fewer than three vertices are skipped; invalid
