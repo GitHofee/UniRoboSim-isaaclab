@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import traceback
+import warnings
 from collections.abc import Callable
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -40,6 +41,8 @@ from .native_protocols import (
 from .planning_scene import planning_scene_demanded
 
 _CALL_TIMEOUT_SECONDS = 300.0
+_STARTUP_TIMEOUT_SECONDS = 30.0
+_STARTUP_ATTEMPTS = 2
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/1"
 _WORKER_PROTOCOL_VERSION = 1
@@ -50,6 +53,10 @@ Reply = tuple[str, Any]
 
 class NativeWorkerError(RuntimeError):
     """A native worker failed or returned an exception."""
+
+
+class _NativeWorkerTimeout(NativeWorkerError):
+    """An otherwise-live worker did not reply before its operation deadline."""
 
 
 def _module_origin(module: object, name: str) -> Path:
@@ -496,19 +503,40 @@ class IsaacLabWorkerRuntime:
         *,
         worker_factory: WorkerFactory = _spawn_worker,
     ) -> None:
-        self._connection, self._process = worker_factory(config)
         self._closed = False
         self._active_world: IsaacLabWorkerWorld | None = None
-        try:
-            _validate_worker_startup(self._receive("worker startup"))
-        except Exception:
-            self._abort()
-            raise
+        for attempt in range(1, _STARTUP_ATTEMPTS + 1):
+            self._connection, self._process = worker_factory(config)
+            try:
+                startup = self._receive(
+                    "worker startup",
+                    timeout_seconds=_STARTUP_TIMEOUT_SECONDS,
+                )
+                _validate_worker_startup(startup)
+                break
+            except _NativeWorkerTimeout as exc:
+                self._abort()
+                if attempt == _STARTUP_ATTEMPTS:
+                    raise NativeWorkerError(
+                        "native worker startup timed out after "
+                        f"{_STARTUP_ATTEMPTS} attempts of {_STARTUP_TIMEOUT_SECONDS:g}s"
+                    ) from exc
+                warnings.warn(
+                    "Isaac Kit did not complete native startup within "
+                    f"{_STARTUP_TIMEOUT_SECONDS:g}s; the isolated worker was cleaned up "
+                    f"and startup will be retried ({attempt + 1}/{_STARTUP_ATTEMPTS})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except Exception:
+                self._abort()
+                raise
 
-    def _receive(self, operation: str) -> Any:
+    def _receive(self, operation: str, *, timeout_seconds: float | None = None) -> Any:
+        timeout = _CALL_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         try:
-            if not self._connection.poll(_CALL_TIMEOUT_SECONDS):
-                raise NativeWorkerError(f"timed out after {_CALL_TIMEOUT_SECONDS:g}s during {operation}")
+            if not self._connection.poll(timeout):
+                raise _NativeWorkerTimeout(f"timed out after {timeout:g}s during {operation}")
             reply = cast(Reply, self._connection.recv())
         except (EOFError, OSError) as exc:
             raise NativeWorkerError(

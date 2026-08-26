@@ -859,6 +859,7 @@ def _compose(
         executor=executor,
         planning_raw=planning_raw,
         simulation_root=simulation_root,
+        recording_capture=None,
     )
     return bundle, adapter
 

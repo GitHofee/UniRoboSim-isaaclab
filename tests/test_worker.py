@@ -313,7 +313,7 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/1"
     assert fingerprint["worker_protocol"] == 1
     assert fingerprint["adapter"] == {
-        "version": "0.10.1",
+        "version": "0.10.2",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
     }
     core = cast(dict[str, object], fingerprint["core"])
@@ -680,9 +680,65 @@ def test_worker_startup_failures_abort(startup_reply: object, message: str) -> N
 
 
 def test_worker_startup_timeout_aborts() -> None:
-    factory, connection, process = fake_worker_factory([], poll_result=False)
-    with pytest.raises(NativeWorkerError, match="timed out"):
+    connections: list[FakeConnection] = []
+    processes: list[FakeProcess] = []
+
+    def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
+        del config
+        process = FakeProcess()
+        connection = FakeConnection([], process, poll_result=False)
+        connections.append(connection)
+        processes.append(process)
+        return connection, process
+
+    with pytest.warns(RuntimeWarning, match="startup will be retried"):
+        with pytest.raises(NativeWorkerError, match="timed out after 2 attempts of 30s"):
+            IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert len(connections) == len(processes) == 2
+    assert all(connection.closed for connection in connections)
+    assert all(not process.alive for process in processes)
+
+
+def test_worker_startup_timeout_retries_one_clean_worker() -> None:
+    first_process = FakeProcess()
+    first_connection = FakeConnection([], first_process, poll_result=False)
+    second_process = FakeProcess()
+    second_connection = FakeConnection(
+        [("ok", _worker_startup_fingerprint()), ("ok", None)],
+        second_process,
+    )
+    attempts = iter(((first_connection, first_process), (second_connection, second_process)))
+
+    def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
+        del config
+        return next(attempts)
+
+    with pytest.warns(RuntimeWarning, match=r"retried \(2/2\)"):
+        runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert first_connection.closed and not first_process.alive
+    assert not second_connection.closed and second_process.alive
+
+    runtime.close()
+    assert second_connection.closed and not second_process.alive
+
+
+def test_worker_startup_deterministic_error_is_not_retried() -> None:
+    process = FakeProcess()
+    connection = FakeConnection(
+        [("error", {"type": "ValueError", "message": "bad config", "traceback": "remote trace"})],
+        process,
+    )
+    attempts = 0
+
+    def factory(config: IsaacLabAdapterConfig) -> tuple[Any, Any]:
+        nonlocal attempts
+        del config
+        attempts += 1
+        return connection, process
+
+    with pytest.raises(NativeWorkerError, match="bad config"):
         IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    assert attempts == 1
     assert connection.closed and not process.alive
 
 

@@ -243,7 +243,7 @@ def test_droid_acceptance_entry_point_closes_metadata_and_factory() -> None:
     assert entry_point.name == "isaaclab"
     assert entry_point.group == "unirobosim.backends"
     assert entry_point.value == "unirobosim_isaaclab:create_easy_provider"
-    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.1")
+    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.2")
     factory = entry_point.load()
     assert callable(factory)
     assert factory() is provider
@@ -286,6 +286,8 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
         rate_policy="exact",
         initial_generation_seed=1,
         planning_reads_demanded=False,
+        observation_demand=(),
+        observation_once_channels=(),
     )
     adapter = adapter_module._UniRoboSimAdapter(projection, entry_points=lambda: (entry_point,))
     assert adapter._select_entry_point() is entry_point
@@ -294,7 +296,7 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
         "group": "unirobosim.backends",
         "value": "unirobosim_isaaclab:create_easy_provider",
         "distribution": "unirobosim-isaaclab",
-        "version": "0.10.1",
+        "version": "0.10.2",
     }
     assert entry_point.load()() is provider
 
@@ -438,6 +440,8 @@ def test_droid_compose_keeps_exact_adapter_and_planning_gate() -> None:
         rate_policy="exact",
         initial_generation_seed=1,
         planning_reads_demanded=False,
+        observation_demand=(),
+        observation_once_channels=(),
     )
     bundle, adapter = droid_acceptance._compose(
         SimpleNamespace(runtime={"physics_hz": 240.0}),

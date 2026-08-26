@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.2
+
+- Bound the isolated native-worker startup wait to 30 seconds and retry once
+  after fully cleaning up a worker that never returns from Isaac Kit startup.
+- Keep deterministic startup errors fail-fast; only a live worker that produces
+  no startup reply is retried.
+- Align the DROID acceptance composition with FastSim's explicit recording
+  capture boundary while leaving capture disabled for the adapter-only run.
+
 ## 0.10.1
 
 - Preserve authored per-joint stiffness and damping by default instead of applying
