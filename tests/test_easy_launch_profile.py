@@ -149,7 +149,35 @@ def test_easy_provider_reads_the_profile_exactly_once(monkeypatch: pytest.Monkey
 
 def test_explicit_provider_creation_does_not_read_the_easy_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "getenv", lambda name: pytest.fail(f"unexpected environment read: {name}"))
+    monkeypatch.setattr(unirobosim_isaaclab, "recommended_startup_budgets", lambda: (300.0, 300.0))
 
     provider = unirobosim_isaaclab.create_provider()
 
     assert provider._config.headless is True
+    assert provider._config.worker_startup_hard_timeout_s == 300.0
+    assert provider._config.worker_kit_launch_idle_timeout_s == 300.0
+
+
+def test_explicit_provider_configuration_owns_startup_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        unirobosim_isaaclab,
+        "recommended_startup_budgets",
+        lambda: pytest.fail("explicit provider configuration must not probe startup budgets"),
+    )
+    config = IsaacLabAdapterConfig(
+        worker_startup_hard_timeout_s=42.0,
+        worker_kit_launch_idle_timeout_s=41.0,
+    )
+
+    provider = unirobosim_isaaclab.create_provider(config)
+
+    assert provider._config is config
+
+
+def test_easy_provider_uses_detected_profile_startup_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(unirobosim_isaaclab, "recommended_startup_budgets", lambda: (300.0, 300.0))
+
+    config = _explicit_config("headless")
+
+    assert config.worker_startup_hard_timeout_s == 300.0
+    assert config.worker_kit_launch_idle_timeout_s == 300.0

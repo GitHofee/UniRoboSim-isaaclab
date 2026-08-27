@@ -7,7 +7,7 @@ from unirobosim import ValidationError
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
 from .descriptor import CAMERA_CAPABILITIES, CAPABILITIES, DESCRIPTOR, descriptor_for_config
-from .probe import probe_environment
+from .probe import probe_environment, recommended_startup_budgets
 from .provider import IsaacLabProvider, IsaacLabSession
 from .world import IsaacLabWorld
 
@@ -16,6 +16,12 @@ ISAACLAB_LAUNCH_PROFILE_ENV = "UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE"
 
 
 def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProvider:
+    if config is None:
+        worker_startup_hard_timeout_s, worker_kit_launch_idle_timeout_s = recommended_startup_budgets()
+        config = IsaacLabAdapterConfig(
+            worker_startup_hard_timeout_s=worker_startup_hard_timeout_s,
+            worker_kit_launch_idle_timeout_s=worker_kit_launch_idle_timeout_s,
+        )
     return IsaacLabProvider(config)
 
 
@@ -56,6 +62,7 @@ def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvid
             operation="isaaclab.launch_profile.resolve",
         )
 
+    worker_startup_hard_timeout_s, worker_kit_launch_idle_timeout_s = recommended_startup_budgets()
     return IsaacLabProvider(
         IsaacLabAdapterConfig(
             headless=headless,
@@ -63,6 +70,8 @@ def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvid
             render=render,
             render_on_step=render_on_step,
             max_render_hz=max_render_hz,
+            worker_startup_hard_timeout_s=worker_startup_hard_timeout_s,
+            worker_kit_launch_idle_timeout_s=worker_kit_launch_idle_timeout_s,
         )
     )
 
@@ -82,4 +91,5 @@ __all__ = [
     "create_easy_provider",
     "descriptor_for_config",
     "probe_environment",
+    "recommended_startup_budgets",
 ]

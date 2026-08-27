@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.10.4
+
+- Admit the exact official NGC Isaac Lab 3.0 / Isaac Sim 6.0.1 bundle as a
+  second fail-closed runtime profile. Its probe validates release files, module
+  locations, adapter-required API modules, PhysX, Torch, and debug-draw layout
+  without importing or launching Kit; the existing 6.1.17 source profile remains
+  unchanged and exact.
+- Resolve `isaacsim.util.debug_draw` from both the pip SDK layout and the official
+  NGC bundle layout without an unbounded filesystem search.
+- Keep the source profile at a configurable 90-second Kit idle allowance inside
+  a 120-second hard limit. Give only the fully fingerprinted official NGC profile
+  a finite 300-second allowance for first-run RTX pipeline compilation. Zero-config
+  provider factories select the matching budget automatically; explicitly supplied
+  configurations remain authoritative.
+
 ## 0.10.3
 
 - Share one global RTX render across every camera read at the same world

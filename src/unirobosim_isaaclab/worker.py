@@ -43,22 +43,18 @@ from .native_protocols import (
 from .planning_scene import planning_scene_demanded
 
 _CALL_TIMEOUT_SECONDS = 300.0
-_STARTUP_TIMEOUT_SECONDS = 30.0
 _STARTUP_ATTEMPTS = 2
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/2"
 _WORKER_PROGRESS_SCHEMA = "unirobosim-isaaclab-worker-progress/1"
 _WORKER_PROTOCOL_VERSION = 2
 
-# Visible Kit startup took 6.809--8.136 seconds across all seven instrumented
-# launches on the acceptance host on 2026-08-26.  A 15 second Kit-phase idle
-# limit preserves almost 7 seconds of margin above that observed maximum.  A
-# SIGUSR1 stack placed the failed acceptance worker inside Kit's native startup
-# call before its first Carbonite event; that phase receives the 15 second
-# allowance.  Earlier interpreter/import phases normally complete in well under
-# a second and use an 8 second idle limit.  Progress is a fixed, strictly ordered
-# sequence: it can never act as an unbounded heartbeat or extend the 30 second
-# per-worker hard limit.
+# Earlier interpreter/import phases normally complete in well under a second and
+# retain small fixed idle limits.  Kit launch is the exceptional phase: a cold
+# container can legitimately spend tens of seconds compiling/loading native state,
+# so its idle limit and the per-worker hard limit come from the validated adapter
+# configuration.  Progress remains a fixed, strictly ordered sequence: it can
+# never act as an unbounded heartbeat or extend the configured hard limit.
 _STARTUP_PHASES = (
     "bootstrap_connected",
     "config_received",
@@ -79,7 +75,6 @@ _STARTUP_PHASE_IDLE_TIMEOUT_SECONDS = {
     "native_module_loading": 8.0,
     "native_module_loaded": 8.0,
     "sdk_importing": 8.0,
-    "kit_launching": 15.0,
     "kit_ready": 10.0,
     "runtime_importing": 10.0,
     "runtime_ready": 5.0,
@@ -592,7 +587,7 @@ class IsaacLabWorkerRuntime:
         for attempt in range(1, _STARTUP_ATTEMPTS + 1):
             self._connection, self._process = worker_factory(config)
             try:
-                startup = self._receive_startup()
+                startup = self._receive_startup(config)
                 _validate_worker_startup(startup)
                 break
             except _NativeWorkerTimeout as exc:
@@ -611,19 +606,22 @@ class IsaacLabWorkerRuntime:
                 self._abort()
                 raise
 
-    def _receive_startup(self) -> Any:
+    def _receive_startup(self, config: IsaacLabAdapterConfig) -> Any:
         started = time.monotonic()
-        hard_deadline = started + _STARTUP_TIMEOUT_SECONDS
+        hard_limit = config.worker_startup_hard_timeout_s
+        hard_deadline = started + hard_limit
         phase = "process_spawned"
         next_phase_index = 0
         while True:
             now = time.monotonic()
-            idle_limit = _STARTUP_PHASE_IDLE_TIMEOUT_SECONDS[phase]
+            idle_limit = (
+                config.worker_kit_launch_idle_timeout_s
+                if phase == "kit_launching"
+                else _STARTUP_PHASE_IDLE_TIMEOUT_SECONDS[phase]
+            )
             timeout = min(idle_limit, max(0.0, hard_deadline - now))
             if timeout <= 0.0:
-                raise _NativeWorkerTimeout(
-                    f"stalled in startup phase {phase!r} at the {_STARTUP_TIMEOUT_SECONDS:g}s hard limit"
-                )
+                raise _NativeWorkerTimeout(f"stalled in startup phase {phase!r} at the {hard_limit:g}s hard limit")
             try:
                 value = self._receive(
                     "worker startup",
@@ -632,11 +630,11 @@ class IsaacLabWorkerRuntime:
                 )
             except _NativeWorkerTimeout as exc:
                 elapsed = time.monotonic() - started
-                limit_kind = "hard" if elapsed >= _STARTUP_TIMEOUT_SECONDS else "idle"
+                limit_kind = "hard" if elapsed >= hard_limit else "idle"
                 raise _NativeWorkerTimeout(
                     f"stalled in startup phase {phase!r} after {elapsed:.3f}s "
                     f"({limit_kind} limit, phase idle limit {idle_limit:g}s, "
-                    f"hard limit {_STARTUP_TIMEOUT_SECONDS:g}s)"
+                    f"hard limit {hard_limit:g}s)"
                 ) from exc
             if isinstance(value, _WorkerStartupProgress):
                 expected_phase = _STARTUP_PHASES[next_phase_index] if next_phase_index < len(_STARTUP_PHASES) else None

@@ -92,7 +92,17 @@ def test_overlay_close_is_idempotent_and_rejects_mutation() -> None:
 def test_debug_extension_lookup_is_explicit_about_sdk_cache(tmp_path: Path) -> None:
     root = tmp_path / "isaacsim"
     extension = root / "extscache" / "isaacsim.util.debug_draw-3.2.3"
-    extension.mkdir(parents=True)
+    (extension / "bin").mkdir(parents=True)
+    (extension / "isaacsim").mkdir()
     assert _find_debug_extension(root) == extension
     with pytest.raises(RuntimeError, match="isaacsim-extscache-kit-sdk"):
         _find_debug_extension(tmp_path / "missing")
+
+
+def test_debug_extension_lookup_supports_official_ngc_bundle_layout(tmp_path: Path) -> None:
+    package_root = tmp_path / "isaac-sim" / "python_packages" / "isaacsim"
+    package_root.mkdir(parents=True)
+    extension = tmp_path / "isaac-sim" / "extscache" / "isaacsim.util.debug_draw-3.2.3"
+    (extension / "bin").mkdir(parents=True)
+    (extension / "isaacsim").mkdir()
+    assert _find_debug_extension(package_root) == extension

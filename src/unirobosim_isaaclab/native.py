@@ -123,7 +123,21 @@ _GLYPHS = {
 
 
 def _find_debug_extension(isaacsim_root: Path) -> Path:
-    extension = next(iter(sorted((isaacsim_root / "extscache").glob("isaacsim.util.debug_draw-*"))), None)
+    # The pip SDK places ``extscache`` below the ``isaacsim`` package root,
+    # whereas the official NGC image places the package at
+    # ``<root>/python_packages/isaacsim`` and the cache at ``<root>/extscache``.
+    # Search only this bounded ancestor chain and require the exact extension;
+    # never scan arbitrary SDK or filesystem roots.
+    search_roots = (isaacsim_root, *isaacsim_root.parents[:3])
+    extension = next(
+        (
+            candidate
+            for root in search_roots
+            for candidate in sorted((root / "extscache").glob("isaacsim.util.debug_draw-*"))
+            if (candidate / "bin").is_dir() and (candidate / "isaacsim").is_dir()
+        ),
+        None,
+    )
     if extension is None:
         raise RuntimeError(
             "Isaac native debug sink requires isaacsim.util.debug_draw; install "

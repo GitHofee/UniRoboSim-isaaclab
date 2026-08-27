@@ -319,6 +319,21 @@ DESCRIPTOR = ProviderDescriptor(
             "isaaclab_physx_distribution": "1.1.3",
             "isaacsim_distribution": "6.0.1.0",
             "python": "3.12",
+            "runtime_profiles": [
+                {
+                    "id": "source-isaaclab-3.0.0-beta2",
+                    "isaaclab_distribution": "6.1.17",
+                    "isaacsim_distribution": "6.0.1.0",
+                    "torch_distribution": "2.11.0",
+                },
+                {
+                    "id": "ngc-isaaclab-3.0.0",
+                    "isaaclab_release": "3.0.0",
+                    "isaaclab_distribution": "6.1.11",
+                    "isaacsim_release": "6.0.1",
+                    "torch_distribution": "2.10.0",
+                },
+            ],
         }
     ),
 )

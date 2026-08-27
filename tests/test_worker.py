@@ -277,7 +277,10 @@ def test_spawn_worker_passes_anchored_argv_and_child_environment(monkeypatch: py
     subprocess_module = cast(Any, worker_module).__dict__["subprocess"]
     monkeypatch.setattr(multiprocessing_module, "get_context", lambda method: context)
     monkeypatch.setattr(subprocess_module, "Popen", fake_popen)
-    config = IsaacLabAdapterConfig()
+    config = IsaacLabAdapterConfig(
+        worker_startup_hard_timeout_s=240,
+        worker_kit_launch_idle_timeout_s=180,
+    )
 
     connection, handle = _spawn_worker(config)
 
@@ -293,6 +296,9 @@ def test_spawn_worker_passes_anchored_argv_and_child_environment(monkeypatch: py
     assert kwargs["start_new_session"] is True
     assert child.closed
     assert parent.sent == [config]
+    sent_config = cast(IsaacLabAdapterConfig, parent.sent[0])
+    assert sent_config.worker_startup_hard_timeout_s == 240.0
+    assert sent_config.worker_kit_launch_idle_timeout_s == 180.0
 
 
 def test_spawn_worker_failure_closes_both_pipe_ends(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,7 +343,7 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/2"
     assert fingerprint["worker_protocol"] == 2
     assert fingerprint["adapter"] == {
-        "version": "0.10.3",
+        "version": "0.10.4",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
     }
     core = cast(dict[str, object], fingerprint["core"])
@@ -778,10 +784,14 @@ def test_worker_startup_timeout_identifies_last_strict_phase() -> None:
         processes.append(process)
         return connection, process
 
-    with pytest.warns(RuntimeWarning, match="phase 'kit_launching'.*phase idle limit 15s"):
-        with pytest.raises(NativeWorkerError, match="phase 'kit_launching'.*phase idle limit 15s"):
-            IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
-    assert all(connection.poll_calls[-1] == pytest.approx(15.0, abs=0.01) for connection in connections)
+    config = IsaacLabAdapterConfig(
+        worker_startup_hard_timeout_s=40,
+        worker_kit_launch_idle_timeout_s=23,
+    )
+    with pytest.warns(RuntimeWarning, match="phase 'kit_launching'.*phase idle limit 23s"):
+        with pytest.raises(NativeWorkerError, match="phase 'kit_launching'.*phase idle limit 23s"):
+            IsaacLabWorkerRuntime(config, worker_factory=factory)
+    assert all(connection.poll_calls[-1] == pytest.approx(23.0, abs=0.01) for connection in connections)
     assert all(connection.closed for connection in connections)
     assert all(not process.alive for process in processes)
 
@@ -810,7 +820,13 @@ def test_worker_startup_progress_cannot_extend_hard_limit(monkeypatch: pytest.Mo
     monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock)
     with pytest.warns(RuntimeWarning, match="30s hard limit"):
         with pytest.raises(NativeWorkerError, match="30s hard limit"):
-            IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+            IsaacLabWorkerRuntime(
+                IsaacLabAdapterConfig(
+                    worker_startup_hard_timeout_s=30,
+                    worker_kit_launch_idle_timeout_s=15,
+                ),
+                worker_factory=factory,
+            )
     assert len(connections) == 2
     assert all(connection.closed and not connection.process.alive for connection in connections)
 

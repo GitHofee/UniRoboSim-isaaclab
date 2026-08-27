@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import importlib.metadata
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -33,10 +34,14 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.3"
+    assert unirobosim_isaaclab.__version__ == "0.10.4"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
+    assert [profile["id"] for profile in DESCRIPTOR.metadata["runtime_profiles"]] == [
+        "source-isaaclab-3.0.0-beta2",
+        "ngc-isaaclab-3.0.0",
+    ]
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
     assert CAPABILITIES.get(CapabilityId("control.rigid_body.wrench@1")) is not None
     assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None
@@ -103,6 +108,38 @@ def test_default_position_gains_preserve_authored_asset_values() -> None:
     config = IsaacLabAdapterConfig()
     assert config.position_stiffness is None
     assert config.position_damping is None
+
+
+def test_default_worker_startup_budget_covers_cold_kit_without_unbounded_wait() -> None:
+    config = IsaacLabAdapterConfig()
+    assert config.worker_startup_hard_timeout_s == 120.0
+    assert config.worker_kit_launch_idle_timeout_s == 90.0
+
+
+def test_worker_startup_budget_is_normalized_and_serializable() -> None:
+    config = IsaacLabAdapterConfig(
+        worker_startup_hard_timeout_s=300,
+        worker_kit_launch_idle_timeout_s=45,
+    )
+    restored = pickle.loads(pickle.dumps(config))
+    assert restored == config
+    assert restored.worker_startup_hard_timeout_s == 300.0
+    assert restored.worker_kit_launch_idle_timeout_s == 45.0
+
+
+@pytest.mark.parametrize("field", ["worker_startup_hard_timeout_s", "worker_kit_launch_idle_timeout_s"])
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "120", "bad", 301])
+def test_invalid_worker_startup_budget(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        IsaacLabAdapterConfig(**{field: value})  # type: ignore[arg-type]
+
+
+def test_kit_launch_idle_budget_cannot_exceed_worker_hard_budget() -> None:
+    with pytest.raises(ValidationError, match="must not exceed"):
+        IsaacLabAdapterConfig(
+            worker_startup_hard_timeout_s=20,
+            worker_kit_launch_idle_timeout_s=21,
+        )
 
 
 @pytest.mark.parametrize("device", ["", "gpu", "cuda:-1", "CUDA:0", 7])
@@ -230,6 +267,138 @@ def test_probe_cpu_success_and_version_failures() -> None:
         }
     )
     assert probe_environment(IsaacLabAdapterConfig(device="cpu"), DESCRIPTOR, version_reader=versions.get).available
+
+
+def test_recommended_startup_budgets_are_larger_only_for_verified_ngc_bundle() -> None:
+    source_versions = dict(probe_module._EXPECTED)
+    ngc_versions: dict[str, str | None] = {
+        **source_versions,
+        **probe_module._OFFICIAL_NGC_EXPECTED,
+        "isaacsim": None,
+        "torchaudio": None,
+    }
+    accepted_bundle = probe_module._OfficialBundleEvidence((), {"isaacsim_release": "6.0.1"})
+    rejected_bundle = probe_module._OfficialBundleEvidence(("bundle mismatch",), {})
+
+    assert probe_module.recommended_startup_budgets(version_reader=source_versions.get) == (120.0, 90.0)
+    assert probe_module.recommended_startup_budgets(
+        version_reader=ngc_versions.get,
+        official_bundle_inspector=lambda: accepted_bundle,
+    ) == (300.0, 300.0)
+    assert probe_module.recommended_startup_budgets(
+        version_reader=ngc_versions.get,
+        official_bundle_inspector=lambda: rejected_bundle,
+    ) == (120.0, 90.0)
+
+
+def test_probe_accepts_only_validated_official_ngc_bundle_profile() -> None:
+    versions: dict[str, str | None] = {
+        "isaaclab": "6.1.11",
+        "isaaclab_physx": "1.1.3",
+        "isaacsim": None,
+        "torch": "2.10.0+cu128",
+        "torchvision": "0.25.0+cu128",
+        "torchaudio": None,
+    }
+    calls = 0
+
+    def inspect() -> probe_module._OfficialBundleEvidence:
+        nonlocal calls
+        calls += 1
+        return probe_module._OfficialBundleEvidence(
+            (),
+            {
+                "isaaclab_release": "3.0.0",
+                "isaacsim_release": "6.0.1",
+                "isaacsim_build": "6.0.1-alpha.17+develop.42429.af8ceaf7.gl",
+            },
+        )
+
+    report = probe_environment(
+        IsaacLabAdapterConfig(device="cpu"),
+        DESCRIPTOR,
+        version_reader=versions.get,
+        official_bundle_inspector=inspect,
+    )
+    assert report.available
+    assert report.reason is None
+    assert calls == 1
+    assert report.details["runtime_profile"] == "ngc-isaaclab-3.0.0"
+    assert report.details["runtime_profile_evidence"]["isaacsim_release"] == "6.0.1"
+
+
+def test_probe_rejects_ngc_fingerprint_when_bundle_capabilities_are_incomplete() -> None:
+    versions: dict[str, str | None] = {
+        "isaaclab": "6.1.11",
+        "isaaclab_physx": "1.1.3",
+        "isaacsim": None,
+        "torch": "2.10.0",
+        "torchvision": "0.25.0",
+        "torchaudio": None,
+    }
+    report = probe_environment(
+        IsaacLabAdapterConfig(device="cpu"),
+        DESCRIPTOR,
+        version_reader=versions.get,
+        official_bundle_inspector=lambda: probe_module._OfficialBundleEvidence(
+            ("official NGC bundle is missing required adapter API modules: sensors/camera/__init__.py",),
+            {"missing_api_modules": ("sensors/camera/__init__.py",)},
+        ),
+    )
+    assert not report.available
+    assert report.details["runtime_profile"] is None
+    assert "sensors/camera" in (report.reason or "")
+
+
+def test_official_ngc_bundle_inspection_is_file_based_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isaaclab_root = tmp_path / "workspace" / "isaaclab"
+    isaaclab_package = isaaclab_root / "source" / "isaaclab" / "isaaclab"
+    physx_package = isaaclab_root / "source" / "isaaclab_physx" / "isaaclab_physx"
+    isaacsim_root = tmp_path / "isaac-sim"
+    isaacsim_package = isaacsim_root / "python_packages" / "isaacsim"
+    (isaaclab_root / "VERSION").parent.mkdir(parents=True)
+    (isaaclab_root / "VERSION").write_text("3.0.0\n", encoding="utf-8")
+    for relative in (
+        "app/__init__.py",
+        "sim/__init__.py",
+        "actuators/__init__.py",
+        "assets/__init__.py",
+        "assets/articulation/__init__.py",
+        "assets/rigid_object/__init__.py",
+        "sensors/camera/__init__.py",
+        "sensors/contact_sensor/__init__.py",
+        "sim/schemas/__init__.py",
+    ):
+        path = isaaclab_package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    for relative in ("physics/__init__.py", "sim/schemas/__init__.py"):
+        path = physx_package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    (isaacsim_root / "docs" / "py").mkdir(parents=True)
+    (isaacsim_root / "docs" / "py" / "VERSION").write_text("6.0.1\n", encoding="utf-8")
+    (isaacsim_root / "VERSION").write_text("6.0.1-alpha.17+develop.42429.af8ceaf7.gl\n", encoding="utf-8")
+    isaacsim_package.mkdir(parents=True)
+    extension = isaacsim_root / "extscache" / "isaacsim.util.debug_draw-3.2.3"
+    (extension / "bin").mkdir(parents=True)
+    (extension / "isaacsim").mkdir()
+    package_paths = {
+        "isaaclab": isaaclab_package,
+        "isaaclab_physx": physx_package,
+        "isaacsim": isaacsim_package,
+    }
+    monkeypatch.setattr(probe_module, "_package_directory", package_paths.get)
+
+    evidence = probe_module._inspect_official_ngc_bundle()
+
+    assert evidence.issues == ()
+    assert evidence.details["isaaclab_release"] == "3.0.0"
+    assert evidence.details["isaacsim_release"] == "6.0.1"
+    assert evidence.details["debug_draw_extension"] == str(extension)
 
 
 def test_probe_rejects_other_python(monkeypatch: pytest.MonkeyPatch) -> None:

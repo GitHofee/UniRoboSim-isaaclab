@@ -11,6 +11,7 @@ from unirobosim import ValidationError
 _DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)$")
 _ANTI_ALIASING_MODES = {"off": 0, "taa": 1, "fxaa": 2, "dlss": 3, "dlaa": 4}
 _FLUID_RENDER_MODES = {"particles", "isosurface"}
+_MAX_STARTUP_BUDGET_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,11 @@ class IsaacLabAdapterConfig:
     position_damping: float | None = None
     velocity_damping: float = 100.0
     max_cached_scene_commands: int = 4096
+    # Cold containers can spend tens of seconds compiling/loading Kit state.
+    # These budgets remain finite and affect only a worker that has not become
+    # ready yet, so a warm worker never waits for the unused allowance.
+    worker_startup_hard_timeout_s: float = 120.0
+    worker_kit_launch_idle_timeout_s: float = 90.0
 
     def __post_init__(self) -> None:
         if (
@@ -146,3 +152,28 @@ class IsaacLabAdapterConfig:
                 "max_cached_scene_commands must be an integer in [16, 1000000]",
                 operation="isaaclab.config.validate",
             )
+        startup_budgets = {
+            "worker_startup_hard_timeout_s": self.worker_startup_hard_timeout_s,
+            "worker_kit_launch_idle_timeout_s": self.worker_kit_launch_idle_timeout_s,
+        }
+        normalized_startup_budgets: dict[str, float] = {}
+        for name, value in startup_budgets.items():
+            if type(value) not in (int, float):
+                raise ValidationError(f"{name} must be numeric", operation="isaaclab.config.validate")
+            seconds = float(value)
+            if not math.isfinite(seconds) or not 0.0 < seconds <= _MAX_STARTUP_BUDGET_SECONDS:
+                raise ValidationError(
+                    f"{name} must be positive, finite, and at most {_MAX_STARTUP_BUDGET_SECONDS:g}",
+                    operation="isaaclab.config.validate",
+                )
+            normalized_startup_budgets[name] = seconds
+        if (
+            normalized_startup_budgets["worker_kit_launch_idle_timeout_s"]
+            > normalized_startup_budgets["worker_startup_hard_timeout_s"]
+        ):
+            raise ValidationError(
+                "worker_kit_launch_idle_timeout_s must not exceed worker_startup_hard_timeout_s",
+                operation="isaaclab.config.validate",
+            )
+        for name, value in normalized_startup_budgets.items():
+            object.__setattr__(self, name, value)

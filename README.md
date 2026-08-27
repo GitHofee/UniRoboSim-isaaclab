@@ -4,25 +4,31 @@
 
 `unirobosim-isaaclab` connects UniRoboSim `0.10.x` to Isaac Lab 3.0 / Isaac Sim 6.0.1. Import and `probe()` are side-effect free. `open()` starts Kit in an adapter-owned worker process, so Isaac Sim cannot take over or terminate the application process.
 
-Worker startup reports one fixed, strictly ordered phase sequence. A worker that
-makes no pre-Kit progress for 8 seconds, or remains inside Kit launch for 15
-seconds, is diagnosed, fully cleaned up, and retried once. Progress never extends
-the 30-second per-worker hard limit; deterministic configuration, protocol, and
-package-fingerprint failures remain fail-fast.
+Worker startup reports one fixed, strictly ordered phase sequence. Pre-Kit phases
+retain short fail-fast idle limits. The source profile uses a 90-second Kit idle
+budget inside a 120-second per-worker hard limit. The exact official NGC profile uses
+a 300-second finite budget because its first GPU launch may compile RTX pipelines
+without emitting worker-protocol progress. Both budgets are validated and capped at 300 seconds;
+unused allowance adds no delay to warm startup. A timeout is diagnosed, fully cleaned
+up, and retried once. Progress never extends the hard limit, while deterministic
+configuration, protocol, and package-fingerprint failures remain fail-fast.
 
 ## Compatibility
 
-| Item | Required profile |
-| --- | --- |
-| Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.10,<0.11` |
-| Isaac Lab profile | `release/3.0.0-beta2` (`isaaclab==6.1.17`) |
-| Isaac Lab PhysX | `1.1.3` |
-| Isaac Sim | `6.0.1.0` |
-| PyTorch | `torch==2.11.0` |
-| TorchVision | `torchvision==0.26.0` |
-| TorchAudio | `torchaudio==2.11.0` |
-| Runtime contract | `v0alpha6` |
+Python `>=3.12,<3.13`, UniRoboSim `>=0.10,<0.11`, and runtime contract
+`v0alpha6` are common to both admitted profiles:
+
+| Profile | Isaac Lab | Isaac Sim | Torch stack |
+| --- | --- | --- | --- |
+| `source-isaaclab-3.0.0-beta2` | source release, distribution `6.1.17`; PhysX `1.1.3` | distribution `6.0.1.0` | Torch `2.11.0`, TorchVision `0.26.0`, TorchAudio `2.11.0` |
+| `ngc-isaaclab-3.0.0` | official NGC bundle, `VERSION=3.0.0`, distribution `6.1.11`; PhysX `1.1.3` | module bundle, `VERSION=6.0.1` | Torch `2.10.0`, TorchVision `0.25.0`; TorchAudio is not required |
+
+The NGC profile is not a relaxed version range. It recognizes the exact official
+bundle layout and verifies the Isaac Lab and Isaac Sim version files, top-level
+module locations, every adapter-required API module, and the debug-draw extension.
+The source profile retains its complete exact distribution gate. The larger NGC
+startup budget is selected only after this complete fingerprint passes and adds no
+delay to a warm launch.
 
 ## Installation
 
@@ -65,12 +71,14 @@ python -m pip check
 python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
 ```
 
-The CUDA 12.8 command above is the tested Linux x86-64 profile. CUDA wheels with the
-same public versions and a compatible local tag are accepted. The adapter intentionally
-keeps the large NVIDIA and Torch packages out of its own wheel metadata. The probe reads
-distribution metadata for Isaac Lab, Isaac Lab PhysX, Isaac Sim, PyTorch, TorchVision,
-and TorchAudio, and fails closed on a missing or incompatible package. `pip check` must
-finish with `No broken requirements found`.
+The CUDA 12.8 command above is the tested Linux x86-64 source profile. CUDA wheels with
+the same public versions and a compatible local tag are accepted. The adapter
+intentionally keeps the large NVIDIA and Torch packages out of its own wheel metadata.
+The side-effect-free probe selects exactly one supported profile. It reads distribution
+metadata for the source profile; for the NGC profile it additionally reads the official
+bundle's module specs, version files, required module tree, and extension layout without
+importing or launching Kit. It fails closed if neither complete fingerprint matches.
+`pip check` must finish with `No broken requirements found` for the source profile.
 
 ## EasyAPI
 
@@ -114,6 +122,9 @@ Values are case-sensitive. Any other value fails before the Isaac SDK is loaded.
 The adapter does not infer a profile from `DISPLAY`, so batch behavior is stable across
 machines. This selector applies only to normal installed entry-point discovery;
 `create_provider(IsaacLabAdapterConfig(...))` remains the explicit programmatic API.
+Calling `create_provider()` without a configuration uses the same exact-profile
+startup-budget selection as the installed entry point. Passing a configuration is
+authoritative, including both worker startup budgets.
 FastSim passes its canonical Plan value directly to the same entry-point factory, for
 example `create_easy_provider(launch_profile="headless-physics")`. An explicit keyword
 never reads `UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE`; the environment remains a
@@ -134,6 +145,8 @@ provider = create_provider(
         anti_aliasing="fxaa",
         texture_streaming=False,
         render_on_step=False,
+        worker_startup_hard_timeout_s=120,
+        worker_kit_launch_idle_timeout_s=90,
     )
 )
 
@@ -175,7 +188,7 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.10.3 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
+Adapter 0.10.4 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
 Static and composite USD scenes expose immutable planning resources plus live world
 transforms. Degenerate faces with fewer than three vertices are skipped; invalid

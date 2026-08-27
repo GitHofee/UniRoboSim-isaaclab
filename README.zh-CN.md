@@ -4,24 +4,28 @@
 
 `unirobosim-isaaclab` 将 UniRoboSim `0.10.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
 
-Worker 启动只上报一组固定且严格有序的阶段。若启动前 8 秒没有任何
-pre-Kit 进展，或 Kit launch 阶段连续 15 秒没有进展，Adapter 会记录诊断、
-完整清理该 worker，并且只重试一次。阶段进度不能延长单 worker 30 秒的硬上限；
-配置、协议和 package fingerprint 等确定性错误仍然立即失败。
+Worker 启动只上报一组固定且严格有序的阶段。pre-Kit 阶段继续使用较短的
+fail-fast idle 上限。源码档位在单 worker 120 秒硬上限内使用 90 秒 Kit idle
+预算；精确匹配的官方 NGC 档位使用有限的 300 秒预算，因为首次 GPU 启动可能在
+不产生 worker 协议进度的情况下编译 RTX pipeline。所有预算都经过校验且最大为
+300 秒；热启动不会等待未使用的预算。超时后 Adapter 会记录诊断、完整清理该
+worker，并且只重试一次。阶段进度不能延长硬上限；配置、协议和 package
+fingerprint 等确定性错误仍然立即失败。
 
 ## 兼容矩阵
 
-| 项目 | 要求档位 |
-| --- | --- |
-| Python | `>=3.12,<3.13` |
-| UniRoboSim | `>=0.10,<0.11` |
-| Isaac Lab profile | `release/3.0.0-beta2`（`isaaclab==6.1.17`） |
-| Isaac Lab PhysX | `1.1.3` |
-| Isaac Sim | `6.0.1.0` |
-| PyTorch | `torch==2.11.0` |
-| TorchVision | `torchvision==0.26.0` |
-| TorchAudio | `torchaudio==2.11.0` |
-| Runtime contract | `v0alpha6` |
+两个准入档位共同要求 Python `>=3.12,<3.13`、UniRoboSim `>=0.10,<0.11`
+和运行时合同 `v0alpha6`：
+
+| 档位 | Isaac Lab | Isaac Sim | Torch 栈 |
+| --- | --- | --- | --- |
+| `source-isaaclab-3.0.0-beta2` | 源码 release，发行包 `6.1.17`；PhysX `1.1.3` | 发行包 `6.0.1.0` | Torch `2.11.0`、TorchVision `0.26.0`、TorchAudio `2.11.0` |
+| `ngc-isaaclab-3.0.0` | 官方 NGC bundle，`VERSION=3.0.0`、发行包 `6.1.11`；PhysX `1.1.3` | 模块 bundle，`VERSION=6.0.1` | Torch `2.10.0`、TorchVision `0.25.0`；不要求 TorchAudio |
+
+NGC 档位不是放宽后的版本区间。它只识别官方 bundle 的精确布局，并检查
+Isaac Lab/Isaac Sim 版本文件、顶层模块位置、Adapter 所需的全部 API 模块和
+debug-draw 扩展。源码档位仍保留完整的精确发行包门禁。只有这套完整指纹通过后才会
+选用更大的 NGC 启动预算，热启动不会因此增加延迟。
 
 ## 安装
 
@@ -63,11 +67,12 @@ python -m pip check
 python -c "from unirobosim_isaaclab import create_provider; print(create_provider().probe())"
 ```
 
-上面的 CUDA 12.8 命令是已验证的 Linux x86-64 档位。公开版本相同且本地
+上面的 CUDA 12.8 命令是已验证的 Linux x86-64 源码档位。公开版本相同且本地
 CUDA 标签兼容的 Wheel 也可接受。Adapter 会有意将大型 NVIDIA 和 Torch 包排除在
-自身 Wheel 元数据之外。Probe 会读取 Isaac Lab、Isaac Lab PhysX、Isaac Sim、
-PyTorch、TorchVision 和 TorchAudio 的发行包元数据，缺包或版本不兼容都会明确
-失败；`pip check` 必须输出 `No broken requirements found`。
+自身 Wheel 元数据之外。无副作用 Probe 只会选择一个完整支持档位：源码档位读取
+发行包元数据；NGC 档位还会读取官方 bundle 的模块 spec、版本文件、必需模块树和
+扩展布局，但不会导入或启动 Kit。两个完整 fingerprint 都不匹配时会 fail closed。
+源码档位的 `pip check` 必须输出 `No broken requirements found`。
 
 ## EasyAPI
 
@@ -110,6 +115,8 @@ UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE=visible python run_simulation.py
 自动推断档位，因此同一批处理任务在不同机器上的默认行为一致。这个选择器只作用于
 正常的已安装入口发现；`create_provider(IsaacLabAdapterConfig(...))` 仍是显式的
 程序化配置接口。
+不传配置调用 `create_provider()` 时，会与已安装入口一样，根据完整兼容档位自动选择
+启动预算；一旦显式传入配置，其中的两个 worker 启动预算就是权威值。
 FastSim 会把 Plan 中的规范值直接传给同一个入口工厂，例如
 `create_easy_provider(launch_profile="headless-physics")`。显式关键字不会读取
 `UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE`；环境变量只保留给零参数 EasyAPI 兼容路径。
@@ -129,6 +136,8 @@ provider = create_provider(
         anti_aliasing="fxaa",
         texture_streaming=False,
         render_on_step=False,
+        worker_startup_hard_timeout_s=120,
+        worker_kit_launch_idle_timeout_s=90,
     )
 )
 
@@ -170,7 +179,7 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.10.3 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
+Adapter 0.10.4 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
 
 静态和复合 USD 场景会提供不可变 planning resource 与实时 world transform。
 少于三个顶点的退化 face 会被跳过；非法索引、不一致的方向数据，以及没有任何
