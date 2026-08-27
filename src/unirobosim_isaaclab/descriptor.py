@@ -236,6 +236,14 @@ CAPABILITIES = CapabilitySet(
                 }
             ),
         ),
+        CapabilityDeclaration(CapabilityId("scene.snapshot@1")),
+        CapabilityDeclaration(CapabilityId("scene.delta@1")),
+        CapabilityDeclaration(CapabilityId("scene.command.pose@1")),
+        CapabilityDeclaration(
+            CapabilityId("scene.command.drag@1"),
+            FrozenMap({"entity_kinds": ["rigid_body"], "modes": ["kinematic"]}),
+            limitations=("constraint drag is not exposed by the adapter",),
+        ),
         CapabilityDeclaration(
             CapabilityId("render.browser-scene@1"),
             FrozenMap(

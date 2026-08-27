@@ -52,6 +52,14 @@ def test_public_identity_and_protocol() -> None:
     assert any("raw USD/Omni Physics" in limitation for limitation in fluid_state.limitations)
     assert any("particle reaction loads" in limitation for limitation in fluid_state.limitations)
     assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("scene.snapshot@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("scene.delta@1")) is not None
+    pose_command = CAPABILITIES.get(CapabilityId("scene.command.pose@1"))
+    assert pose_command is not None
+    drag_command = CAPABILITIES.get(CapabilityId("scene.command.drag@1"))
+    assert drag_command is not None
+    assert drag_command.properties == FrozenMap({"entity_kinds": ["rigid_body"], "modes": ["kinematic"]})
+    assert any("constraint drag" in limitation for limitation in drag_command.limitations)
     assert CAPABILITIES.get(CapabilityId("render.browser-scene@1")) is not None
     asset_formats = CAPABILITIES.get(CapabilityId("asset.formats@1"))
     assert asset_formats is not None
@@ -81,6 +89,8 @@ def test_public_identity_and_protocol() -> None:
     assert camera_provider.descriptor is not DESCRIPTOR
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.rgb@1")) is not None
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.normals@1")) is not None
+    assert camera_provider.descriptor.capabilities.get(CapabilityId("scene.command.pose@1")) is pose_command
+    assert camera_provider.descriptor.capabilities.get(CapabilityId("scene.command.drag@1")) is drag_command
     camera_profile = camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera@1"))
     assert camera_profile is not None
     assert camera_profile.properties["mount_parent_kinds"] == ("articulation",)
