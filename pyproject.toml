@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "unirobosim-isaaclab"
-version = "0.10.4"
+version = "0.10.6"
 description = "Isaac Lab 3.0 and Isaac Sim 6.0 adapter for UniRoboSim"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

@@ -188,7 +188,7 @@ In this Isaac Sim profile, particle state is read through PhysX/USD rather than 
 
 ## Planning-scene compatibility
 
-Adapter 0.10.4 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
+Adapter 0.10.6 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
 Static and composite USD scenes expose immutable planning resources plus live world
 transforms. Degenerate faces with fewer than three vertices are skipped; invalid

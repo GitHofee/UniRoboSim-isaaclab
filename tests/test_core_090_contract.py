@@ -243,7 +243,7 @@ def test_droid_acceptance_entry_point_closes_metadata_and_factory() -> None:
     assert entry_point.name == "isaaclab"
     assert entry_point.group == "unirobosim.backends"
     assert entry_point.value == "unirobosim_isaaclab:create_easy_provider"
-    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.4")
+    assert (entry_point.dist.name, entry_point.dist.version) == ("unirobosim-isaaclab", "0.10.6")
     factory = entry_point.load()
     assert callable(factory)
     assert factory() is provider
@@ -300,7 +300,7 @@ def test_droid_acceptance_entry_point_passes_fastsim_adapter_discovery() -> None
         "group": "unirobosim.backends",
         "value": "unirobosim_isaaclab:create_easy_provider",
         "distribution": "unirobosim-isaaclab",
-        "version": "0.10.4",
+        "version": "0.10.6",
     }
     assert entry_point.load()() is provider
     assert (

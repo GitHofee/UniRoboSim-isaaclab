@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.6
+
+- Enable Isaac Sim 6's legacy RTX Real-Time implementation at the Kit startup
+  boundary when ordinary cameras select `RaytracedLighting`. Isaac Sim 6 keeps
+  that implementation disabled by default, so selecting it later through
+  `SimulationApp` was silently mapped back to `RealTimePathTracing`.
+- Keep fluid-isosurface worlds on the explicitly selected RTPT implementation
+  and retain fail-closed renderer readback after startup.
+
+## 0.10.5
+
+- Select `RaytracedLighting` for ordinary camera worlds instead of inheriting
+  Isaac Sim 6's `RealTimePathTracing` default. This prevents single-sample RTX
+  noise when a headless runtime cannot initialize the NGX/DLSS Ray
+  Reconstruction denoiser, while retaining explicit real-time path tracing for
+  fluid-isosurface rendering.
+- Re-apply and verify the selected renderer after Isaac Lab rendering presets
+  load so they cannot silently restore a different mode.
+
 ## 0.10.4
 
 - Admit the exact official NGC Isaac Lab 3.0 / Isaac Sim 6.0.1 bundle as a

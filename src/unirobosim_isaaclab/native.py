@@ -51,6 +51,8 @@ _COMPOSITE_UNBOUND_RIGID_MODE_KEY = "composite_unbound_rigid_mode"
 _COMPOSITE_UNBOUND_RIGID_MODES = frozenset({"authored", "kinematic"})
 _POSITION_STIFFNESS_FALLBACK = 1000.0
 _POSITION_DAMPING_FALLBACK = 100.0
+_DEFAULT_CAMERA_RENDERER = "RaytracedLighting"
+_ISOSURFACE_CAMERA_RENDERER = "RealTimePathTracing"
 
 
 def _position_command_gains(
@@ -639,9 +641,24 @@ def _launcher_kwargs(config: IsaacLabAdapterConfig, *, process_isolated: bool = 
         launcher_args["visualizer_explicit"] = True
     if config.enable_cameras:
         launcher_args["anti_aliasing"] = _ANTI_ALIASING_MODES[config.anti_aliasing]
+        # Isaac Sim 6 defaults SimulationApp to RealTimePathTracing.  That path
+        # depends on the NGX/DLSS Ray Reconstruction denoiser and degrades to a
+        # visibly noisy single-sample image when NGX cannot initialize (notably
+        # in otherwise valid headless containers).  Ordinary RGB cameras do not
+        # need RTPT, so select the stable real-time ray-traced renderer before
+        # Kit starts.  Fluid isosurfaces retain their explicit RTPT requirement.
+        launcher_args["renderer"] = _camera_render_mode(config)
     if config.experience is not None:
         launcher_args["experience"] = config.experience
     return launcher_args
+
+
+def _camera_render_mode(config: IsaacLabAdapterConfig) -> str:
+    """Return the renderer required by the adapter's camera/fluid contract."""
+
+    if config.fluid_render_mode == "isosurface":
+        return _ISOSURFACE_CAMERA_RENDERER
+    return _DEFAULT_CAMERA_RENDERER
 
 
 def _camera_launcher_settings(config: IsaacLabAdapterConfig) -> tuple[str, ...]:
@@ -653,6 +670,12 @@ def _camera_launcher_settings(config: IsaacLabAdapterConfig) -> tuple[str, ...]:
         "--/rtx-transient/dlssg/enabled=false",
         f"--/rtx-transient/resourcemanager/enableTextureStreaming={texture_streaming}",
     ]
+    if _camera_render_mode(config) == _DEFAULT_CAMERA_RENDERER:
+        # Isaac Sim 6 disables the legacy RTX Real-Time implementation at Kit
+        # startup.  Selecting RaytracedLighting through SimulationApp happens
+        # after that startup boundary and is therefore silently mapped back to
+        # RTPT unless the implementation is admitted before AppLauncher runs.
+        settings.append("--/persistent/rtx/modes/rt/enabled=true")
     if not config.texture_streaming:
         settings.append("--/rtx-transient/resourcemanager/texturestreaming/async=false")
     return tuple(settings)
@@ -705,30 +728,40 @@ class IsaacLabNativeRuntime:
 
         if config.enable_cameras:
             expected_anti_aliasing = _ANTI_ALIASING_MODES[config.anti_aliasing]
+            expected_render_mode = _camera_render_mode(config)
             # Isaac Lab applies its rendering-mode preset after constructing SimulationApp,
             # which currently overwrites SimulationApp's ``anti_aliasing`` launch value.
             # Re-apply the caller's mode after AppLauncher has completed, before any render
             # products exist, then read it back so a silent preset override cannot pass.
             render_settings = carb.settings.get_settings()
             render_settings.set("/rtx/post/aa/op", expected_anti_aliasing)
+            # Re-apply the requested renderer after Isaac Lab's rendering-mode
+            # preset so a preset cannot silently restore SimulationApp's RTPT
+            # default after the launch configuration selected RaytracedLighting.
+            render_settings.set("/rtx/rendermode", expected_render_mode)
             render_settings.set(
                 "/rtx-transient/resourcemanager/enableTextureStreaming",
                 config.texture_streaming,
             )
             if config.fluid_render_mode == "isosurface":
-                render_settings.set("/rtx/rendermode", "RealTimePathTracing")
                 render_settings.set("/rtx/translucency/enabled", True)
                 render_settings.set("/rtx/translucency/maxRefractionBounces", 12)
                 render_settings.set("/rtx/rtpt/maxBounces", 6)
                 render_settings.set("/rtx/rtpt/maxSpecularAndTransmissionBounces", 6)
                 render_settings.set("/rtx/rtpt/maxVolumeBounces", 6)
             actual_anti_aliasing = render_settings.get("/rtx/post/aa/op")
+            actual_render_mode = render_settings.get("/rtx/rendermode")
             actual_texture_streaming = render_settings.get("/rtx-transient/resourcemanager/enableTextureStreaming")
             if actual_anti_aliasing != expected_anti_aliasing:
                 raise RuntimeError(
                     "Isaac Sim did not apply the requested camera anti-aliasing mode: "
                     f"requested={config.anti_aliasing!r} expected={expected_anti_aliasing} "
                     f"actual={actual_anti_aliasing!r}"
+                )
+            if actual_render_mode != expected_render_mode:
+                raise RuntimeError(
+                    "Isaac Sim did not apply the requested camera renderer: "
+                    f"expected={expected_render_mode!r} actual={actual_render_mode!r}"
                 )
             if actual_texture_streaming != config.texture_streaming:
                 raise RuntimeError(
@@ -737,11 +770,6 @@ class IsaacLabNativeRuntime:
                 )
             if config.fluid_render_mode == "isosurface" and not render_settings.get("/rtx/translucency/enabled"):
                 raise RuntimeError("Isaac Sim did not enable RTX translucency for fluid isosurface rendering")
-            if (
-                config.fluid_render_mode == "isosurface"
-                and render_settings.get("/rtx/rendermode") != "RealTimePathTracing"
-            ):
-                raise RuntimeError("Isaac Sim did not enable real-time path tracing for fluid isosurface rendering")
         import isaaclab.sim as sim_utils  # type: ignore[import-not-found]
         import isaacsim  # type: ignore[import-not-found]
         import omni.physics.tensors as physics_tensors  # type: ignore[import-not-found]

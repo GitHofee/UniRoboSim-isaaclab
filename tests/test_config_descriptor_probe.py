@@ -34,7 +34,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.4"
+    assert unirobosim_isaaclab.__version__ == "0.10.6"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -508,7 +508,11 @@ def test_launcher_disables_process_terminating_fast_shutdown() -> None:
         "enable_cameras": True,
         "fast_shutdown": False,
         "anti_aliasing": 2,
+        "renderer": "RaytracedLighting",
     }
+
+    isosurface = IsaacLabAdapterConfig(enable_cameras=True, fluid_render_mode="isosurface")
+    assert _launcher_kwargs(isosurface)["renderer"] == "RealTimePathTracing"
 
     configured = IsaacLabAdapterConfig(experience="/tmp/custom.kit")
     assert _launcher_kwargs(configured)["experience"] == "/tmp/custom.kit"
@@ -523,7 +527,11 @@ def test_camera_launcher_texture_residency_settings() -> None:
     fidelity = _camera_launcher_settings(IsaacLabAdapterConfig(enable_cameras=True))
     assert "--/rtx-transient/resourcemanager/enableTextureStreaming=false" in fidelity
     assert "--/rtx-transient/resourcemanager/texturestreaming/async=false" in fidelity
+    assert "--/persistent/rtx/modes/rt/enabled=true" in fidelity
 
     streaming = _camera_launcher_settings(IsaacLabAdapterConfig(enable_cameras=True, texture_streaming=True))
     assert "--/rtx-transient/resourcemanager/enableTextureStreaming=true" in streaming
     assert "--/rtx-transient/resourcemanager/texturestreaming/async=false" not in streaming
+
+    isosurface = _camera_launcher_settings(IsaacLabAdapterConfig(enable_cameras=True, fluid_render_mode="isosurface"))
+    assert "--/persistent/rtx/modes/rt/enabled=true" not in isosurface
