@@ -181,3 +181,13 @@ def test_easy_provider_uses_detected_profile_startup_budgets(monkeypatch: pytest
 
     assert config.worker_startup_hard_timeout_s == 300.0
     assert config.worker_kit_launch_idle_timeout_s == 300.0
+
+
+def test_easy_provider_reads_opt_in_fluid_surface_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(unirobosim_isaaclab.ISAACLAB_FLUID_RENDER_MODE_ENV, "isosurface")
+    monkeypatch.setenv(unirobosim_isaaclab.ISAACLAB_FLUID_SURFACE_COLOR_ENV, "0.24,0.065,0.018")
+
+    config = _explicit_config("visible")
+
+    assert config.fluid_render_mode == "isosurface"
+    assert config.fluid_surface_color_rgb == (0.24, 0.065, 0.018)

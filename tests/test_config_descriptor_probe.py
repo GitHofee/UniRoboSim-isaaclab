@@ -114,6 +114,12 @@ def test_valid_config(device: str) -> None:
     assert config.anti_aliasing == "fxaa"
 
 
+def test_fluid_surface_color_is_normalized_and_bounded() -> None:
+    assert IsaacLabAdapterConfig(fluid_surface_color_rgb=(1, 0.5, 0)).fluid_surface_color_rgb == (1.0, 0.5, 0.0)
+    with pytest.raises(ValidationError, match="fluid_surface_color_rgb"):
+        IsaacLabAdapterConfig(fluid_surface_color_rgb=(1.1, 0.5, 0.0))
+
+
 def test_default_position_gains_preserve_authored_asset_values() -> None:
     config = IsaacLabAdapterConfig()
     assert config.position_stiffness is None

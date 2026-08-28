@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 import unirobosim
-from unirobosim import CommandMode, DebugBatch, EntityPath, PointCommandMode, WorldSpec
+from unirobosim import CommandMode, DebugBatch, EntityPath, KinematicTarget, PointCommandMode, WorldSpec
 
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
@@ -27,6 +27,7 @@ from .native_protocols import (
     Matrix,
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativeKinematicState,
     NativePhysicsDiagnostics,
     NativePlanningCatalog,
     NativePlanningError,
@@ -34,6 +35,7 @@ from .native_protocols import (
     NativePlanningState,
     NativePlanningWorldDriver,
     NativeRuntime,
+    NativeSensorBatch,
     NativeSensorSample,
     NativeWorldDriver,
     PointBatch,
@@ -367,8 +369,19 @@ def _dispatch(
         return active, active.read_particle_fluid(cast(EntityPath, args[0])), False
     if operation == "read_sensor":
         return active, active.read_sensor(cast(EntityPath, args[0])), False
+    if operation == "read_sensors":
+        return active, active.read_sensors(cast(tuple[EntityPath, ...], args[0])), False
     if operation == "camera_calibration":
         return active, active.camera_calibration(cast(EntityPath, args[0])), False
+    if operation == "read_selected_kinematics":
+        return (
+            active,
+            active.read_selected_kinematics(
+                cast(tuple[KinematicTarget, ...], args[0]),
+                cast(int, args[1]),
+            ),
+            False,
+        )
     if operation == "planning_catalog":
         planning = cast(NativePlanningWorldDriver, active)
         return active, planning.planning_catalog(cast(int, args[0])), False
@@ -890,9 +903,24 @@ class IsaacLabWorkerWorld:
         self._ensure_open("read_sensor")
         return cast(NativeSensorSample, self._runtime._request("read_sensor", path))
 
+    def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch:
+        self._ensure_open("read_sensors")
+        return cast(NativeSensorBatch, self._runtime._request("read_sensors", paths))
+
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
         self._ensure_open("camera_calibration")
         return cast(NativeCameraCalibration, self._runtime._request("camera_calibration", path))
+
+    def read_selected_kinematics(
+        self,
+        targets: tuple[KinematicTarget, ...],
+        environment_index: int = 0,
+    ) -> tuple[NativeKinematicState, ...]:
+        self._ensure_open("read_selected_kinematics")
+        return cast(
+            tuple[NativeKinematicState, ...],
+            self._runtime._request("read_selected_kinematics", targets, environment_index),
+        )
 
     def publish_debug(self, batch: DebugBatch) -> tuple[int, int, int]:
         self._ensure_open("publish_debug")

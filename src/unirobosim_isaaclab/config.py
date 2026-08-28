@@ -28,6 +28,16 @@ class IsaacLabAdapterConfig:
     render_on_step: bool = True
     max_render_hz: float | None = None
     fluid_render_mode: str = "particles"
+    fluid_surface_color_rgb: tuple[float, float, float] | None = None
+    fluid_surface_distance_scale: float = 2.5
+    fluid_surface_smoothing_scale: float = 3.0
+    fluid_damping: float = 0.0
+    fluid_cohesion: float = 0.0
+    fluid_adhesion: float = 0.0
+    fluid_friction: float = 0.2
+    fluid_cfl_coefficient: float = 1.0
+    fluid_max_velocity_m_s: float | None = None
+    fluid_max_depenetration_velocity_m_s: float | None = None
     experience: str | None = None
     # ``None`` delegates position-drive gains to the authored asset.  Numeric
     # values retain the legacy adapter-wide override for callers that need it.
@@ -70,6 +80,55 @@ class IsaacLabAdapterConfig:
                 details={"fluid_render_mode": self.fluid_render_mode},
             )
         object.__setattr__(self, "fluid_render_mode", self.fluid_render_mode.lower())
+        if self.fluid_surface_color_rgb is not None:
+            try:
+                color = tuple(float(value) for value in self.fluid_surface_color_rgb)
+            except (TypeError, ValueError):
+                raise ValidationError(
+                    "fluid_surface_color_rgb must contain three finite values in [0, 1]",
+                    operation="isaaclab.config.validate",
+                ) from None
+            if len(color) != 3 or any(not math.isfinite(value) or value < 0.0 or value > 1.0 for value in color):
+                raise ValidationError(
+                    "fluid_surface_color_rgb must contain three finite values in [0, 1]",
+                    operation="isaaclab.config.validate",
+                )
+            object.__setattr__(self, "fluid_surface_color_rgb", color)
+        for name in ("fluid_surface_distance_scale", "fluid_surface_smoothing_scale"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate")
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError):
+                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate") from None
+            if not math.isfinite(normalized) or normalized <= 0.0:
+                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate")
+            object.__setattr__(self, name, normalized)
+        for name in ("fluid_damping", "fluid_cohesion", "fluid_adhesion", "fluid_friction", "fluid_cfl_coefficient"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise ValidationError(f"{name} must be finite and non-negative", operation="isaaclab.config.validate")
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError):
+                raise ValidationError(f"{name} must be finite and non-negative", operation="isaaclab.config.validate") from None
+            if not math.isfinite(normalized) or normalized < 0.0:
+                raise ValidationError(f"{name} must be finite and non-negative", operation="isaaclab.config.validate")
+            object.__setattr__(self, name, normalized)
+        for name in ("fluid_max_velocity_m_s", "fluid_max_depenetration_velocity_m_s"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate")
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError):
+                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate") from None
+            if not math.isfinite(normalized) or normalized <= 0.0:
+                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate")
+            object.__setattr__(self, name, normalized)
         if isinstance(self.environment_spacing_m, bool):
             raise ValidationError("environment spacing must be numeric", operation="isaaclab.config.validate")
         try:

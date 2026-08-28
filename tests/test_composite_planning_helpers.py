@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from unirobosim import (
     COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
+    ArrayValue,
     CapabilityId,
     CapabilityRequirement,
     EntityKind,
@@ -15,6 +17,7 @@ from unirobosim import (
     PlanningGeometryLocalPose,
     PlanningJointType,
     PlanningSceneIncompleteError,
+    ParticleFluidSpec,
     WorldSpec,
 )
 
@@ -59,6 +62,29 @@ def test_planning_preflight_admits_composite_but_keeps_static_scene_fail_closed(
     )
     with pytest.raises(PlanningSceneIncompleteError, match="static-scene collider forest"):
         validate_planning_build_spec(static, backend_id="nvidia.isaaclab")
+
+
+def test_particle_fluid_is_not_published_as_planning_geometry() -> None:
+    fluid = EntitySpec(
+        EntityPath("/water"),
+        EntityKind.PARTICLE_FLUID,
+        particle_fluid=ParticleFluidSpec(ArrayValue.from_nested(((0.0, 0.0, 1.0),))),
+    )
+    admission = object.__new__(_PlanningAdmission)
+    admission._world = SimpleNamespace(_spec=SimpleNamespace(entities=(fluid,)))
+    admission._frames = {}
+    admission._entities = {}
+    admission._geometries = {}
+    admission._ground_geometry = lambda: None
+    admission._verify_complete_native_world = lambda: None
+
+    catalog = admission._build_catalog()
+
+    assert catalog.entities == ()
+    assert catalog.links == ()
+    assert catalog.joints == ()
+    assert catalog.geometries == ()
+    assert tuple(frame.frame_id for frame in catalog.frames) == ("frame.world",)
 
 
 def test_embedded_moving_subtree_matching_does_not_claim_anchor_siblings() -> None:

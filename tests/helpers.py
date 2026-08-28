@@ -15,6 +15,7 @@ from unirobosim import (
     EntitySpec,
     EnvironmentSpec,
     FrozenMap,
+    KinematicTarget,
     PointCommandMode,
     ProbeReport,
     ProviderDescriptor,
@@ -25,7 +26,9 @@ from unirobosim_isaaclab.native_protocols import (
     Matrix,
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativeKinematicState,
     NativePhysicsDiagnostics,
+    NativeSensorBatch,
     NativeSensorSample,
     PointBatch,
 )
@@ -245,6 +248,32 @@ class FakeNativeWorld:
             channels.append((modality, shape, values))
         return tuple(channels)
 
+    def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch:
+        self.calls.append(("read_sensors", paths))
+        samples = []
+        for path in paths:
+            entity = next(item for item in self.spec.entities if item.path == path)
+            assert entity.camera is not None
+            channels = []
+            for modality in entity.camera.modalities:
+                if modality is CameraModality.RGB:
+                    shape = (
+                        self.spec.environments.count,
+                        entity.camera.height_px,
+                        entity.camera.width_px,
+                        3,
+                    )
+                    values: tuple[int | float, ...] | bytes = bytes((17,)) * math.prod(shape)
+                elif modality is CameraModality.DEPTH:
+                    shape = (self.spec.environments.count, entity.camera.height_px, entity.camera.width_px)
+                    values = (1.25,) * math.prod(shape)
+                else:
+                    shape = (self.spec.environments.count, entity.camera.height_px, entity.camera.width_px, 3)
+                    values = (0.0, 0.0, 1.0) * (math.prod(shape) // 3)
+                channels.append((modality, shape, values))
+            samples.append(tuple(channels))
+        return tuple(samples)
+
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
         self.calls.append(("camera_calibration", path))
         entity = next(item for item in self.spec.entities if item.path == path)
@@ -258,6 +287,25 @@ class FakeNativeWorld:
             clipping_range_m=(entity.camera.near_plane_m, entity.camera.far_plane_m),
             position_m=(0.0, 0.0, 0.0),
             orientation_opengl_xyzw=(0.0, 0.0, 0.0, 1.0),
+        )
+
+    def read_selected_kinematics(
+        self,
+        targets: tuple[KinematicTarget, ...],
+        environment_index: int = 0,
+    ) -> tuple[NativeKinematicState, ...]:
+        self.calls.append(("read_selected_kinematics", (targets, environment_index)))
+        return tuple(
+            NativeKinematicState(
+                target.target_id,
+                target.entity_path,
+                target.link_name,
+                (0.4, -0.2, 0.9),
+                (0.0, 0.0, 0.0, 1.0),
+                (0.1, 0.2, 0.3),
+                (0.0, 1.0, 0.0),
+            )
+            for target in targets
         )
 
     def publish_debug(self, batch: DebugBatch) -> tuple[int, int, int]:

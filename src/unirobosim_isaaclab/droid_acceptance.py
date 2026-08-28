@@ -807,7 +807,9 @@ def _compose(
     runtime = import_module("fastsim.runtime")
     adapter_module = import_module("fastsim.integrations.unirobosim.adapter")
     composition = import_module("fastsim.integrations.unirobosim.composition")
+    fluid_emitter_module = import_module("fastsim.integrations.unirobosim._fluid_emitter")
     projection_module = import_module("fastsim.integrations.unirobosim.projection")
+    scene_command_module = import_module("fastsim.integrations.unirobosim._scene_command")
     simulation_query_module = import_module("fastsim.integrations.unirobosim._simulation_query")
     services = import_module("fastsim.integrations.unirobosim.services")
     planning_module = import_module("fastsim.integrations.unirobosim._planning_raw")
@@ -842,6 +844,15 @@ def _compose(
         provider_id=projection.backend.provider_id,
         world_id=projection.world_spec.world_id,
     )
+    fluid_emitter_root = fluid_emitter_module._FluidEmitterRoot(
+        projection,
+        adapter,
+        "droid-equivalence-isaaclab",
+    )
+    scene_command_root = scene_command_module._SceneCommandRoot(
+        run_id="droid-equivalence-isaaclab",
+        mark_scene_mutated=planning_raw._mark_scene_mutated,
+    )
     kernel = runtime.RuntimeKernel(
         plan,
         adapter,
@@ -865,6 +876,7 @@ def _compose(
     )
     planning_raw._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
     simulation_root._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
+    scene_command_root._bind_authority(kernel.submit_authority, lambda: kernel.snapshot)
     executor.bind_authority_submitter(kernel.submit_authority)
     for observation_provider in projection_module.observation_providers(projection):
         kernel.observations.register(observation_provider)
@@ -877,6 +889,8 @@ def _compose(
         planning_raw=planning_raw,
         simulation_root=simulation_root,
         recording_capture=None,
+        fluid_emitter_root=fluid_emitter_root,
+        scene_command_root=scene_command_root,
     )
     return bundle, adapter
 

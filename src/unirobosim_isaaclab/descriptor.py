@@ -156,6 +156,17 @@ CAPABILITIES = CapabilitySet(
         ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
         CapabilityDeclaration(
+            CapabilityId("state.kinematics.selected@1"),
+            FrozenMap(
+                {
+                    "complexity": "selected-targets-only",
+                    "frame": "environment-local-world",
+                    "targets": ["articulation-root", "articulation-link"],
+                    "geometry_materialization": False,
+                }
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("state.articulation.axis-units@1"),
             FrozenMap({"position_units": ["rad", "m"], "velocity_units": ["rad/s", "m/s"]}),
         ),

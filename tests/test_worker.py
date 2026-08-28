@@ -455,6 +455,10 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     assert fluid[0][0][0] == (0.0, 0.0, 1.0)
     world, sensor, _ = _dispatch(runtime, world, ("read_sensor", (EntityPath("/camera"),)))
     assert tuple(channel[0] for channel in sensor) == (CameraModality.RGB, CameraModality.DEPTH)
+    camera_paths = (EntityPath("/camera"), EntityPath("/camera"))
+    world, sensors, _ = _dispatch(runtime, world, ("read_sensors", (camera_paths,)))
+    assert len(sensors) == 2 and sensors[0] == sensors[1]
+    assert runtime.worlds[0].calls[-1] == ("read_sensors", camera_paths)
     world, calibration, _ = _dispatch(runtime, world, ("camera_calibration", (EntityPath("/camera"),)))
     assert calibration.resolution_px == (2, 2)
     assert calibration.projection == "perspective"
@@ -643,6 +647,31 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         "close_world",
         "close_runtime",
     ]
+
+
+def test_worker_camera_batch_is_one_request_and_preserves_packed_bytes(tmp_path: Path) -> None:
+    sample = ((CameraModality.RGB, (1, 1, 2, 3), b"\x01\x02\x03\x04\x05\x06"),)
+    paths = (EntityPath("/camera"), EntityPath("/camera"))
+    factory, connection, process = fake_worker_factory(
+        [
+            ("ok", None),
+            ("ok", None),
+            ("ok", (sample, sample)),
+            ("ok", None),
+            ("ok", None),
+        ]
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    world = runtime.build_world(extended_world(make_articulation_asset(tmp_path / "robot.usda")))
+
+    assert world.read_sensors(paths) == (sample, sample)
+
+    world.close()
+    runtime.close()
+    operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
+    assert operations == ["build_world", "read_sensors", "close_world", "close_runtime"]
+    assert connection.sent[1] == ("read_sensors", (paths,))
+    assert connection.closed and not process.alive
 
 
 def test_worker_planning_proxy_is_demand_only_and_complete(tmp_path: Path) -> None:

@@ -848,6 +848,13 @@ class _PlanningAdmission:
             if spec.kind is EntityKind.CAMERA_SENSOR:
                 self._verify_nonphysical_entity(spec)
                 continue
+            if spec.kind is EntityKind.PARTICLE_FLUID:
+                # Particle fluids are simulated entities, but they are not a
+                # planner-consumable collision resource.  Excluding them from
+                # the planning catalog lets one world expose rigid/articulated
+                # geometry and fluid state at the same time without pretending
+                # thousands of transient particles are immutable obstacles.
+                continue
             if spec.kind is EntityKind.STATIC_SCENE:
                 # Static scenes deliberately retain the old fail-closed contract.
                 raise NativePlanningError("topology_unsupported")

@@ -10,6 +10,7 @@ from unirobosim import (
     CommandMode,
     DebugBatch,
     EntityPath,
+    KinematicTarget,
     PlanningArticulationState,
     PlanningAttachment,
     PlanningEntityDescriptor,
@@ -33,6 +34,7 @@ PointBatch = tuple[tuple[Vector3, ...], ...]
 NativeSensorValues = tuple[float | int, ...] | bytes
 NativeSensorChannel = tuple[CameraModality, tuple[int, ...], NativeSensorValues]
 NativeSensorSample = tuple[NativeSensorChannel, ...]
+NativeSensorBatch = tuple[NativeSensorSample, ...]
 NativeDebugReport = tuple[int, int, int]
 
 
@@ -58,6 +60,19 @@ class NativeCameraCalibration:
     clipping_range_m: tuple[float, float]
     position_m: Vector3
     orientation_opengl_xyzw: Quaternion
+
+
+@dataclass(frozen=True, slots=True)
+class NativeKinematicState:
+    """One selected environment-local body state returned by the native SDK."""
+
+    target_id: str
+    entity_path: EntityPath
+    link_name: str | None
+    position_m: Vector3
+    orientation_xyzw: Quaternion
+    linear_velocity_m_s: Vector3
+    angular_velocity_rad_s: Vector3
 
 
 class NativePlanningError(RuntimeError):
@@ -197,7 +212,15 @@ class NativeWorldDriver(Protocol):
 
     def read_sensor(self, path: EntityPath) -> NativeSensorSample: ...
 
+    def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch: ...
+
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration: ...
+
+    def read_selected_kinematics(
+        self,
+        targets: tuple[KinematicTarget, ...],
+        environment_index: int = 0,
+    ) -> tuple[NativeKinematicState, ...]: ...
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport: ...
 

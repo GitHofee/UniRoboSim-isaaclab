@@ -33,6 +33,8 @@ from unirobosim import (
     EntityPath,
     EntitySpec,
     FrozenMap,
+    KinematicState,
+    KinematicTarget,
     LifecycleError,
     ParticleFluidCommand,
     ParticleFluidState,
@@ -63,7 +65,14 @@ from unirobosim import (
     WorldState,
 )
 
-from .native_protocols import NativeArticulationCommand, NativeCameraCalibration, NativeWorldDriver, PointBatch
+from .native_protocols import (
+    NativeArticulationCommand,
+    NativeCameraCalibration,
+    NativeKinematicState,
+    NativeSensorSample,
+    NativeWorldDriver,
+    PointBatch,
+)
 
 if TYPE_CHECKING:
     from .provider import IsaacLabSession
@@ -634,17 +643,16 @@ class IsaacLabWorld:
         )
         return ParticleFluidState(ArrayValue.from_nested(positions), ArrayValue.from_nested(velocities), self.tick)
 
-    def read_sensor(self, handle: EntityHandle) -> SensorSample:
-        operation = "world.read_sensor"
-        self._ensure_ready(operation)
-        entity = self._validate_handle(handle, operation)
-        if entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None:
-            raise CommandError("entity is not a camera sensor", operation=operation, entity_path=entity.path.value)
-        native_channels = self._native_call(
-            operation,
-            lambda: self._native.read_sensor(entity.path),
-            entity_path=entity.path.value,
-        )
+    def _sensor_sample(
+        self,
+        handle: EntityHandle,
+        entity: EntitySpec,
+        native_channels: NativeSensorSample,
+        tick: Tick,
+        *,
+        operation: str,
+    ) -> SensorSample:
+        assert entity.camera is not None
         if tuple(item[0] for item in native_channels) != entity.camera.modalities:
             raise UniRoboSimError(
                 "Isaac Lab returned camera modalities in an invalid order",
@@ -668,7 +676,55 @@ class IsaacLabWorld:
             else:
                 data = ArrayValue(shape, values, dtype="uint8" if modality is CameraModality.RGB else "float32")
             channels.append(SensorChannel(modality, data))
-        return SensorSample(handle, tuple(channels), self.tick)
+        return SensorSample(handle, tuple(channels), tick)
+
+    def read_sensor(self, handle: EntityHandle) -> SensorSample:
+        operation = "world.read_sensor"
+        self._ensure_ready(operation)
+        entity = self._validate_handle(handle, operation)
+        if entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None:
+            raise CommandError("entity is not a camera sensor", operation=operation, entity_path=entity.path.value)
+        native_channels = self._native_call(
+            operation,
+            lambda: self._native.read_sensor(entity.path),
+            entity_path=entity.path.value,
+        )
+        return self._sensor_sample(handle, entity, native_channels, self.tick, operation=operation)
+
+    def read_sensors(self, handles: Iterable[EntityHandle]) -> tuple[SensorSample, ...]:
+        """Read an ordered, same-tick batch of camera samples in one native call."""
+
+        operation = "world.read_sensors"
+        self._ensure_ready(operation)
+        try:
+            selected = tuple(handles)
+        except TypeError as exc:
+            raise ValidationError(
+                "read_sensors requires an iterable of EntityHandle values", operation=operation
+            ) from exc
+        entities = tuple(self._validate_handle(handle, operation) for handle in selected)
+        for entity in entities:
+            if entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None:
+                raise CommandError("entity is not a camera sensor", operation=operation, entity_path=entity.path.value)
+        if not selected:
+            return ()
+        native_samples = self._native_call(
+            operation,
+            lambda: self._native.read_sensors(tuple(entity.path for entity in entities)),
+        )
+        if len(native_samples) != len(selected):
+            raise UniRoboSimError(
+                "Isaac Lab returned an invalid camera batch size",
+                operation=operation,
+                backend_id=self._session.descriptor.provider_id,
+                world_id=self.world_id,
+                details={"expected_size": len(selected), "actual_size": len(native_samples)},
+            )
+        tick = self.tick
+        return tuple(
+            self._sensor_sample(handle, entity, channels, tick, operation=operation)
+            for handle, entity, channels in zip(selected, entities, native_samples, strict=True)
+        )
 
     def read_camera_calibration(self, handle: EntityHandle) -> NativeCameraCalibration:
         """Read effective native camera parameters without advancing physics."""
@@ -683,6 +739,88 @@ class IsaacLabWorld:
             lambda: self._native.camera_calibration(entity.path),
             entity_path=entity.path.value,
         )
+
+    def read_selected_kinematics(
+        self,
+        targets: Iterable[KinematicTarget],
+        environment_index: int = 0,
+    ) -> tuple[KinematicState, ...]:
+        """Read selected roots/links without constructing planning geometry."""
+
+        operation = "world.read_selected_kinematics"
+        self._ensure_ready(operation)
+        try:
+            selected = tuple(targets)
+        except TypeError as error:
+            raise ValidationError(
+                "targets must be an iterable of KinematicTarget values", operation=operation
+            ) from error
+        if any(type(target) is not KinematicTarget for target in selected):
+            raise ValidationError(
+                "targets must contain only exact KinematicTarget values", operation=operation
+            )
+        if len({target.target_id for target in selected}) != len(selected):
+            raise ValidationError(
+                "selected kinematics target_id values must be unique", operation=operation
+            )
+        if type(environment_index) is not int or not 0 <= environment_index < self._spec.environments.count:
+            raise ValidationError("environment_index is out of range", operation=operation)
+        if not selected:
+            return ()
+        for target in selected:
+            entity = self._entities.get(target.entity_path)
+            if entity is None:
+                raise EntityNotFoundError(
+                    "selected kinematics entity does not exist",
+                    operation=operation,
+                    entity_path=target.entity_path.value,
+                )
+            if entity.kind is not EntityKind.ARTICULATION:
+                raise ValidationError(
+                    "selected link kinematics currently require an articulation entity",
+                    operation=operation,
+                    entity_path=target.entity_path.value,
+                )
+        native = self._native_call(
+            operation,
+            lambda: self._native.read_selected_kinematics(selected, environment_index),
+        )
+        if (
+            type(native) is not tuple
+            or len(native) != len(selected)
+            or any(type(item) is not NativeKinematicState for item in native)
+        ):
+            raise UniRoboSimError(
+                "Isaac Lab returned an invalid selected-kinematics batch",
+                operation=operation,
+                backend_id=self._session.descriptor.provider_id,
+                world_id=self.world_id,
+            )
+        result: list[KinematicState] = []
+        for target, value in zip(selected, native, strict=True):
+            if (
+                value.target_id != target.target_id
+                or value.entity_path != target.entity_path
+                or value.link_name != target.link_name
+            ):
+                raise UniRoboSimError(
+                    "Isaac Lab changed selected-kinematics order or identity",
+                    operation=operation,
+                    backend_id=self._session.descriptor.provider_id,
+                    world_id=self.world_id,
+                )
+            result.append(
+                KinematicState(
+                    value.target_id,
+                    value.entity_path,
+                    value.link_name,
+                    self.tick,
+                    Pose(value.position_m, value.orientation_xyzw),
+                    value.linear_velocity_m_s,
+                    value.angular_velocity_rad_s,
+                )
+            )
+        return tuple(result)
 
     def publish_debug(self, batch: DebugBatch) -> DebugPublishReport:
         operation = "world.publish_debug"

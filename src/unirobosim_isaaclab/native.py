@@ -26,6 +26,7 @@ from unirobosim import (
     EntityKind,
     EntityPath,
     EntitySpec,
+    KinematicTarget,
     PointCommandMode,
     Pose,
     WorldSpec,
@@ -38,7 +39,9 @@ from .native_protocols import (
     NativeArticulationCommand,
     NativeCameraCalibration,
     NativeDebugReport,
+    NativeKinematicState,
     NativePhysicsDiagnostics,
+    NativeSensorBatch,
     NativeSensorSample,
     PointBatch,
 )
@@ -465,6 +468,67 @@ def _camera_native_data_type(modality: CameraModality) -> str:
     if modality is CameraModality.NORMALS:
         return "normals"
     raise ValueError(f"unsupported camera modality: {modality!r}")
+
+
+def _pack_compatible_rgb_tensors(
+    torch_module: Any,
+    tensors: tuple[Any, ...],
+    staging_cache: dict[tuple[int, tuple[int, ...], str, str], Any],
+) -> tuple[tuple[int, ...], tuple[bytes, ...]] | None:
+    """Copy equal-shaped CUDA RGB tensors into reusable pinned host storage."""
+
+    if not tensors:
+        return (), ()
+    devices = tuple(getattr(tensor, "device", None) for tensor in tensors)
+    if any(getattr(device, "type", None) != "cuda" for device in devices):
+        return None
+    device = devices[0]
+    device_name = str(device)
+    if any(str(candidate) != device_name for candidate in devices[1:]):
+        return None
+    try:
+        normalized = tuple(tensor.to(dtype=torch_module.uint8).contiguous() for tensor in tensors)
+    except (AttributeError, TypeError):
+        return None
+    shape = tuple(int(size) for size in normalized[0].shape)
+    if any(tuple(int(size) for size in tensor.shape) != shape for tensor in normalized[1:]):
+        return None
+    dtype = getattr(normalized[0], "dtype", None)
+    if dtype is None or any(getattr(tensor, "dtype", None) != dtype for tensor in normalized[1:]):
+        return None
+    try:
+        stream = torch_module.cuda.current_stream(device=device)
+        synchronize = stream.synchronize
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    key = (len(normalized), shape, device_name, str(dtype))
+    host_batch = staging_cache.get(key)
+    if host_batch is None:
+        try:
+            host_batch = torch_module.empty(
+                (len(normalized), *shape),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=True,
+            )
+        except (AttributeError, NotImplementedError, RuntimeError, TypeError):
+            return None
+        staging_cache[key] = host_batch
+    enqueued = False
+    try:
+        for index, tensor in enumerate(normalized):
+            host_batch[index].copy_(tensor, non_blocking=True)
+            enqueued = True
+    except (AttributeError, NotImplementedError, TypeError):
+        if enqueued:
+            synchronize()
+        return None
+    synchronize()
+    sample_size = math.prod(shape)
+    payloads = tuple(host_batch[index].numpy().tobytes(order="C") for index in range(len(normalized)))
+    if any(len(payload) != sample_size for payload in payloads):
+        raise RuntimeError("native RGB staging buffer returned an invalid per-camera byte size")
+    return shape, payloads
 
 
 def _relationship_target_path(relationship: Any) -> str | None:
@@ -903,6 +967,7 @@ class IsaacLabNativeWorld:
         self._articulations: dict[EntityPath, Any] = {}
         self._usd_articulations: dict[EntityPath, tuple[_UsdArticulation, ...]] = {}
         self._usd_articulation_views: dict[EntityPath, Any] = {}
+        self._selected_link_views: dict[tuple[EntityPath, str], Any] = {}
         self._initial_usd_articulation: dict[EntityPath, tuple[Any, Any, Any, Any]] = {}
         self._initial_usd_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
         self._rigids: dict[EntityPath, Any] = {}
@@ -922,6 +987,7 @@ class IsaacLabNativeWorld:
         self._deformables: dict[EntityPath, Any] = {}
         self._fluids: dict[EntityPath, tuple[_FluidSet, ...]] = {}
         self._cameras: dict[EntityPath, Any] = {}
+        self._rgb_host_staging: dict[tuple[int, tuple[int, ...], str, str], Any] = {}
         self._debug_draw_interface: Any | None = None
         self._debug_overlay: NativeDebugOverlay | None = None
         self._debug_expirations: dict[tuple[str, str, str], int | None] = {}
@@ -1627,11 +1693,18 @@ class IsaacLabNativeWorld:
             system.CreateSolidRestOffsetAttr().Set(fluid.particle_radius_m * 0.99)
             system.CreateFluidRestOffsetAttr().Set(fluid.particle_radius_m * 0.6)
             system.CreateSolverPositionIterationCountAttr().Set(8)
+            system.CreateEnableCCDAttr().Set(True)
+            if self._config.fluid_max_velocity_m_s is not None:
+                system.CreateMaxVelocityAttr().Set(self._config.fluid_max_velocity_m_s)
+            if self._config.fluid_max_depenetration_velocity_m_s is not None:
+                system.CreateMaxDepenetrationVelocityAttr().Set(
+                    self._config.fluid_max_depenetration_velocity_m_s
+                )
             system.CreateGlobalSelfCollisionEnabledAttr().Set(True)
             system.CreateNonParticleCollisionEnabledAttr().Set(True)
 
             if self._config.fluid_render_mode == "isosurface":
-                material = self._author_water_material(stage, root, fluid)
+                material = self._author_fluid_surface_material(stage, root, fluid)
             else:
                 material = self._m.UsdShade.Material.Define(stage, f"{root}/pbd_material")
                 self._apply_pbd_material(material, fluid)
@@ -1649,9 +1722,18 @@ class IsaacLabNativeWorld:
                 self._m.Vt.FloatArray((fluid.particle_radius_m * 2.0,) * fluid.particle_count)
             )
             if self._config.fluid_render_mode == "particles":
+                fluid_color = getattr(fluid, "color_rgba", None) or (0.1, 0.45, 1.0, 1.0)
                 points.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
-                    self._m.Vt.Vec3fArray(((0.1, 0.45, 1.0),))
+                    self._m.Vt.Vec3fArray((tuple(fluid_color[:3]),))
                 )
+                points.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+                    self._m.Vt.FloatArray((float(fluid_color[3]),))
+                )
+            else:
+                # The particle set remains active for PhysX, while RTX renders only
+                # the reconstructed surface.  Rendering both is the characteristic
+                # "beads inside a surface" artifact this mode is intended to avoid.
+                points.CreateVisibilityAttr().Set(self._m.UsdGeom.Tokens.invisible)
             set_api = self._m.PhysxSchema.PhysxParticleSetAPI.Apply(points.GetPrim())
             # PhysxParticleSetAPI derives from PhysxParticleAPI; constructing the base view from
             # the applied set schema matches NVIDIA's particleUtils.configure_particle_set path.
@@ -1673,9 +1755,38 @@ class IsaacLabNativeWorld:
         material_api.CreateDensityAttr().Set(fluid.rest_density_kg_m3)
         material_api.CreateViscosityAttr().Set(fluid.dynamic_viscosity_pa_s)
         material_api.CreateSurfaceTensionAttr().Set(fluid.surface_tension_n_m)
+        material_api.CreateDampingAttr().Set(self._config.fluid_damping)
+        material_api.CreateCohesionAttr().Set(self._config.fluid_cohesion)
+        material_api.CreateAdhesionAttr().Set(self._config.fluid_adhesion)
+        material_api.CreateAdhesionOffsetScaleAttr().Set(0.5 if self._config.fluid_adhesion > 0.0 else 0.0)
+        material_api.CreateFrictionAttr().Set(self._config.fluid_friction)
+        material_api.CreateCflCoefficientAttr().Set(self._config.fluid_cfl_coefficient)
 
-    def _author_water_material(self, stage: Any, root: str, fluid: Any) -> Any:
-        """Create one material that carries both water rendering and PBD properties."""
+    def _author_fluid_surface_material(self, stage: Any, root: str, fluid: Any) -> Any:
+        """Create one material carrying surface rendering and PBD properties."""
+
+        entity_color = getattr(fluid, "color_rgba", None)
+        color = (
+            entity_color
+            if entity_color is not None
+            else None
+            if self._config.fluid_surface_color_rgb is None
+            else (*self._config.fluid_surface_color_rgb, 1.0)
+        )
+        if color is not None:
+            material_path = f"{root}/fluid_surface_material"
+            material = self._m.UsdShade.Material.Define(stage, material_path)
+            shader = self._m.UsdShade.Shader.Define(stage, f"{material_path}/Shader")
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", self._m.Sdf.ValueTypeNames.Color3f).Set(
+                self._m.Gf.Vec3f(*color[:3])
+            )
+            shader.CreateInput("roughness", self._m.Sdf.ValueTypeNames.Float).Set(0.28)
+            shader.CreateInput("metallic", self._m.Sdf.ValueTypeNames.Float).Set(0.0)
+            shader.CreateInput("opacity", self._m.Sdf.ValueTypeNames.Float).Set(float(color[3]))
+            material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+            self._apply_pbd_material(material, fluid)
+            return material
 
         from omni.usd.commands import CreateMdlMaterialPrimCommand  # type: ignore[import-not-found]
 
@@ -1699,7 +1810,7 @@ class IsaacLabNativeWorld:
         system_prim = system.GetPrim()
         smoothing = self._m.PhysxSchema.PhysxParticleSmoothingAPI.Apply(system_prim)
         smoothing.CreateParticleSmoothingEnabledAttr().Set(True)
-        smoothing.CreateStrengthAttr().Set(0.5)
+        smoothing.CreateStrengthAttr().Set(1.0)
 
         anisotropy = self._m.PhysxSchema.PhysxParticleAnisotropyAPI.Apply(system_prim)
         anisotropy.CreateParticleAnisotropyEnabledAttr().Set(True)
@@ -1715,11 +1826,15 @@ class IsaacLabNativeWorld:
         fluid_rest_offset = fluid.particle_radius_m * 0.6
         grid_spacing = fluid_rest_offset * 1.5
         isosurface.CreateGridSpacingAttr().Set(grid_spacing)
-        isosurface.CreateSurfaceDistanceAttr().Set(fluid_rest_offset * 1.6)
+        isosurface.CreateSurfaceDistanceAttr().Set(
+            fluid_rest_offset * self._config.fluid_surface_distance_scale
+        )
         isosurface.CreateGridFilteringPassesAttr().Set("")
-        isosurface.CreateGridSmoothingRadiusAttr().Set(fluid_rest_offset * 2.0)
-        isosurface.CreateNumMeshSmoothingPassesAttr().Set(2)
-        isosurface.CreateNumMeshNormalSmoothingPassesAttr().Set(4)
+        isosurface.CreateGridSmoothingRadiusAttr().Set(
+            fluid_rest_offset * self._config.fluid_surface_smoothing_scale
+        )
+        isosurface.CreateNumMeshSmoothingPassesAttr().Set(5)
+        isosurface.CreateNumMeshNormalSmoothingPassesAttr().Set(6)
         self._m.UsdGeom.PrimvarsAPI(system).CreatePrimvar(
             "doNotCastShadows",
             self._m.Sdf.ValueTypeNames.Bool,
@@ -2466,6 +2581,84 @@ class IsaacLabNativeWorld:
             tuple(tuple(float(value) for value in row) for row in velocities),
         )
 
+    def read_selected_kinematics(
+        self,
+        targets: tuple[KinematicTarget, ...],
+        environment_index: int = 0,
+    ) -> tuple[NativeKinematicState, ...]:
+        """Read only requested articulation bodies without admitting geometry."""
+
+        if not 0 <= environment_index < self._spec.environments.count:
+            raise IndexError("selected kinematics environment index is out of range")
+        origin = self._origins_cpu[environment_index]
+        result: list[NativeKinematicState] = []
+        for target in targets:
+            path = target.entity_path
+            if path in self._articulations:
+                asset = self._articulations[path]
+                if target.link_name is None:
+                    pose_row = asset.data.root_link_pose_w.torch[environment_index]
+                    velocity_row = asset.data.root_link_vel_w.torch[environment_index]
+                else:
+                    matches = tuple(
+                        index for index, name in enumerate(asset.body_names) if name == target.link_name
+                    )
+                    if len(matches) != 1:
+                        raise KeyError(
+                            f"selected link {target.link_name!r} must match exactly one body on {path.value}"
+                        )
+                    body_index = matches[0]
+                    pose_row = asset.data.body_link_pose_w.torch[environment_index, body_index]
+                    velocity_row = asset.data.body_link_vel_w.torch[environment_index, body_index]
+                row = pose_row.detach().cpu().tolist()
+                velocity = velocity_row.detach().cpu().tolist()
+            elif path in self._usd_articulation_views:
+                articulation_view = self._usd_articulation_views[path]
+                if target.link_name is None:
+                    row = articulation_view.get_root_transforms()[environment_index].detach().cpu().tolist()
+                    velocity = articulation_view.get_root_velocities()[environment_index].detach().cpu().tolist()
+                else:
+                    key = (path, target.link_name)
+                    body_view = self._selected_link_views.get(key)
+                    if body_view is None:
+                        parent_name = _native_name(path)
+                        suffix: str | None = None
+                        for environment in range(self._spec.environments.count):
+                            root = f"/World/env_{environment}/{parent_name}"
+                            current = _articulation_mount_body_suffix(self._m, root, target.link_name)
+                            if suffix is None:
+                                suffix = current
+                            elif current != suffix:
+                                raise RuntimeError("selected articulation body changed across environments")
+                        assert suffix is not None
+                        expected_paths = tuple(
+                            f"/World/env_{environment}/{parent_name}{suffix}"
+                            for environment in range(self._spec.environments.count)
+                        )
+                        body_view = self._usd_simulation_view().create_rigid_body_view(list(expected_paths))
+                        if (
+                            body_view.count != self._spec.environments.count
+                            or tuple(body_view.prim_paths) != expected_paths
+                        ):
+                            raise RuntimeError("selected body view did not preserve environment order")
+                        self._selected_link_views[key] = body_view
+                    row = body_view.get_transforms()[environment_index].detach().cpu().tolist()
+                    velocity = body_view.get_velocities()[environment_index].detach().cpu().tolist()
+            else:
+                raise KeyError(f"selected kinematics entity {path.value!r} is not an articulation")
+            result.append(
+                NativeKinematicState(
+                    target.target_id,
+                    path,
+                    target.link_name,
+                    tuple(float(row[index]) - float(origin[index]) for index in range(3)),
+                    tuple(float(row[index]) for index in range(3, 7)),
+                    tuple(float(velocity[index]) for index in range(3)),
+                    tuple(float(velocity[index]) for index in range(3, 6)),
+                )
+            )
+        return tuple(result)
+
     def apply_rigid_body_wrench(
         self,
         path: EntityPath,
@@ -2656,13 +2849,8 @@ class IsaacLabNativeWorld:
             )
         return tuple(positions), tuple(velocities)
 
-    def read_sensor(self, path: EntityPath) -> NativeSensorSample:
-        camera = self._cameras[path]
-        entity = next(item for item in self._spec.entities if item.path == path)
+    def _read_camera_channels(self, camera: Any, entity: EntitySpec) -> NativeSensorSample:
         assert entity.camera is not None
-        assert self._sim is not None
-        self._ensure_camera_render()
-        camera.update(0.0, force_recompute=True)
         channels = []
         for modality in entity.camera.modalities:
             native_name = _camera_native_data_type(modality)
@@ -2699,6 +2887,54 @@ class IsaacLabNativeWorld:
                 channel_values = tuple(float(item) for item in tensor.detach().cpu().reshape(-1).tolist())
             channels.append((modality, shape, channel_values))
         return tuple(channels)
+
+    def read_sensor(self, path: EntityPath) -> NativeSensorSample:
+        camera = self._cameras[path]
+        entity = next(item for item in self._spec.entities if item.path == path)
+        assert entity.camera is not None
+        assert self._sim is not None
+        self._ensure_camera_render()
+        camera.update(0.0, force_recompute=True)
+        return self._read_camera_channels(camera, entity)
+
+    def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch:
+        """Read ordered cameras after one shared render and, when possible, one RGB transfer."""
+
+        entity_by_path = {
+            entity.path: entity
+            for entity in self._spec.entities
+            if entity.kind is EntityKind.CAMERA_SENSOR and entity.camera is not None
+        }
+        targets = []
+        for path in paths:
+            camera = self._cameras.get(path)
+            entity = entity_by_path.get(path)
+            if camera is None or entity is None:
+                raise KeyError(f"native camera does not exist: {path.value}")
+            targets.append((camera, entity))
+        if not targets:
+            return ()
+
+        assert self._sim is not None
+        self._ensure_camera_render()
+        for camera, _ in targets:
+            camera.update(0.0, force_recompute=True)
+
+        if all(
+            entity.camera is not None and entity.camera.modalities == (CameraModality.RGB,) for _, entity in targets
+        ):
+            rgb_tensors = tuple(
+                getattr(camera.data.output["rgb"], "torch", camera.data.output["rgb"]) for camera, _ in targets
+            )
+            packed = _pack_compatible_rgb_tensors(self._m.torch, rgb_tensors, self._rgb_host_staging)
+            if packed is not None:
+                shape, payloads = packed
+                return tuple(((CameraModality.RGB, shape, payload),) for payload in payloads)
+
+        # Mixed modalities or image shapes retain the generic conversion path.
+        # Rendering and camera updates have already happened once for the whole
+        # request, so fallback cannot create additional frames or skew the tick.
+        return tuple(self._read_camera_channels(camera, entity) for camera, entity in targets)
 
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
         """Read the effective camera state authored into Isaac/USD."""
@@ -2841,6 +3077,7 @@ class IsaacLabNativeWorld:
         self._articulations.clear()
         self._usd_articulations.clear()
         self._usd_articulation_views.clear()
+        self._selected_link_views.clear()
         self._initial_usd_articulation.clear()
         self._initial_usd_articulation_gains.clear()
         self._rigids.clear()
@@ -2860,6 +3097,7 @@ class IsaacLabNativeWorld:
         self._deformables.clear()
         self._fluids.clear()
         self._cameras.clear()
+        self._rgb_host_staging.clear()
         self._debug_expirations.clear()
         self._debug_lifetimes.clear()
         if self._debug_overlay is not None:

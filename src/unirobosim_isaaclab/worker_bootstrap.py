@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from multiprocessing.connection import Connection
 
@@ -31,6 +32,11 @@ def main() -> None:  # pragma: no cover - exercised by native process acceptance
     except ValueError as exc:
         raise SystemExit("worker connection descriptor must be an integer") from exc
     connection = Connection(descriptor)
+    # ``pass_fds`` is required for the clean bootstrap exec, but Kit may spawn
+    # UI/helper processes afterwards.  Those descendants must not retain the
+    # worker IPC endpoint: otherwise a failed main worker leaves the pipe open
+    # and the parent reports a misleading startup timeout instead of EOF/error.
+    os.set_inheritable(descriptor, False)
     _send_progress(connection, "bootstrap_connected")
 
     # Absolute imports intentionally occur after the first progress event.  The
