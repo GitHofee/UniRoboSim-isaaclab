@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 import unirobosim
-from unirobosim import CommandMode, DebugBatch, EntityPath, KinematicTarget, PointCommandMode, WorldSpec
+from unirobosim import CommandMode, DebugBatch, EntityPath, KinematicTarget, PointCommandMode, Pose, WorldSpec
 
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
@@ -342,6 +342,24 @@ def _dispatch(
             cast(Vector3, args[1]),
             cast(Quaternion, args[2]),
             cast(int, args[3]),
+        )
+        return active, None, False
+    if operation == "attach_rigid_body":
+        relative = active.attach_rigid_body(
+            cast(str, args[0]),
+            cast(EntityPath, args[1]),
+            cast(str | None, args[2]),
+            cast(EntityPath, args[3]),
+            cast(str | None, args[4]),
+            cast(int, args[5]),
+            cast(Pose | None, args[6]),
+        )
+        return active, relative, False
+    if operation == "detach_rigid_body":
+        active.detach_rigid_body(
+            cast(str, args[0]),
+            cast(EntityPath, args[1]),
+            cast(int, args[2]),
         )
         return active, None, False
     if operation == "read_contact":
@@ -850,6 +868,45 @@ class IsaacLabWorkerWorld:
             path,
             position_m,
             orientation_xyzw,
+            environment_index,
+        )
+
+    def attach_rigid_body(
+        self,
+        attachment_id: str,
+        parent_path: EntityPath,
+        parent_link_name: str | None,
+        child_path: EntityPath,
+        child_link_name: str | None,
+        environment_index: int,
+        parent_T_child: Pose | None,
+    ) -> Pose:
+        self._ensure_open("attach_rigid_body")
+        return cast(
+            Pose,
+            self._runtime._request(
+                "attach_rigid_body",
+                attachment_id,
+                parent_path,
+                parent_link_name,
+                child_path,
+                child_link_name,
+                environment_index,
+                parent_T_child,
+            ),
+        )
+
+    def detach_rigid_body(
+        self,
+        attachment_id: str,
+        child_path: EntityPath,
+        environment_index: int,
+    ) -> None:
+        self._ensure_open("detach_rigid_body")
+        self._runtime._request(
+            "detach_rigid_body",
+            attachment_id,
+            child_path,
             environment_index,
         )
 

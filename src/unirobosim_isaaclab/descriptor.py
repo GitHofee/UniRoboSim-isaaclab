@@ -251,6 +251,18 @@ CAPABILITIES = CapabilitySet(
         CapabilityDeclaration(CapabilityId("scene.delta@1")),
         CapabilityDeclaration(CapabilityId("scene.command.pose@1")),
         CapabilityDeclaration(
+            CapabilityId("scene.command.attachment@1"),
+            FrozenMap(
+                {
+                    "constraint": "fixed_6dof",
+                    "child_entity_kinds": ("rigid_body",),
+                    "parent_entity_kinds": ("rigid_body", "articulation"),
+                    "preserve_current_relative_pose": True,
+                    "reset_clears": True,
+                }
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("scene.command.drag@1"),
             FrozenMap({"entity_kinds": ["rigid_body"], "modes": ["kinematic"]}),
             limitations=("constraint drag is not exposed by the adapter",),

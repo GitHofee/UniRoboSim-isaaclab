@@ -17,6 +17,7 @@ from unirobosim import (
     FrozenMap,
     KinematicTarget,
     PointCommandMode,
+    Pose,
     ProbeReport,
     ProviderDescriptor,
     WorldSpec,
@@ -102,6 +103,7 @@ class FakeNativeWorld:
             for entity in spec.entities
             if entity.kind is EntityKind.RIGID_BODY
         }
+        self.attachments: dict[tuple[int, str], EntityPath] = {}
 
     def physics_diagnostics(self) -> NativePhysicsDiagnostics:
         return NativePhysicsDiagnostics(
@@ -115,6 +117,10 @@ class FakeNativeWorld:
         if self.reset_error is not None:
             raise self.reset_error
         self.calls.append(("reset", environment_indices))
+        selected = frozenset(environment_indices)
+        self.attachments = {
+            key: child for key, child in self.attachments.items() if key[0] not in selected
+        }
 
     def apply_articulation(
         self,
@@ -176,6 +182,43 @@ class FakeNativeWorld:
     ) -> None:
         self.calls.append(("set_rigid_body_pose", (path, position_m, orientation_xyzw, environment_index)))
         self.rigid_poses[path][environment_index] = (position_m, orientation_xyzw)
+
+    def attach_rigid_body(
+        self,
+        attachment_id: str,
+        parent_path: EntityPath,
+        parent_link_name: str | None,
+        child_path: EntityPath,
+        child_link_name: str | None,
+        environment_index: int,
+        parent_T_child: Pose | None,
+    ) -> Pose:
+        relative = parent_T_child or Pose((0.0, 0.0, 1.0))
+        self.calls.append(
+            (
+                "attach_rigid_body",
+                (
+                    attachment_id,
+                    parent_path,
+                    parent_link_name,
+                    child_path,
+                    child_link_name,
+                    environment_index,
+                    relative,
+                ),
+            )
+        )
+        self.attachments[environment_index, attachment_id] = child_path
+        return relative
+
+    def detach_rigid_body(
+        self,
+        attachment_id: str,
+        child_path: EntityPath,
+        environment_index: int,
+    ) -> None:
+        self.calls.append(("detach_rigid_body", (attachment_id, child_path, environment_index)))
+        del self.attachments[environment_index, attachment_id]
 
     def read_contact(self, path: EntityPath) -> Matrix:
         self.calls.append(("read_contact", path))

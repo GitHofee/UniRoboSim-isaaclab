@@ -340,6 +340,38 @@ def test_scene_snapshot_delta_and_transactional_rigid_drag(tmp_path: Path) -> No
         world.apply_scene_command(command("inactive-update", SceneCommandKind.DRAG_UPDATE, target=Pose())).error_code
         == "drag_not_active"
     )
+    attach = SceneCommand(
+        "attach-marker",
+        "mission",
+        "lease",
+        world.generation,
+        SceneCommandKind.ATTACH,
+        EntityPath("/props/marker"),
+        1,
+        attachment_id="held-marker",
+        parent_entity_path=EntityPath("/robots/arm"),
+        parent_link_name="link_b",
+    )
+    attached = world.apply_scene_command(attach)
+    assert attached.status is SceneCommandStatus.APPLIED
+    assert attached.attachment_id == "held-marker"
+    assert world.apply_scene_command(attach).status is SceneCommandStatus.DUPLICATE
+    detached = world.apply_scene_command(
+        SceneCommand(
+            "detach-marker",
+            "mission",
+            "lease",
+            world.generation,
+            SceneCommandKind.DETACH,
+            EntityPath("/props/marker"),
+            1,
+            attachment_id="held-marker",
+        )
+    )
+    assert detached.status is SceneCommandStatus.APPLIED
+    assert detached.attachment_id == "held-marker"
+    assert any(call[0] == "attach_rigid_body" for call in runtime.worlds[-1].calls)
+    assert any(call[0] == "detach_rigid_body" for call in runtime.worlds[-1].calls)
     with pytest.raises(ValidationError):
         world.scene_delta(999)
     sequence_before_reset = world.scene_snapshot().sequence

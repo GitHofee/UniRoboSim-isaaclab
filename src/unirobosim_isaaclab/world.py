@@ -108,6 +108,7 @@ class IsaacLabWorld:
         self._scene_sequence = 0
         self._scene_results: dict[str, SceneCommandResult] = {}
         self._drags: dict[str, tuple[EntityPath, int, Pose]] = {}
+        self._attachments: dict[tuple[int, str], EntityPath] = {}
         self._pending_articulation_commands: list[NativeArticulationCommand] = []
         self._entities = {entity.path: entity for entity in spec.entities}
         self._build_report = BuildReport(
@@ -323,6 +324,10 @@ class IsaacLabWorld:
         self._reset_count += 1
         self._scene_sequence += 1
         self._drags.clear()
+        selected = frozenset(environments)
+        self._attachments = {
+            key: child for key, child in self._attachments.items() if key[0] not in selected
+        }
         return ResetResult(environments, self._reset_count, self.tick)
 
     def apply_articulation_command(self, command: ArticulationCommand) -> None:
@@ -998,6 +1003,11 @@ class IsaacLabWorld:
             self.tick,
             code,
             message,
+            attachment_id=(
+                command.attachment_id
+                if command.kind in {SceneCommandKind.ATTACH, SceneCommandKind.DETACH}
+                else None
+            ),
         )
         self._scene_results[command.command_id] = result
         if len(self._scene_results) > self._session.config.max_cached_scene_commands:
@@ -1029,6 +1039,7 @@ class IsaacLabWorld:
                 previous.scene_sequence,
                 previous.tick,
                 message="command was already processed",
+                attachment_id=previous.attachment_id,
             )
         if command.expected_generation != self.generation:
             return self._scene_result(command, SceneCommandStatus.REJECTED, "stale_generation", "generation mismatch")
@@ -1040,12 +1051,82 @@ class IsaacLabWorld:
                 command,
                 SceneCommandStatus.REJECTED,
                 "unsupported_entity_kind",
-                "only free rigid bodies are draggable",
+                "scene manipulation requires a free rigid-body target",
             )
         environment = command.environment_index
         if command.kind is SceneCommandKind.SET_POSE:
             assert command.target_pose is not None
             self._set_rigid_pose(entity.path, environment, command.target_pose)
+        elif command.kind is SceneCommandKind.ATTACH:
+            assert command.attachment_id is not None
+            assert command.parent_entity_path is not None
+            parent = self._entities.get(command.parent_entity_path)
+            if parent is None:
+                return self._scene_result(
+                    command,
+                    SceneCommandStatus.REJECTED,
+                    "parent_not_found",
+                    "attachment parent does not exist",
+                )
+            if parent.kind not in {EntityKind.RIGID_BODY, EntityKind.ARTICULATION}:
+                return self._scene_result(
+                    command,
+                    SceneCommandStatus.REJECTED,
+                    "unsupported_parent_kind",
+                    "attachment parent must be a rigid body or articulation",
+                )
+            key = (environment, command.attachment_id)
+            if key in self._attachments:
+                return self._scene_result(
+                    command,
+                    SceneCommandStatus.REJECTED,
+                    "attachment_exists",
+                    "attachment ID is already active",
+                )
+            if any(
+                child == entity.path and key_environment == environment
+                for (key_environment, _), child in self._attachments.items()
+            ):
+                return self._scene_result(
+                    command,
+                    SceneCommandStatus.REJECTED,
+                    "child_already_attached",
+                    "attachment child already has an active parent",
+                )
+            self._native_call(
+                "world.apply_scene_command",
+                lambda: self._native.attach_rigid_body(
+                    command.attachment_id,
+                    parent.path,
+                    command.parent_link_name,
+                    entity.path,
+                    command.child_link_name,
+                    environment,
+                    command.parent_T_child,
+                ),
+                entity_path=entity.path.value,
+            )
+            self._attachments[key] = entity.path
+        elif command.kind is SceneCommandKind.DETACH:
+            assert command.attachment_id is not None
+            key = (environment, command.attachment_id)
+            if self._attachments.get(key) != entity.path:
+                return self._scene_result(
+                    command,
+                    SceneCommandStatus.REJECTED,
+                    "attachment_not_active",
+                    "attachment is missing or targets a different child",
+                )
+            self._native_call(
+                "world.apply_scene_command",
+                lambda: self._native.detach_rigid_body(
+                    command.attachment_id,
+                    entity.path,
+                    environment,
+                ),
+                entity_path=entity.path.value,
+            )
+            del self._attachments[key]
         elif command.kind is SceneCommandKind.DRAG_BEGIN:
             assert command.drag_id is not None
             if command.drag_mode is not SceneDragMode.KINEMATIC:
@@ -1077,6 +1158,7 @@ class IsaacLabWorld:
         self._state = WorldState.CLOSED
         self._scene_results.clear()
         self._drags.clear()
+        self._attachments.clear()
         self._pending_articulation_commands.clear()
         self._entities.clear()
         try:

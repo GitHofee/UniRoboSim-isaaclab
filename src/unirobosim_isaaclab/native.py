@@ -334,6 +334,18 @@ class _UsdArticulation:
     root_prim: Any
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeAttachment:
+    attachment_id: str
+    environment_index: int
+    parent_path: EntityPath
+    parent_link_name: str | None
+    child_path: EntityPath
+    child_link_name: str | None
+    parent_T_child: Pose
+    joint_prim_path: str
+
+
 @dataclass
 class _CompositeRigidState:
     view: Any
@@ -661,6 +673,46 @@ def _rotate_xyzw(
     )
 
 
+def _multiply_xyzw(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    values = (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isfinite(norm) or norm <= 1.0e-12:
+        raise ValueError("attachment quaternion is invalid")
+    return tuple(value / norm for value in values)  # type: ignore[return-value]
+
+
+def _relative_pose(parent: Pose, child: Pose) -> Pose:
+    inverse = (
+        -parent.orientation_xyzw[0],
+        -parent.orientation_xyzw[1],
+        -parent.orientation_xyzw[2],
+        parent.orientation_xyzw[3],
+    )
+    displacement = tuple(child.position[index] - parent.position[index] for index in range(3))
+    return Pose(
+        _rotate_xyzw(displacement, inverse),  # type: ignore[arg-type]
+        _multiply_xyzw(inverse, child.orientation_xyzw),
+    )
+
+
+def _compose_pose(parent: Pose, child: Pose) -> Pose:
+    offset = _rotate_xyzw(child.position, parent.orientation_xyzw)
+    return Pose(
+        tuple(parent.position[index] + offset[index] for index in range(3)),  # type: ignore[arg-type]
+        _multiply_xyzw(parent.orientation_xyzw, child.orientation_xyzw),
+    )
+
+
 def _transform_position(
     vector: tuple[float, float, float],
     translation: tuple[float, float, float],
@@ -976,6 +1028,8 @@ class IsaacLabNativeWorld:
         self._initial_usd_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._usd_rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
         self._kinematic_rigids: dict[EntityPath, bool] = {}
+        self._entity_specs = {entity.path: entity for entity in spec.entities}
+        self._runtime_attachments: dict[tuple[int, str], _RuntimeAttachment] = {}
         self._static_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
         self._composite_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
         self._embedded_joint_paths: dict[EntityPath, tuple[tuple[str, ...], ...]] = {}
@@ -2268,6 +2322,13 @@ class IsaacLabNativeWorld:
             self._initial_deformable[path] = (state, target)
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
+        if getattr(self, "_runtime_attachments", None):
+            selected = frozenset(environment_indices)
+            stage = self._m.sim_utils.get_current_stage()
+            for key, attachment in tuple(self._runtime_attachments.items()):
+                if attachment.environment_index in selected:
+                    stage.RemovePrim(attachment.joint_prim_path)
+                    del self._runtime_attachments[key]
         env_ids = list(environment_indices)
         for state in getattr(self, "_composite_rigid_states", ()):
             selected = tuple(
@@ -2763,6 +2824,219 @@ class IsaacLabNativeWorld:
             )
         assert self._sim is not None
         self._sim.forward()
+
+    def _attachment_body_path(
+        self,
+        path: EntityPath,
+        link_name: str | None,
+        environment_index: int,
+    ) -> str:
+        entity = self._entity_specs.get(path)
+        if entity is None:
+            raise KeyError(f"attachment entity {path.value!r} does not exist")
+        if entity.embedded_binding is not None:
+            raise ValueError("runtime attachment endpoints do not yet support embedded component bindings")
+        root = f"/World/env_{environment_index}/{_native_name(path)}"
+        if entity.kind is EntityKind.ARTICULATION:
+            return f"{root}{_articulation_mount_body_suffix(self._m, root, link_name)}"
+        if entity.kind is not EntityKind.RIGID_BODY:
+            raise ValueError("attachment endpoints must be rigid bodies or articulations")
+        bodies = tuple(
+            self._m.sim_utils.get_all_matching_child_prims(
+                root,
+                lambda prim: prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI),
+            )
+        )
+        if link_name is None:
+            matches = bodies
+        else:
+            matches = tuple(prim for prim in bodies if prim.GetName() == link_name)
+        if len(matches) != 1:
+            raise ValueError(
+                f"attachment endpoint {path.value!r} link {link_name!r} must identify exactly one rigid body; "
+                f"found {len(matches)}"
+            )
+        return self._prim_path_string(matches[0])
+
+    def _attachment_endpoint_pose(
+        self,
+        path: EntityPath,
+        link_name: str | None,
+        environment_index: int,
+    ) -> Pose:
+        entity = self._entity_specs[path]
+        if entity.kind is EntityKind.ARTICULATION:
+            state = self.read_selected_kinematics(
+                (KinematicTarget("attachment-endpoint", path, link_name),),
+                environment_index,
+            )[0]
+            return Pose(state.position_m, state.orientation_xyzw)
+        positions, orientations, _linear, _angular = self.read_rigid_body(path)
+        return Pose(positions[environment_index], orientations[environment_index])
+
+    def _attachment_center_of_mass_pose(
+        self,
+        path: EntityPath,
+        link_name: str | None,
+        environment_index: int,
+    ) -> Pose:
+        origin = self._origins_cpu[environment_index]
+        if path in self._articulations:
+            asset = self._articulations[path]
+            if link_name is None:
+                row = asset.data.root_com_pose_w.torch[environment_index].detach().cpu().tolist()
+            else:
+                matches = tuple(index for index, name in enumerate(asset.body_names) if name == link_name)
+                if len(matches) != 1:
+                    raise KeyError(f"attachment link {link_name!r} must identify exactly one body")
+                row = (
+                    asset.data.body_com_pose_w.torch[environment_index, matches[0]]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+        elif path in self._rigids:
+            if link_name is not None:
+                entity = self._entity_specs[path]
+                if link_name != entity.root_link_name:
+                    raise KeyError(f"attachment link {link_name!r} does not identify the rigid root body")
+            row = self._rigids[path].data.root_com_pose_w.torch[environment_index].detach().cpu().tolist()
+        elif path in self._usd_articulation_views:
+            if link_name is None:
+                row = (
+                    self._usd_articulation_views[path]
+                    .get_root_transforms()[environment_index]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+            else:
+                self.read_selected_kinematics(
+                    (KinematicTarget("attachment-com", path, link_name),), environment_index
+                )
+                row = (
+                    self._selected_link_views[path, link_name]
+                    .get_transforms()[environment_index]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+        elif path in self._usd_rigid_views:
+            row = (
+                self._usd_rigid_views[path]
+                .get_transforms()[environment_index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+        else:
+            raise KeyError(f"attachment entity {path.value!r} has no native rigid-body state")
+        return Pose(
+            tuple(float(row[index]) - float(origin[index]) for index in range(3)),  # type: ignore[arg-type]
+            tuple(float(row[index]) for index in range(3, 7)),  # type: ignore[arg-type]
+        )
+
+    def attach_rigid_body(
+        self,
+        attachment_id: str,
+        parent_path: EntityPath,
+        parent_link_name: str | None,
+        child_path: EntityPath,
+        child_link_name: str | None,
+        environment_index: int,
+        parent_T_child: Pose | None,
+    ) -> Pose:
+        if not 0 <= environment_index < self._spec.environments.count:
+            raise IndexError("attachment environment index is out of range")
+        key = (environment_index, attachment_id)
+        if key in self._runtime_attachments:
+            raise ValueError("attachment ID is already active")
+        if any(
+            attachment.environment_index == environment_index and attachment.child_path == child_path
+            for attachment in self._runtime_attachments.values()
+        ):
+            raise ValueError("attachment child already has an active parent")
+        parent_body_path = self._attachment_body_path(parent_path, parent_link_name, environment_index)
+        child_body_path = self._attachment_body_path(child_path, child_link_name, environment_index)
+        if parent_body_path == child_body_path:
+            raise ValueError("attachment endpoints resolve to the same physical body")
+        parent_endpoint_pose = self._attachment_endpoint_pose(
+            parent_path, parent_link_name, environment_index
+        )
+        child_endpoint_pose = self._attachment_endpoint_pose(
+            child_path, child_link_name, environment_index
+        )
+        relative = parent_T_child or _relative_pose(parent_endpoint_pose, child_endpoint_pose)
+        joint_world_pose = (
+            child_endpoint_pose
+            if parent_T_child is None
+            else _compose_pose(parent_endpoint_pose, parent_T_child)
+        )
+        parent_com_T_joint = _relative_pose(
+            self._attachment_center_of_mass_pose(parent_path, parent_link_name, environment_index),
+            joint_world_pose,
+        )
+        child_com_T_joint = _relative_pose(
+            self._attachment_center_of_mass_pose(child_path, child_link_name, environment_index),
+            child_endpoint_pose,
+        )
+        digest = hashlib.sha256(attachment_id.encode("utf-8")).hexdigest()[:24]
+        joint_root = f"/World/env_{environment_index}/unirobosim_runtime_attachments"
+        joint_path = f"{joint_root}/fixed_{digest}"
+        stage = self._m.sim_utils.get_current_stage()
+        stage.DefinePrim(joint_root, "Scope")
+        if stage.GetPrimAtPath(joint_path).IsValid():
+            raise ValueError("attachment joint Prim path is already occupied")
+        fixed = self._m.UsdPhysics.FixedJoint.Define(stage, joint_path)
+        fixed.CreateBody0Rel().SetTargets((self._m.Sdf.Path(parent_body_path),))
+        fixed.CreateBody1Rel().SetTargets((self._m.Sdf.Path(child_body_path),))
+        fixed.CreateLocalPos0Attr().Set(self._m.Gf.Vec3f(*parent_com_T_joint.position))
+        fixed.CreateLocalRot0Attr().Set(
+            self._m.Gf.Quatf(
+                parent_com_T_joint.orientation_xyzw[3],
+                self._m.Gf.Vec3f(*parent_com_T_joint.orientation_xyzw[:3]),
+            )
+        )
+        fixed.CreateLocalPos1Attr().Set(self._m.Gf.Vec3f(*child_com_T_joint.position))
+        fixed.CreateLocalRot1Attr().Set(
+            self._m.Gf.Quatf(
+                child_com_T_joint.orientation_xyzw[3],
+                self._m.Gf.Vec3f(*child_com_T_joint.orientation_xyzw[:3]),
+            )
+        )
+        fixed.CreateJointEnabledAttr().Set(True)
+        fixed.CreateCollisionEnabledAttr().Set(True)
+        fixed.CreateExcludeFromArticulationAttr().Set(True)
+        self._runtime_attachments[key] = _RuntimeAttachment(
+            attachment_id,
+            environment_index,
+            parent_path,
+            parent_link_name,
+            child_path,
+            child_link_name,
+            relative,
+            joint_path,
+        )
+        assert self._sim is not None
+        self._sim.forward()
+        return relative
+
+    def detach_rigid_body(
+        self,
+        attachment_id: str,
+        child_path: EntityPath,
+        environment_index: int,
+    ) -> None:
+        key = (environment_index, attachment_id)
+        attachment = self._runtime_attachments.get(key)
+        if attachment is None or attachment.child_path != child_path:
+            raise KeyError("attachment is missing or belongs to another child")
+        stage = self._m.sim_utils.get_current_stage()
+        if not stage.RemovePrim(attachment.joint_prim_path):
+            raise RuntimeError("failed to remove the runtime fixed joint")
+        del self._runtime_attachments[key]
+        assert self._sim is not None
+        self._sim.forward()
         self._update_assets(0.0)
         self._invalidate_render()
 
@@ -3098,6 +3372,7 @@ class IsaacLabNativeWorld:
         self._fluids.clear()
         self._cameras.clear()
         self._rgb_host_staging.clear()
+        self._runtime_attachments.clear()
         self._debug_expirations.clear()
         self._debug_lifetimes.clear()
         if self._debug_overlay is not None:

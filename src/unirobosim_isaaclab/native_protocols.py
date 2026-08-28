@@ -24,6 +24,7 @@ from unirobosim import (
     PlanningLinkDescriptor,
     PlanningLinkState,
     PointCommandMode,
+    Pose,
     WorldSpec,
 )
 
@@ -81,6 +82,13 @@ class NativePlanningError(RuntimeError):
     _CODES = frozenset(
         {
             "catalog_invalid",
+            "attachment_entity_missing",
+            "attachment_frame_missing",
+            "attachment_geometry_missing",
+            "attachment_link_missing",
+            "attachment_pose_invalid",
+            "attachment_value_invalid",
+            "attachment_pose_missing",
             "collision_cooking_failed",
             "collision_filter_unsupported",
             "collision_geometry_unsupported",
@@ -184,6 +192,24 @@ class NativeWorldDriver(Protocol):
         path: EntityPath,
         position_m: Vector3,
         orientation_xyzw: Quaternion,
+        environment_index: int,
+    ) -> None: ...
+
+    def attach_rigid_body(
+        self,
+        attachment_id: str,
+        parent_path: EntityPath,
+        parent_link_name: str | None,
+        child_path: EntityPath,
+        child_link_name: str | None,
+        environment_index: int,
+        parent_T_child: Pose | None,
+    ) -> Pose: ...
+
+    def detach_rigid_body(
+        self,
+        attachment_id: str,
+        child_path: EntityPath,
         environment_index: int,
     ) -> None: ...
 

@@ -23,6 +23,7 @@ from unirobosim import (
     EntityKind,
     EntityPath,
     PlanningArticulationState,
+    PlanningAttachment,
     PlanningEntityDescriptor,
     PlanningEntityKind,
     PlanningEntityState,
@@ -240,6 +241,23 @@ def _compose_pose(parent: PlanningPose, local: PlanningGeometryLocalPose) -> Pla
         parent.frame_id,
         tuple(parent.position_m[index] + offset[index] for index in range(3)),  # type: ignore[arg-type]
         _quat_multiply(parent.orientation_xyzw, local.orientation_xyzw),
+    )
+
+
+def _relative_pose(parent: PlanningPose, child: PlanningPose, parent_frame_id: str) -> PlanningPose:
+    inverse_orientation = (
+        -parent.orientation_xyzw[0],
+        -parent.orientation_xyzw[1],
+        -parent.orientation_xyzw[2],
+        parent.orientation_xyzw[3],
+    )
+    world_delta = tuple(
+        child.position_m[index] - parent.position_m[index] for index in range(3)
+    )
+    return PlanningPose(
+        parent_frame_id,
+        _rotate(world_delta, inverse_orientation),  # type: ignore[arg-type]
+        _quat_multiply(inverse_orientation, child.orientation_xyzw),
     )
 
 
@@ -2705,6 +2723,73 @@ class _PlanningAdmission:
                     _compose_pose(parent_pose, geometry_binding.descriptor.parent_frame_T_geometry),
                 )
             )
+        attachments: list[PlanningAttachment] = []
+        for (attachment_environment, _attachment_id), attachment in sorted(
+            getattr(self._world, "_runtime_attachments", {}).items()
+        ):
+            if attachment_environment != environment_index:
+                continue
+            parent = self._entities.get(attachment.parent_path)
+            child = self._entities.get(attachment.child_path)
+            if parent is None or child is None:
+                raise NativePlanningError("attachment_entity_missing")
+            parent_link_name = attachment.parent_link_name or parent.root_link_name
+            child_link_name = attachment.child_link_name or child.root_link_name
+            parent_link_id = parent.link_id_by_name.get(parent_link_name)
+            child_link_id = child.link_id_by_name.get(child_link_name)
+            if parent_link_id is None or child_link_id is None:
+                raise NativePlanningError("attachment_link_missing")
+
+            def link_frame_id(link_id: str) -> str:
+                matches = tuple(
+                    link.frame_id
+                    for link in self._catalog.links
+                    if link.link_id == link_id
+                )
+                if len(matches) != 1:
+                    raise NativePlanningError("attachment_frame_missing")
+                return matches[0]
+
+            parent_frame_id = link_frame_id(parent_link_id)
+            child_frame_id = link_frame_id(child_link_id)
+            geometry_ids = tuple(
+                geometry.descriptor.geometry_id
+                for geometry in self._geometries.values()
+                if geometry.entity_path == attachment.child_path
+                and geometry.descriptor.owner_link_id == child_link_id
+            )
+            if not geometry_ids:
+                raise NativePlanningError("attachment_geometry_missing")
+            try:
+                current_relative = _relative_pose(
+                    poses[attachment.parent_path, parent_link_name],
+                    poses[attachment.child_path, child_link_name],
+                    parent_frame_id,
+                )
+            except KeyError:
+                raise NativePlanningError("attachment_pose_missing") from None
+            except NativePlanningError:
+                raise
+            except Exception:
+                raise NativePlanningError("attachment_pose_invalid") from None
+            try:
+                attachments.append(
+                    PlanningAttachment(
+                        attachment.attachment_id,
+                        parent.entity_id,
+                        child.entity_id,
+                        parent_frame_id,
+                        child_frame_id,
+                        current_relative,
+                        tuple(sorted(geometry_ids)),
+                        parent_link_id,
+                        child_link_id,
+                    )
+                )
+            except NativePlanningError:
+                raise
+            except Exception:
+                raise NativePlanningError("attachment_value_invalid") from None
         return NativePlanningState(
             self._world._step_index,
             tuple(sorted(entity_states, key=lambda item: item.entity_id)),
@@ -2712,7 +2797,7 @@ class _PlanningAdmission:
             frame_states,
             tuple(sorted(articulations, key=lambda item: item.entity_id)),
             tuple(geometry_transforms),
-            (),
+            tuple(sorted(attachments, key=lambda item: item.attachment_id)),
         )
 
 
