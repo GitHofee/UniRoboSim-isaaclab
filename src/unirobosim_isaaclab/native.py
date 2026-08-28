@@ -2682,18 +2682,8 @@ class IsaacLabNativeWorld:
                     key = (path, target.link_name)
                     body_view = self._selected_link_views.get(key)
                     if body_view is None:
-                        parent_name = _native_name(path)
-                        suffix: str | None = None
-                        for environment in range(self._spec.environments.count):
-                            root = f"/World/env_{environment}/{parent_name}"
-                            current = _articulation_mount_body_suffix(self._m, root, target.link_name)
-                            if suffix is None:
-                                suffix = current
-                            elif current != suffix:
-                                raise RuntimeError("selected articulation body changed across environments")
-                        assert suffix is not None
                         expected_paths = tuple(
-                            f"/World/env_{environment}/{parent_name}{suffix}"
+                            self._attachment_body_path(path, target.link_name, environment)
                             for environment in range(self._spec.environments.count)
                         )
                         body_view = self._usd_simulation_view().create_rigid_body_view(list(expected_paths))
@@ -2835,7 +2825,33 @@ class IsaacLabNativeWorld:
         if entity is None:
             raise KeyError(f"attachment entity {path.value!r} does not exist")
         if entity.embedded_binding is not None:
-            raise ValueError("runtime attachment endpoints do not yet support embedded component bindings")
+            binding = entity.embedded_binding
+            roots = self._composite_scene_roots.get(binding.container_path)
+            if roots is None or environment_index >= len(roots):
+                raise KeyError(f"attachment container for {path.value!r} is unavailable")
+            if link_name is None:
+                relative_path = binding.root_body_prim_path
+            else:
+                matches = tuple(
+                    item.relative_prim_path
+                    for item in binding.link_prims
+                    if item.logical_name == link_name
+                )
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"attachment link {link_name!r} on {path.value!r} must identify exactly one "
+                        f"embedded rigid body; found {len(matches)}"
+                    )
+                relative_path = matches[0]
+            prim = self._embedded_prim(
+                roots[environment_index],
+                relative_path,
+                entity=entity,
+                role=f"attachment link {link_name!r}",
+            )
+            if not prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
+                raise ValueError("an embedded attachment endpoint must be a rigid-body Prim")
+            return self._prim_path_string(prim)
         root = f"/World/env_{environment_index}/{_native_name(path)}"
         if entity.kind is EntityKind.ARTICULATION:
             return f"{root}{_articulation_mount_body_suffix(self._m, root, link_name)}"
@@ -2880,6 +2896,7 @@ class IsaacLabNativeWorld:
         link_name: str | None,
         environment_index: int,
     ) -> Pose:
+        """Return the PhysX actor frame used by a runtime joint endpoint."""
         origin = self._origins_cpu[environment_index]
         if path in self._articulations:
             asset = self._articulations[path]
@@ -2952,7 +2969,9 @@ class IsaacLabNativeWorld:
         if key in self._runtime_attachments:
             raise ValueError("attachment ID is already active")
         if any(
-            attachment.environment_index == environment_index and attachment.child_path == child_path
+            attachment.environment_index == environment_index
+            and attachment.child_path == child_path
+            and attachment.child_link_name == child_link_name
             for attachment in self._runtime_attachments.values()
         ):
             raise ValueError("attachment child already has an active parent")
@@ -2972,11 +2991,13 @@ class IsaacLabNativeWorld:
             if parent_T_child is None
             else _compose_pose(parent_endpoint_pose, parent_T_child)
         )
-        parent_com_T_joint = _relative_pose(
+        # Runtime physics joints consume the PhysX actor/center-of-mass frames.  The
+        # public relation remains expressed between the selected logical link frames.
+        parent_actor_T_joint = _relative_pose(
             self._attachment_center_of_mass_pose(parent_path, parent_link_name, environment_index),
             joint_world_pose,
         )
-        child_com_T_joint = _relative_pose(
+        child_actor_T_joint = _relative_pose(
             self._attachment_center_of_mass_pose(child_path, child_link_name, environment_index),
             child_endpoint_pose,
         )
@@ -2990,22 +3011,24 @@ class IsaacLabNativeWorld:
         fixed = self._m.UsdPhysics.FixedJoint.Define(stage, joint_path)
         fixed.CreateBody0Rel().SetTargets((self._m.Sdf.Path(parent_body_path),))
         fixed.CreateBody1Rel().SetTargets((self._m.Sdf.Path(child_body_path),))
-        fixed.CreateLocalPos0Attr().Set(self._m.Gf.Vec3f(*parent_com_T_joint.position))
+        fixed.CreateLocalPos0Attr().Set(self._m.Gf.Vec3f(*parent_actor_T_joint.position))
         fixed.CreateLocalRot0Attr().Set(
             self._m.Gf.Quatf(
-                parent_com_T_joint.orientation_xyzw[3],
-                self._m.Gf.Vec3f(*parent_com_T_joint.orientation_xyzw[:3]),
+                parent_actor_T_joint.orientation_xyzw[3],
+                self._m.Gf.Vec3f(*parent_actor_T_joint.orientation_xyzw[:3]),
             )
         )
-        fixed.CreateLocalPos1Attr().Set(self._m.Gf.Vec3f(*child_com_T_joint.position))
+        fixed.CreateLocalPos1Attr().Set(self._m.Gf.Vec3f(*child_actor_T_joint.position))
         fixed.CreateLocalRot1Attr().Set(
             self._m.Gf.Quatf(
-                child_com_T_joint.orientation_xyzw[3],
-                self._m.Gf.Vec3f(*child_com_T_joint.orientation_xyzw[:3]),
+                child_actor_T_joint.orientation_xyzw[3],
+                self._m.Gf.Vec3f(*child_actor_T_joint.orientation_xyzw[:3]),
             )
         )
         fixed.CreateJointEnabledAttr().Set(True)
-        fixed.CreateCollisionEnabledAttr().Set(True)
+        # The two constrained bodies must not simultaneously repel one another;
+        # contacts with every other scene body remain enabled.
+        fixed.CreateCollisionEnabledAttr().Set(False)
         fixed.CreateExcludeFromArticulationAttr().Set(True)
         self._runtime_attachments[key] = _RuntimeAttachment(
             attachment_id,

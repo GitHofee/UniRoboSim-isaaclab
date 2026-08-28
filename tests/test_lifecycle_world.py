@@ -372,6 +372,32 @@ def test_scene_snapshot_delta_and_transactional_rigid_drag(tmp_path: Path) -> No
     assert detached.attachment_id == "held-marker"
     assert any(call[0] == "attach_rigid_body" for call in runtime.worlds[-1].calls)
     assert any(call[0] == "detach_rigid_body" for call in runtime.worlds[-1].calls)
+
+    articulated_child = SceneCommand(
+        "attach-articulation-link",
+        "mission",
+        "lease",
+        world.generation,
+        SceneCommandKind.ATTACH,
+        EntityPath("/robots/arm"),
+        1,
+        attachment_id="held-articulation-link",
+        parent_entity_path=EntityPath("/props/marker"),
+        child_link_name="link_b",
+    )
+    assert world.apply_scene_command(articulated_child).status is SceneCommandStatus.APPLIED
+    assert world.apply_scene_command(
+        SceneCommand(
+            "detach-articulation-link",
+            "mission",
+            "lease",
+            world.generation,
+            SceneCommandKind.DETACH,
+            EntityPath("/robots/arm"),
+            1,
+            attachment_id="held-articulation-link",
+        )
+    ).status is SceneCommandStatus.APPLIED
     with pytest.raises(ValidationError):
         world.scene_delta(999)
     sequence_before_reset = world.scene_snapshot().sequence

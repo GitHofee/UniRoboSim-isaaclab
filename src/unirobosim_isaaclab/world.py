@@ -108,7 +108,7 @@ class IsaacLabWorld:
         self._scene_sequence = 0
         self._scene_results: dict[str, SceneCommandResult] = {}
         self._drags: dict[str, tuple[EntityPath, int, Pose]] = {}
-        self._attachments: dict[tuple[int, str], EntityPath] = {}
+        self._attachments: dict[tuple[int, str], tuple[EntityPath, str | None]] = {}
         self._pending_articulation_commands: list[NativeArticulationCommand] = []
         self._entities = {entity.path: entity for entity in spec.entities}
         self._build_report = BuildReport(
@@ -1046,12 +1046,15 @@ class IsaacLabWorld:
         entity = self._entities.get(command.entity_path)
         if entity is None or command.environment_index >= self._spec.environments.count:
             return self._scene_result(command, SceneCommandStatus.REJECTED, "target_not_found", "target does not exist")
-        if entity.kind is not EntityKind.RIGID_BODY:
+        attachment_command = command.kind in {SceneCommandKind.ATTACH, SceneCommandKind.DETACH}
+        if entity.kind is not EntityKind.RIGID_BODY and not (
+            attachment_command and entity.kind is EntityKind.ARTICULATION
+        ):
             return self._scene_result(
                 command,
                 SceneCommandStatus.REJECTED,
                 "unsupported_entity_kind",
-                "scene manipulation requires a free rigid-body target",
+                "scene manipulation requires a rigid body, or an articulation attachment endpoint",
             )
         environment = command.environment_index
         if command.kind is SceneCommandKind.SET_POSE:
@@ -1084,7 +1087,7 @@ class IsaacLabWorld:
                     "attachment ID is already active",
                 )
             if any(
-                child == entity.path and key_environment == environment
+                child == (entity.path, command.child_link_name) and key_environment == environment
                 for (key_environment, _), child in self._attachments.items()
             ):
                 return self._scene_result(
@@ -1106,11 +1109,12 @@ class IsaacLabWorld:
                 ),
                 entity_path=entity.path.value,
             )
-            self._attachments[key] = entity.path
+            self._attachments[key] = (entity.path, command.child_link_name)
         elif command.kind is SceneCommandKind.DETACH:
             assert command.attachment_id is not None
             key = (environment, command.attachment_id)
-            if self._attachments.get(key) != entity.path:
+            child = self._attachments.get(key)
+            if child is None or child[0] != entity.path:
                 return self._scene_result(
                     command,
                     SceneCommandStatus.REJECTED,
