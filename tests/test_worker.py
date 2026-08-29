@@ -43,7 +43,10 @@ from unirobosim_isaaclab.worker import (
     _error_reply,
     _planning_error_reply,
     _proc_stat_session,
+    _send_worker_reply,
     _session_member_pids,
+    _SharedRgbReply,
+    _SharedStepStateRgbReply,
     _spawn_worker,
     _spawned_worker_main,
     _startup_progress_reply,
@@ -341,7 +344,7 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     fingerprint = _worker_startup_fingerprint()
     assert worker_bootstrap_module._WORKER_PROGRESS_SCHEMA == worker_module._WORKER_PROGRESS_SCHEMA
     assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/2"
-    assert fingerprint["worker_protocol"] == 2
+    assert fingerprint["worker_protocol"] == 3
     assert fingerprint["adapter"] == {
         "version": "0.10.6",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
@@ -358,6 +361,37 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
     runtime.close()
     assert connection.closed and not process.alive
+
+
+def test_rgb_worker_reply_uses_shared_storage_without_pickling_payloads() -> None:
+    connection = FakeConnection([], FakeProcess())
+    transport = SimpleNamespace(size=24, buf=bytearray(24))
+    payload = (
+        ((CameraModality.RGB, (1, 2, 2, 3), b"a" * 12),),
+        ((CameraModality.RGB, (1, 2, 2, 3), b"b" * 12),),
+    )
+
+    _send_worker_reply(cast(Any, connection), "read_sensors", payload, cast(Any, transport))
+
+    assert bytes(transport.buf) == b"a" * 12 + b"b" * 12
+    assert connection.sent == [
+        ("shared_rgb_batch", (((1, 2, 2, 3), 0, 12), ((1, 2, 2, 3), 12, 12)))
+    ]
+
+    connection.sent.clear()
+    reply = _SharedRgbReply((((1, 2, 2, 3), 0, 12), ((1, 2, 2, 3), 12, 12)))
+    _send_worker_reply(cast(Any, connection), "read_sensors", reply, cast(Any, transport))
+    assert connection.sent == [("shared_rgb_batch", reply.metadata)]
+
+    connection.sent.clear()
+    combined = _SharedStepStateRgbReply((), reply.metadata)
+    _send_worker_reply(
+        cast(Any, connection),
+        "apply_articulation_commands_step_and_read_sensors",
+        combined,
+        cast(Any, transport),
+    )
+    assert connection.sent == [("shared_step_state_rgb", ((), reply.metadata))]
 
 
 @pytest.mark.parametrize(
@@ -671,6 +705,41 @@ def test_worker_camera_batch_is_one_request_and_preserves_packed_bytes(tmp_path:
     operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
     assert operations == ["build_world", "read_sensors", "close_world", "close_runtime"]
     assert connection.sent[1] == ("read_sensors", (paths,))
+    assert connection.closed and not process.alive
+
+
+def test_worker_combines_step_state_and_camera_in_one_request(tmp_path: Path) -> None:
+    sample = ((CameraModality.RGB, (1, 1, 2, 3), b"\x01\x02\x03\x04\x05\x06"),)
+    paths = (EntityPath("/camera"), EntityPath("/camera"))
+    factory, connection, process = fake_worker_factory(
+        [
+            ("ok", None),
+            ("ok", None),
+            ("ok", ((), (sample, sample))),
+            ("ok", None),
+            ("ok", None),
+        ]
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    world = runtime.build_world(extended_world(make_articulation_asset(tmp_path / "robot.usda")))
+
+    states, sensors = world.apply_articulation_commands_step_and_read_sensors((), 1, (), paths)
+
+    assert states == ()
+    assert sensors == (sample, sample)
+    world.close()
+    runtime.close()
+    operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
+    assert operations == [
+        "build_world",
+        "apply_articulation_commands_step_and_read_sensors",
+        "close_world",
+        "close_runtime",
+    ]
+    assert connection.sent[1] == (
+        "apply_articulation_commands_step_and_read_sensors",
+        ((), 1, (), paths),
+    )
     assert connection.closed and not process.alive
 
 

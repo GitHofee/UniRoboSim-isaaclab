@@ -811,6 +811,7 @@ def _compose(
     projection_module = import_module("fastsim.integrations.unirobosim.projection")
     scene_command_module = import_module("fastsim.integrations.unirobosim._scene_command")
     simulation_query_module = import_module("fastsim.integrations.unirobosim._simulation_query")
+    visualization_module = import_module("fastsim.integrations.unirobosim._visualization")
     services = import_module("fastsim.integrations.unirobosim.services")
     planning_module = import_module("fastsim.integrations.unirobosim._planning_raw")
 
@@ -853,6 +854,7 @@ def _compose(
         run_id="droid-equivalence-isaaclab",
         mark_scene_mutated=planning_raw._mark_scene_mutated,
     )
+    visualization_root = visualization_module._VisualizationRoot("droid-equivalence-isaaclab")
     kernel = runtime.RuntimeKernel(
         plan,
         adapter,
@@ -877,6 +879,7 @@ def _compose(
     planning_raw._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
     simulation_root._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
     scene_command_root._bind_authority(kernel.submit_authority, lambda: kernel.snapshot)
+    visualization_root._bind_authority(kernel.submit_authority, lambda: kernel.snapshot)
     executor.bind_authority_submitter(kernel.submit_authority)
     for observation_provider in projection_module.observation_providers(projection):
         kernel.observations.register(observation_provider)
@@ -891,6 +894,7 @@ def _compose(
         recording_capture=None,
         fluid_emitter_root=fluid_emitter_root,
         scene_command_root=scene_command_root,
+        visualization_root=visualization_root,
     )
     return bundle, adapter
 

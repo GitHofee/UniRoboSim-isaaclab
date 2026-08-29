@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import faulthandler
+import math
 import multiprocessing
 import os
 import signal
@@ -13,6 +14,7 @@ import traceback
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from multiprocessing import resource_tracker, shared_memory
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -49,7 +51,11 @@ _STARTUP_ATTEMPTS = 2
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/2"
 _WORKER_PROGRESS_SCHEMA = "unirobosim-isaaclab-worker-progress/1"
-_WORKER_PROTOCOL_VERSION = 2
+_WORKER_PROTOCOL_VERSION = 3
+_PACKED_RGB_BATCH_STATUS = "packed_rgb_batch"
+_SHARED_RGB_BATCH_STATUS = "shared_rgb_batch"
+_SHARED_STEP_STATE_RGB_STATUS = "shared_step_state_rgb"
+_MAX_PACKED_RGB_SAMPLE_BYTES = 1024 * 1024 * 1024
 
 # Earlier interpreter/import phases normally complete in well under a second and
 # retain small fixed idle limits.  Kit launch is the exceptional phase: a cold
@@ -97,6 +103,17 @@ class _NativeWorkerTimeout(NativeWorkerError):
 @dataclass(frozen=True)
 class _WorkerStartupProgress:
     phase: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedRgbReply:
+    metadata: tuple[tuple[tuple[int, ...], int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedStepStateRgbReply:
+    states: tuple[tuple[Matrix, Matrix], ...]
+    metadata: tuple[tuple[tuple[int, ...], int, int], ...]
 
 
 def _module_origin(module: object, name: str) -> Path:
@@ -280,6 +297,71 @@ def _planning_error_reply(exc: BaseException) -> Reply:
     return "planning_error", {"code": code}
 
 
+def _packed_rgb_batch_metadata(payload: object) -> tuple[tuple[tuple[int, ...], int], ...] | None:
+    """Describe an RGB-only batch whose byte payloads can bypass pickle."""
+
+    if type(payload) is not tuple:
+        return None
+    metadata: list[tuple[tuple[int, ...], int]] = []
+    for sample in payload:
+        if type(sample) is not tuple or len(sample) != 1:
+            return None
+        channel = sample[0]
+        if type(channel) is not tuple or len(channel) != 3 or channel[0] is not unirobosim.CameraModality.RGB:
+            return None
+        shape, values = channel[1], channel[2]
+        if (
+            type(shape) is not tuple
+            or not shape
+            or any(type(size) is not int or size <= 0 for size in shape)
+            or type(values) is not bytes
+        ):
+            return None
+        expected = math.prod(shape)
+        if expected > _MAX_PACKED_RGB_SAMPLE_BYTES or len(values) != expected:
+            return None
+        metadata.append((shape, expected))
+    return tuple(metadata)
+
+
+def _send_worker_reply(
+    connection: Connection,
+    operation: str,
+    payload: object,
+    rgb_transport: shared_memory.SharedMemory | None,
+) -> None:
+    """Send large packed RGB buffers without re-pickling their contents."""
+
+    if isinstance(payload, _SharedRgbReply):
+        connection.send((_SHARED_RGB_BATCH_STATUS, payload.metadata))
+        return
+    if isinstance(payload, _SharedStepStateRgbReply):
+        connection.send((_SHARED_STEP_STATE_RGB_STATUS, (payload.states, payload.metadata)))
+        return
+    metadata = _packed_rgb_batch_metadata(payload) if operation == "read_sensors" else None
+    if metadata is None:
+        connection.send(("ok", payload))
+        return
+    if rgb_transport is not None:
+        transport_buffer = cast(memoryview, rgb_transport.buf)
+        offset = 0
+        shared_metadata: list[tuple[tuple[int, ...], int, int]] = []
+        samples = cast(NativeSensorBatch, payload)
+        for (shape, size), sample in zip(metadata, samples, strict=True):
+            end = offset + size
+            if end > rgb_transport.size:
+                raise RuntimeError("packed RGB batch exceeds its shared transport capacity")
+            transport_buffer[offset:end] = cast(bytes, sample[0][2])
+            shared_metadata.append((shape, offset, size))
+            offset = end
+        connection.send((_SHARED_RGB_BATCH_STATUS, tuple(shared_metadata)))
+        return
+    connection.send((_PACKED_RGB_BATCH_STATUS, metadata))
+    samples = cast(NativeSensorBatch, payload)
+    for sample in samples:
+        connection.send_bytes(cast(bytes, sample[0][2]))
+
+
 def _require_world(world: NativeWorldDriver | None, operation: str) -> NativeWorldDriver:
     if world is None:
         raise RuntimeError(f"native worker has no world for operation {operation!r}")
@@ -290,6 +372,7 @@ def _dispatch(
     runtime: NativeRuntime,
     world: NativeWorldDriver | None,
     request: Request,
+    rgb_transport: shared_memory.SharedMemory | None = None,
 ) -> tuple[NativeWorldDriver | None, Any, bool]:
     """Execute one trusted local IPC request and return updated worker state."""
 
@@ -326,6 +409,26 @@ def _dispatch(
             cast(int, args[1]),
         )
         return active, None, False
+    if operation == "apply_articulation_commands_step_and_read":
+        states = active.apply_articulation_commands_step_and_read(
+            cast(tuple[NativeArticulationCommand, ...], args[0]),
+            cast(int, args[1]),
+            cast(tuple[EntityPath, ...], args[2]),
+        )
+        return active, states, False
+    if operation == "apply_articulation_commands_step_and_read_sensors":
+        states = active.apply_articulation_commands_step_and_read(
+            cast(tuple[NativeArticulationCommand, ...], args[0]),
+            cast(int, args[1]),
+            cast(tuple[EntityPath, ...], args[2]),
+        )
+        sensor_paths = cast(tuple[EntityPath, ...], args[3])
+        shared_reader = getattr(active, "read_sensors_into_shared", None)
+        if rgb_transport is not None and callable(shared_reader):
+            metadata = shared_reader(sensor_paths, cast(memoryview, rgb_transport.buf))
+            if metadata is not None:
+                return active, _SharedStepStateRgbReply(states, metadata), False
+        return active, (states, active.read_sensors(sensor_paths)), False
     if operation == "apply_rigid_body_wrench":
         active.apply_rigid_body_wrench(
             cast(EntityPath, args[0]),
@@ -388,7 +491,13 @@ def _dispatch(
     if operation == "read_sensor":
         return active, active.read_sensor(cast(EntityPath, args[0])), False
     if operation == "read_sensors":
-        return active, active.read_sensors(cast(tuple[EntityPath, ...], args[0])), False
+        paths = cast(tuple[EntityPath, ...], args[0])
+        shared_reader = getattr(active, "read_sensors_into_shared", None)
+        if rgb_transport is not None and callable(shared_reader):
+            metadata = shared_reader(paths, cast(memoryview, rgb_transport.buf))
+            if metadata is not None:
+                return active, _SharedRgbReply(metadata), False
+        return active, active.read_sensors(paths), False
     if operation == "camera_calibration":
         return active, active.camera_calibration(cast(EntityPath, args[0])), False
     if operation == "read_selected_kinematics":
@@ -445,6 +554,7 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     runtime: NativeRuntime | None = None
     world: NativeWorldDriver | None = None
+    rgb_transport: shared_memory.SharedMemory | None = None
     try:
         try:
             connection.send(_startup_progress_reply("native_module_loading"))
@@ -465,10 +575,29 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
                 request = cast(Request, connection.recv())
             except EOFError:
                 break
+            operation = request[0]
+            if operation == "build_world" and len(request[1]) == 2 and request[1][1] is not None:
+                descriptor = request[1][1]
+                if (
+                    type(descriptor) is not tuple
+                    or len(descriptor) != 2
+                    or type(descriptor[0]) is not str
+                    or type(descriptor[1]) is not int
+                    or descriptor[1] <= 0
+                ):
+                    connection.send(_error_reply(ValueError("invalid shared RGB transport descriptor")))
+                    continue
+                rgb_transport = shared_memory.SharedMemory(name=descriptor[0], create=False)
+                resource_tracker.unregister(cast(Any, rgb_transport)._name, "shared_memory")
+                if rgb_transport.size != descriptor[1]:
+                    rgb_transport.close()
+                    rgb_transport = None
+                    connection.send(_error_reply(ValueError("shared RGB transport capacity differs")))
+                    continue
             try:
-                world, payload, should_stop = _dispatch(runtime, world, request)
+                world, payload, should_stop = _dispatch(runtime, world, request, rgb_transport)
             except Exception as exc:
-                operation, args = request
+                _, args = request
                 demanded_build = (
                     operation == "build_world"
                     and bool(args)
@@ -480,7 +609,7 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
                 else:
                     connection.send(_error_reply(exc))
                 continue
-            connection.send(("ok", payload))
+            _send_worker_reply(connection, operation, payload, rgb_transport)
             if should_stop:
                 break
     finally:
@@ -488,6 +617,8 @@ def _worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:
         if runtime is not None:
             # Fast shutdown terminates only this adapter-owned worker process.
             runtime.close()
+        if rgb_transport is not None:
+            rgb_transport.close()
 
 
 def _spawned_worker_main(connection: Connection, config: IsaacLabAdapterConfig) -> None:  # pragma: no cover
@@ -615,6 +746,7 @@ class IsaacLabWorkerRuntime:
     ) -> None:
         self._closed = False
         self._active_world: IsaacLabWorkerWorld | None = None
+        self._rgb_transport: shared_memory.SharedMemory | None = None
         for attempt in range(1, _STARTUP_ATTEMPTS + 1):
             self._connection, self._process = worker_factory(config)
             try:
@@ -693,6 +825,7 @@ class IsaacLabWorkerRuntime:
         allow_startup_progress: bool = False,
     ) -> Any:
         timeout = _CALL_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        deadline = time.monotonic() + timeout
         try:
             if not self._connection.poll(timeout):
                 raise _NativeWorkerTimeout(f"timed out after {timeout:g}s during {operation}")
@@ -704,6 +837,14 @@ class IsaacLabWorkerRuntime:
         status, payload = reply
         if status == "ok":
             return payload
+        if status == _PACKED_RGB_BATCH_STATUS:
+            return self._receive_packed_rgb_batch(payload, operation=operation, deadline=deadline)
+        if status == _SHARED_RGB_BATCH_STATUS:
+            return self._receive_shared_rgb_batch(payload, operation=operation)
+        if status == _SHARED_STEP_STATE_RGB_STATUS:
+            if type(payload) is not tuple or len(payload) != 2 or type(payload[0]) is not tuple:
+                raise NativeWorkerError(f"invalid shared step/state/RGB payload during {operation}: {payload!r}")
+            return payload[0], self._receive_shared_rgb_batch(payload[1], operation=operation)
         if status == "startup_progress" and allow_startup_progress:
             return _validate_startup_progress(payload)
         if status == "planning_error" and isinstance(payload, dict):
@@ -714,6 +855,75 @@ class IsaacLabWorkerRuntime:
         message = payload.get("message", "")
         remote_traceback = payload.get("traceback", "")
         raise NativeWorkerError(f"{remote_type} during {operation}: {message}\n{remote_traceback}".rstrip())
+
+    def _receive_packed_rgb_batch(
+        self,
+        value: object,
+        *,
+        operation: str,
+        deadline: float,
+    ) -> NativeSensorBatch:
+        if type(value) is not tuple:
+            raise NativeWorkerError(f"invalid packed RGB metadata during {operation}: {value!r}")
+        result: list[NativeSensorSample] = []
+        for entry in value:
+            if (
+                type(entry) is not tuple
+                or len(entry) != 2
+                or type(entry[0]) is not tuple
+                or not entry[0]
+                or any(type(size) is not int or size <= 0 for size in entry[0])
+                or type(entry[1]) is not int
+                or entry[1] <= 0
+                or entry[1] > _MAX_PACKED_RGB_SAMPLE_BYTES
+                or math.prod(entry[0]) != entry[1]
+            ):
+                raise NativeWorkerError(f"invalid packed RGB metadata during {operation}: {entry!r}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0 or not self._connection.poll(remaining):
+                raise _NativeWorkerTimeout(f"timed out after payload header during {operation}")
+            try:
+                packed = self._connection.recv_bytes()
+            except (EOFError, OSError) as exc:
+                raise NativeWorkerError(
+                    f"native worker disconnected during packed RGB payload for {operation}; "
+                    f"exitcode={self._process.exitcode}"
+                ) from exc
+            if len(packed) != entry[1]:
+                raise NativeWorkerError(
+                    f"packed RGB payload size differs during {operation}: expected {entry[1]}, got {len(packed)}"
+                )
+            result.append(((unirobosim.CameraModality.RGB, entry[0], packed),))
+        return tuple(result)
+
+    def _receive_shared_rgb_batch(self, value: object, *, operation: str) -> NativeSensorBatch:
+        transport = self._rgb_transport
+        if transport is None or type(value) is not tuple:
+            raise NativeWorkerError(f"invalid shared RGB metadata during {operation}: {value!r}")
+        result: list[NativeSensorSample] = []
+        transport_buffer = cast(memoryview, transport.buf)
+        previous_end = 0
+        for entry in value:
+            if (
+                type(entry) is not tuple
+                or len(entry) != 3
+                or type(entry[0]) is not tuple
+                or not entry[0]
+                or any(type(size) is not int or size <= 0 for size in entry[0])
+                or type(entry[1]) is not int
+                or type(entry[2]) is not int
+                or entry[1] != previous_end
+                or entry[2] <= 0
+                or entry[2] > _MAX_PACKED_RGB_SAMPLE_BYTES
+                or math.prod(entry[0]) != entry[2]
+                or entry[1] + entry[2] > transport.size
+            ):
+                raise NativeWorkerError(f"invalid shared RGB metadata during {operation}: {entry!r}")
+            end = entry[1] + entry[2]
+            packed = bytes(transport_buffer[entry[1] : end])
+            result.append(((unirobosim.CameraModality.RGB, entry[0], packed),))
+            previous_end = end
+        return tuple(result)
 
     def _request(self, operation: str, *args: Any) -> Any:
         if self._closed:
@@ -731,7 +941,23 @@ class IsaacLabWorkerRuntime:
     def build_world(self, spec: WorldSpec) -> IsaacLabWorkerWorld:
         if self._active_world is not None and not self._active_world.closed:
             raise NativeWorkerError("native worker already owns a world")
-        self._request("build_world", spec)
+        capacity = sum(
+            entity.camera.width_px * entity.camera.height_px * 3
+            for entity in spec.entities
+            if entity.camera is not None and unirobosim.CameraModality.RGB in entity.camera.modalities
+        )
+        if capacity > 0:
+            self._rgb_transport = shared_memory.SharedMemory(create=True, size=capacity)
+        descriptor = (
+            None
+            if self._rgb_transport is None
+            else (self._rgb_transport.name, self._rgb_transport.size)
+        )
+        try:
+            self._request("build_world", spec, descriptor)
+        except BaseException:
+            self._close_rgb_transport()
+            raise
         world = IsaacLabWorkerPlanningWorld(self) if planning_scene_demanded(spec) else IsaacLabWorkerWorld(self)
         self._active_world = world
         return world
@@ -746,6 +972,14 @@ class IsaacLabWorkerRuntime:
         finally:
             _terminate_worker_tree(self._process)
             self._process.join(_SHUTDOWN_TIMEOUT_SECONDS)
+            self._close_rgb_transport()
+
+    def _close_rgb_transport(self) -> None:
+        transport = self._rgb_transport
+        self._rgb_transport = None
+        if transport is not None:
+            transport.close()
+            transport.unlink()
 
     def close(self) -> None:
         if self._closed:
@@ -770,6 +1004,7 @@ class IsaacLabWorkerRuntime:
             else:
                 # Fast shutdown may leave telemetry and crash-report helpers alive.
                 _terminate_worker_tree(self._process)
+            self._close_rgb_transport()
         if error is not None:
             raise error
         if self._process.exitcode not in {0, None}:
@@ -831,6 +1066,37 @@ class IsaacLabWorkerWorld:
     ) -> None:
         self._ensure_open("apply_articulation_commands_and_step")
         self._runtime._request("apply_articulation_commands_and_step", commands, count)
+
+    def apply_articulation_commands_step_and_read(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[Matrix, Matrix], ...]:
+        self._ensure_open("apply_articulation_commands_step_and_read")
+        return cast(
+            tuple[tuple[Matrix, Matrix], ...],
+            self._runtime._request("apply_articulation_commands_step_and_read", commands, count, paths),
+        )
+
+    def apply_articulation_commands_step_and_read_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], NativeSensorBatch]:
+        self._ensure_open("apply_articulation_commands_step_and_read_sensors")
+        return cast(
+            tuple[tuple[tuple[Matrix, Matrix], ...], NativeSensorBatch],
+            self._runtime._request(
+                "apply_articulation_commands_step_and_read_sensors",
+                commands,
+                count,
+                paths,
+                sensor_paths,
+            ),
+        )
 
     def apply_rigid_body_wrench(
         self,

@@ -177,6 +177,21 @@ class NativeWorldDriver(Protocol):
         count: int,
     ) -> None: ...
 
+    def apply_articulation_commands_step_and_read(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[Matrix, Matrix], ...]: ...
+
+    def apply_articulation_commands_step_and_read_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], NativeSensorBatch]: ...
+
     def apply_rigid_body_wrench(
         self,
         path: EntityPath,

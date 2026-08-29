@@ -491,6 +491,50 @@ def test_articulation_commands_and_read(mode: CommandMode, tmp_path: Path) -> No
     session.close()
 
 
+def test_step_state_and_sensor_batch_share_one_native_transaction(tmp_path: Path) -> None:
+    runtime = FakeNativeRuntime()
+    provider = IsaacLabProvider(
+        IsaacLabAdapterConfig(enable_cameras=True, render=True),
+        runtime_factory=lambda config: runtime,
+        probe_function=available_probe,
+    )
+    session = provider.open()
+    base = make_world(make_articulation_asset(tmp_path / "arm.usd"))
+    spec = WorldSpec(
+        base.world_id,
+        (
+            *base.entities,
+            EntitySpec(
+                EntityPath("/camera"),
+                EntityKind.CAMERA_SENSOR,
+                camera=CameraSpec(
+                    width_px=2,
+                    height_px=2,
+                    modalities=(CameraModality.RGB,),
+                ),
+            ),
+        ),
+        physics=base.physics,
+        environments=base.environments,
+    )
+    world = session.build(spec)
+    arm = world.resolve(EntityPath("/robots/arm"))
+    camera = world.resolve(EntityPath("/camera"))
+
+    tick, states, samples = world.step_and_read_articulations_and_sensors((arm,), (camera,))
+
+    assert tick.step_index == 1
+    assert len(states) == 1 and states[0].tick == tick
+    assert len(samples) == 1 and samples[0].tick == tick
+    assert samples[0].channel(CameraModality.RGB).to_bytes() == bytes((17,)) * 24
+    calls = runtime.worlds[0].calls
+    assert [call[0] for call in calls].count("step") == 1
+    assert [call[0] for call in calls].count("read_articulation") == 1
+    assert [call[0] for call in calls].count("read_sensors") == 1
+    world.close()
+    session.close()
+
+
 def test_articulation_validation(tmp_path: Path) -> None:
     _, session = open_test_session(FakeNativeRuntime())
     world = session.build(make_world(make_articulation_asset(tmp_path / "arm.usd")))

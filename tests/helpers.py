@@ -153,6 +153,25 @@ class FakeNativeWorld:
             )
         self.step(count)
 
+    def apply_articulation_commands_step_and_read(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[Matrix, Matrix], ...]:
+        self.apply_articulation_commands_and_step(commands, count)
+        return tuple(self.read_articulation(path) for path in paths)
+
+    def apply_articulation_commands_step_and_read_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], NativeSensorBatch]:
+        states = self.apply_articulation_commands_step_and_read(commands, count, paths)
+        return states, self.read_sensors(sensor_paths)
+
     def apply_rigid_body_wrench(
         self,
         path: EntityPath,

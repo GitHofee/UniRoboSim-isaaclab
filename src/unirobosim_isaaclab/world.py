@@ -869,6 +869,131 @@ class IsaacLabWorld:
         self._scene_sequence += count
         return self.tick
 
+    def step_and_read_articulations(
+        self,
+        handles: Iterable[EntityHandle],
+        count: int = 1,
+    ) -> tuple[Tick, tuple[ArticulationState, ...]]:
+        """Advance and return selected articulation state through one native call."""
+
+        operation = "world.step_and_read_articulations"
+        self._ensure_ready(operation)
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValidationError("step count must be a positive integer", operation=operation)
+        try:
+            selected = tuple(handles)
+        except TypeError as exc:
+            raise ValidationError("handles must be iterable", operation=operation) from exc
+        entities = tuple(self._validate_handle(handle, operation) for handle in selected)
+        if any(entity.kind is not EntityKind.ARTICULATION for entity in entities):
+            raise CommandError("selected entity is not an articulation", operation=operation)
+        commands = tuple(self._pending_articulation_commands)
+        self._pending_articulation_commands.clear()
+        states = self._native_call(
+            operation,
+            lambda: self._native.apply_articulation_commands_step_and_read(
+                commands,
+                count,
+                tuple(entity.path for entity in entities),
+            ),
+        )
+        if type(states) is not tuple or len(states) != len(entities):
+            raise UniRoboSimError("native articulation state batch is invalid", operation=operation)
+        self._step_index += count
+        self._scene_sequence += count
+        tick = self.tick
+        reports = tuple(
+            ArticulationState(
+                entity_id=entity.path.value,
+                generation=self.generation,
+                tick=tick,
+                joint_names=entity.joint_names,
+                joint_positions=ArrayValue.from_rows(position),
+                joint_velocities=ArrayValue.from_rows(velocity),
+                joint_position_units=entity.joint_position_units,
+                joint_velocity_units=tuple(
+                    "rad/s" if unit == "rad" else "m/s" for unit in entity.joint_position_units
+                ),
+            )
+            for entity, (position, velocity) in zip(entities, states, strict=True)
+        )
+        return tick, reports
+
+    def step_and_read_articulations_and_sensors(
+        self,
+        articulation_handles: Iterable[EntityHandle],
+        sensor_handles: Iterable[EntityHandle],
+        count: int = 1,
+    ) -> tuple[Tick, tuple[ArticulationState, ...], tuple[SensorSample, ...]]:
+        """Advance, read articulation state and acquire cameras in one worker transaction."""
+
+        operation = "world.step_and_read_articulations_and_sensors"
+        self._ensure_ready(operation)
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValidationError("step count must be a positive integer", operation=operation)
+        try:
+            selected_articulations = tuple(articulation_handles)
+            selected_sensors = tuple(sensor_handles)
+        except TypeError as exc:
+            raise ValidationError(
+                "articulation_handles and sensor_handles must be iterable", operation=operation
+            ) from exc
+        articulation_entities = tuple(
+            self._validate_handle(handle, operation) for handle in selected_articulations
+        )
+        sensor_entities = tuple(self._validate_handle(handle, operation) for handle in selected_sensors)
+        if any(entity.kind is not EntityKind.ARTICULATION for entity in articulation_entities):
+            raise CommandError("selected entity is not an articulation", operation=operation)
+        for entity in sensor_entities:
+            if entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None:
+                raise CommandError("selected entity is not a camera sensor", operation=operation)
+        if not selected_sensors:
+            raise ValidationError("sensor_handles must contain at least one camera", operation=operation)
+
+        commands = tuple(self._pending_articulation_commands)
+        self._pending_articulation_commands.clear()
+        states, native_samples = self._native_call(
+            operation,
+            lambda: self._native.apply_articulation_commands_step_and_read_sensors(
+                commands,
+                count,
+                tuple(entity.path for entity in articulation_entities),
+                tuple(entity.path for entity in sensor_entities),
+            ),
+        )
+        if type(states) is not tuple or len(states) != len(articulation_entities):
+            raise UniRoboSimError("native articulation state batch is invalid", operation=operation)
+        if type(native_samples) is not tuple or len(native_samples) != len(sensor_entities):
+            raise UniRoboSimError("native camera batch is invalid", operation=operation)
+        self._step_index += count
+        self._scene_sequence += count
+        tick = self.tick
+        reports = tuple(
+            ArticulationState(
+                entity_id=entity.path.value,
+                generation=self.generation,
+                tick=tick,
+                joint_names=entity.joint_names,
+                joint_positions=ArrayValue.from_rows(position),
+                joint_velocities=ArrayValue.from_rows(velocity),
+                joint_position_units=entity.joint_position_units,
+                joint_velocity_units=tuple(
+                    "rad/s" if unit == "rad" else "m/s" for unit in entity.joint_position_units
+                ),
+            )
+            for entity, (position, velocity) in zip(articulation_entities, states, strict=True)
+        )
+        samples = tuple(
+            self._sensor_sample(handle, entity, channels, tick, operation=operation)
+            for handle, entity, channels in zip(
+                selected_sensors,
+                sensor_entities,
+                native_samples,
+                strict=True,
+            )
+        )
+        return tick, reports, samples
+
     @staticmethod
     def _proxy_visual(entity: EntitySpec) -> SceneVisual:
         if entity.kind is EntityKind.RIGID_BODY:

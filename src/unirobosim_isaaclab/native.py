@@ -1042,6 +1042,8 @@ class IsaacLabNativeWorld:
         self._fluids: dict[EntityPath, tuple[_FluidSet, ...]] = {}
         self._cameras: dict[EntityPath, Any] = {}
         self._rgb_host_staging: dict[tuple[int, tuple[int, ...], str, str], Any] = {}
+        self._rgb_shared_host: Any | None = None
+        self._rgb_shared_host_size = 0
         self._debug_draw_interface: Any | None = None
         self._debug_overlay: NativeDebugOverlay | None = None
         self._debug_expirations: dict[tuple[str, str, str], int | None] = {}
@@ -2556,6 +2558,31 @@ class IsaacLabNativeWorld:
             )
         self.step(count)
 
+    def apply_articulation_commands_step_and_read(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[Matrix, Matrix], ...]:
+        """Advance once and return demanded articulation state in the same worker transaction."""
+
+        if type(paths) is not tuple or any(path not in self._joint_maps for path in paths):
+            raise ValueError("native articulation state batch references an unknown articulation")
+        self.apply_articulation_commands_and_step(commands, count)
+        return tuple(self.read_articulation(path) for path in paths)
+
+    def apply_articulation_commands_step_and_read_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], NativeSensorBatch]:
+        """Advance once, then acquire selected state and cameras at the resulting tick."""
+
+        states = self.apply_articulation_commands_step_and_read(commands, count, paths)
+        return states, self.read_sensors(sensor_paths)
+
     def _apply_usd_articulation(
         self,
         path: EntityPath,
@@ -3233,6 +3260,71 @@ class IsaacLabNativeWorld:
         # request, so fallback cannot create additional frames or skew the tick.
         return tuple(self._read_camera_channels(camera, entity) for camera, entity in targets)
 
+    def read_sensors_into_shared(
+        self,
+        paths: tuple[EntityPath, ...],
+        target: memoryview,
+    ) -> tuple[tuple[tuple[int, ...], int, int], ...] | None:
+        """Write an RGB-only camera batch directly into registered shared host memory."""
+
+        entity_by_path = {
+            entity.path: entity
+            for entity in self._spec.entities
+            if entity.kind is EntityKind.CAMERA_SENSOR and entity.camera is not None
+        }
+        targets = []
+        for path in paths:
+            camera = self._cameras.get(path)
+            entity = entity_by_path.get(path)
+            if camera is None or entity is None:
+                raise KeyError(f"native camera does not exist: {path.value}")
+            targets.append((camera, entity))
+        if not targets or not all(
+            entity.camera is not None and entity.camera.modalities == (CameraModality.RGB,)
+            for _, entity in targets
+        ):
+            return None
+
+        assert self._sim is not None
+        self._ensure_camera_render()
+        for camera, _ in targets:
+            camera.update(0.0, force_recompute=True)
+        tensors = tuple(
+            getattr(camera.data.output["rgb"], "torch", camera.data.output["rgb"])
+            for camera, _ in targets
+        )
+        devices = tuple(getattr(tensor, "device", None) for tensor in tensors)
+        if any(getattr(device, "type", None) != "cuda" for device in devices):
+            return None
+        device = devices[0]
+        if any(str(candidate) != str(device) for candidate in devices[1:]):
+            return None
+        normalized = tuple(tensor.to(dtype=self._m.torch.uint8).contiguous() for tensor in tensors)
+        shape = tuple(int(size) for size in normalized[0].shape)
+        if any(tuple(int(size) for size in tensor.shape) != shape for tensor in normalized[1:]):
+            return None
+        sample_size = math.prod(shape)
+        required = sample_size * len(normalized)
+        if required > len(target):
+            raise RuntimeError("native RGB batch exceeds its shared host allocation")
+
+        host = self._rgb_shared_host
+        if host is None:
+            host = self._m.torch.frombuffer(target, dtype=self._m.torch.uint8)
+            result = self._m.torch.cuda.cudart().cudaHostRegister(host.data_ptr(), host.numel(), 0)
+            if result != 0:
+                raise RuntimeError(f"CUDA could not register the RGB shared host allocation: {result}")
+            self._rgb_shared_host = host
+            self._rgb_shared_host_size = int(host.numel())
+        elif self._rgb_shared_host_size != len(target):
+            raise RuntimeError("native RGB shared host allocation changed while the world was live")
+
+        for index, tensor in enumerate(normalized):
+            offset = index * sample_size
+            host[offset : offset + sample_size].view(shape).copy_(tensor, non_blocking=True)
+        self._m.torch.cuda.current_stream(device=device).synchronize()
+        return tuple((shape, index * sample_size, sample_size) for index in range(len(normalized)))
+
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
         """Read the effective camera state authored into Isaac/USD."""
 
@@ -3395,6 +3487,13 @@ class IsaacLabNativeWorld:
         self._fluids.clear()
         self._cameras.clear()
         self._rgb_host_staging.clear()
+        shared_host = self._rgb_shared_host
+        self._rgb_shared_host = None
+        self._rgb_shared_host_size = 0
+        if shared_host is not None:
+            result = self._m.torch.cuda.cudart().cudaHostUnregister(shared_host.data_ptr())
+            if result != 0:
+                raise RuntimeError(f"CUDA could not unregister the RGB shared host allocation: {result}")
         self._runtime_attachments.clear()
         self._debug_expirations.clear()
         self._debug_lifetimes.clear()
