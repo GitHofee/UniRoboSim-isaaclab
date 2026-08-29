@@ -29,6 +29,8 @@ from .native_protocols import (
     Matrix,
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativeEncodedSensorFrame,
+    NativeEncodedSensorRequest,
     NativeKinematicState,
     NativePhysicsDiagnostics,
     NativePlanningCatalog,
@@ -429,6 +431,17 @@ def _dispatch(
             if metadata is not None:
                 return active, _SharedStepStateRgbReply(states, metadata), False
         return active, (states, active.read_sensors(sensor_paths)), False
+    if operation == "apply_articulation_commands_step_and_read_encoded_sensors":
+        states = active.apply_articulation_commands_step_and_read(
+            cast(tuple[NativeArticulationCommand, ...], args[0]),
+            cast(int, args[1]),
+            cast(tuple[EntityPath, ...], args[2]),
+        )
+        encoded_reader = getattr(active, "read_encoded_sensors", None)
+        if not callable(encoded_reader):
+            raise RuntimeError("native world does not support encoded sensors")
+        frames = encoded_reader(cast(tuple[NativeEncodedSensorRequest, ...], args[3]))
+        return active, (states, frames), False
     if operation == "apply_rigid_body_wrench":
         active.apply_rigid_body_wrench(
             cast(EntityPath, args[0]),
@@ -498,6 +511,11 @@ def _dispatch(
             if metadata is not None:
                 return active, _SharedRgbReply(metadata), False
         return active, active.read_sensors(paths), False
+    if operation == "read_encoded_sensors":
+        encoded_reader = getattr(active, "read_encoded_sensors", None)
+        if not callable(encoded_reader):
+            raise RuntimeError("native world does not support encoded sensors")
+        return active, encoded_reader(cast(tuple[NativeEncodedSensorRequest, ...], args[0])), False
     if operation == "camera_calibration":
         return active, active.camera_calibration(cast(EntityPath, args[0])), False
     if operation == "read_selected_kinematics":
@@ -1098,6 +1116,25 @@ class IsaacLabWorkerWorld:
             ),
         )
 
+    def apply_articulation_commands_step_and_read_encoded_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_requests: tuple[NativeEncodedSensorRequest, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], tuple[NativeEncodedSensorFrame, ...]]:
+        self._ensure_open("apply_articulation_commands_step_and_read_encoded_sensors")
+        return cast(
+            tuple[tuple[tuple[Matrix, Matrix], ...], tuple[NativeEncodedSensorFrame, ...]],
+            self._runtime._request(
+                "apply_articulation_commands_step_and_read_encoded_sensors",
+                commands,
+                count,
+                paths,
+                sensor_requests,
+            ),
+        )
+
     def apply_rigid_body_wrench(
         self,
         path: EntityPath,
@@ -1229,6 +1266,16 @@ class IsaacLabWorkerWorld:
     def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch:
         self._ensure_open("read_sensors")
         return cast(NativeSensorBatch, self._runtime._request("read_sensors", paths))
+
+    def read_encoded_sensors(
+        self,
+        requests: tuple[NativeEncodedSensorRequest, ...],
+    ) -> tuple[NativeEncodedSensorFrame, ...]:
+        self._ensure_open("read_encoded_sensors")
+        return cast(
+            tuple[NativeEncodedSensorFrame, ...],
+            self._runtime._request("read_encoded_sensors", requests),
+        )
 
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
         self._ensure_open("camera_calibration")

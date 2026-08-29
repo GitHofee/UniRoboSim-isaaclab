@@ -27,6 +27,8 @@ from unirobosim import (
     DebugPublishReport,
     DeformableCommand,
     DeformableState,
+    EncodedSensorFrame,
+    EncodedSensorRequest,
     EntityHandle,
     EntityKind,
     EntityNotFoundError,
@@ -68,6 +70,8 @@ from unirobosim import (
 from .native_protocols import (
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativeEncodedSensorFrame,
+    NativeEncodedSensorRequest,
     NativeKinematicState,
     NativeSensorSample,
     NativeWorldDriver,
@@ -993,6 +997,142 @@ class IsaacLabWorld:
             )
         )
         return tick, reports, samples
+
+    def read_encoded_sensors(
+        self,
+        requests: Iterable[EncodedSensorRequest],
+    ) -> tuple[EncodedSensorFrame, ...]:
+        """Read backend-encoded camera frames without materializing CPU RGB arrays."""
+
+        operation = "world.read_encoded_sensors"
+        self._ensure_ready(operation)
+        native_requests, handles, entities = self._encoded_sensor_requests(requests, operation)
+        frames = self._native_call(operation, lambda: self._native.read_encoded_sensors(native_requests))
+        return self._encoded_sensor_frames(handles, entities, frames, self.tick, operation)
+
+    def step_and_read_articulations_and_encoded_sensors(
+        self,
+        articulation_handles: Iterable[EntityHandle],
+        sensor_requests: Iterable[EncodedSensorRequest],
+        count: int = 1,
+    ) -> tuple[Tick, tuple[ArticulationState, ...], tuple[EncodedSensorFrame, ...]]:
+        """Advance, read articulation state and GPU-encode cameras in one transaction."""
+
+        operation = "world.step_and_read_articulations_and_encoded_sensors"
+        self._ensure_ready(operation)
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValidationError("step count must be a positive integer", operation=operation)
+        try:
+            selected_articulations = tuple(articulation_handles)
+        except TypeError as exc:
+            raise ValidationError("articulation_handles must be iterable", operation=operation) from exc
+        articulation_entities = tuple(
+            self._validate_handle(handle, operation) for handle in selected_articulations
+        )
+        if any(entity.kind is not EntityKind.ARTICULATION for entity in articulation_entities):
+            raise CommandError("selected entity is not an articulation", operation=operation)
+        native_requests, sensor_handles, sensor_entities = self._encoded_sensor_requests(
+            sensor_requests,
+            operation,
+        )
+        commands = tuple(self._pending_articulation_commands)
+        self._pending_articulation_commands.clear()
+        states, native_frames = self._native_call(
+            operation,
+            lambda: self._native.apply_articulation_commands_step_and_read_encoded_sensors(
+                commands,
+                count,
+                tuple(entity.path for entity in articulation_entities),
+                native_requests,
+            ),
+        )
+        if type(states) is not tuple or len(states) != len(articulation_entities):
+            raise UniRoboSimError("native articulation state batch is invalid", operation=operation)
+        self._step_index += count
+        self._scene_sequence += count
+        tick = self.tick
+        reports = tuple(
+            ArticulationState(
+                entity_id=entity.path.value,
+                generation=self.generation,
+                tick=tick,
+                joint_names=entity.joint_names,
+                joint_positions=ArrayValue.from_rows(position),
+                joint_velocities=ArrayValue.from_rows(velocity),
+                joint_position_units=entity.joint_position_units,
+                joint_velocity_units=tuple(
+                    "rad/s" if unit == "rad" else "m/s" for unit in entity.joint_position_units
+                ),
+            )
+            for entity, (position, velocity) in zip(articulation_entities, states, strict=True)
+        )
+        frames = self._encoded_sensor_frames(
+            sensor_handles,
+            sensor_entities,
+            native_frames,
+            tick,
+            operation,
+        )
+        return tick, reports, frames
+
+    def _encoded_sensor_requests(
+        self,
+        requests: Iterable[EncodedSensorRequest],
+        operation: str,
+    ) -> tuple[tuple[NativeEncodedSensorRequest, ...], tuple[EntityHandle, ...], tuple[EntitySpec, ...]]:
+        try:
+            selected = tuple(requests)
+        except TypeError as exc:
+            raise ValidationError("encoded sensor requests must be iterable", operation=operation) from exc
+        if not selected or any(not isinstance(request, EncodedSensorRequest) for request in selected):
+            raise ValidationError(
+                "encoded sensor requests must contain at least one EncodedSensorRequest",
+                operation=operation,
+            )
+        handles = tuple(request.handle for request in selected)
+        entities = tuple(self._validate_handle(handle, operation) for handle in handles)
+        if any(entity.kind is not EntityKind.CAMERA_SENSOR or entity.camera is None for entity in entities):
+            raise CommandError("selected entity is not a camera sensor", operation=operation)
+        native = tuple(
+            NativeEncodedSensorRequest(
+                path=entity.path,
+                encoding=request.encoding,
+                quality=request.quality,
+                color_space=request.color_space,
+                chroma_subsampling=request.chroma_subsampling,
+            )
+            for request, entity in zip(selected, entities, strict=True)
+        )
+        return native, handles, entities
+
+    @staticmethod
+    def _encoded_sensor_frames(
+        handles: tuple[EntityHandle, ...],
+        entities: tuple[EntitySpec, ...],
+        frames: object,
+        tick: Tick,
+        operation: str,
+    ) -> tuple[EncodedSensorFrame, ...]:
+        if type(frames) is not tuple or len(frames) != len(handles):
+            raise UniRoboSimError("native encoded camera batch is invalid", operation=operation)
+        result: list[EncodedSensorFrame] = []
+        for handle, entity, frame in zip(handles, entities, frames, strict=True):
+            if not isinstance(frame, NativeEncodedSensorFrame) or frame.path != entity.path:
+                raise UniRoboSimError("native encoded camera identity is invalid", operation=operation)
+            result.append(
+                EncodedSensorFrame(
+                    handle=handle,
+                    payload=frame.payload,
+                    width_px=frame.width_px,
+                    height_px=frame.height_px,
+                    encoding=frame.encoding,
+                    quality=frame.quality,
+                    color_space=frame.color_space,
+                    chroma_subsampling=frame.chroma_subsampling,
+                    tick=tick,
+                )
+            )
+        return tuple(result)
 
     @staticmethod
     def _proxy_visual(entity: EntitySpec) -> SceneVisual:

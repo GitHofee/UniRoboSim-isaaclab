@@ -40,6 +40,27 @@ NativeDebugReport = tuple[int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
+class NativeEncodedSensorRequest:
+    path: EntityPath
+    encoding: str
+    quality: int | None
+    color_space: str
+    chroma_subsampling: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class NativeEncodedSensorFrame:
+    path: EntityPath
+    payload: bytes
+    width_px: int
+    height_px: int
+    encoding: str
+    quality: int | None
+    color_space: str
+    chroma_subsampling: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class NativePhysicsDiagnostics:
     """Effective native timing read back from an initialized simulator."""
 
@@ -192,6 +213,14 @@ class NativeWorldDriver(Protocol):
         sensor_paths: tuple[EntityPath, ...],
     ) -> tuple[tuple[tuple[Matrix, Matrix], ...], NativeSensorBatch]: ...
 
+    def apply_articulation_commands_step_and_read_encoded_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_requests: tuple[NativeEncodedSensorRequest, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], tuple[NativeEncodedSensorFrame, ...]]: ...
+
     def apply_rigid_body_wrench(
         self,
         path: EntityPath,
@@ -254,6 +283,11 @@ class NativeWorldDriver(Protocol):
     def read_sensor(self, path: EntityPath) -> NativeSensorSample: ...
 
     def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch: ...
+
+    def read_encoded_sensors(
+        self,
+        requests: tuple[NativeEncodedSensorRequest, ...],
+    ) -> tuple[NativeEncodedSensorFrame, ...]: ...
 
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration: ...
 

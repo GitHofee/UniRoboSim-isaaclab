@@ -2583,6 +2583,18 @@ class IsaacLabNativeWorld:
         states = self.apply_articulation_commands_step_and_read(commands, count, paths)
         return states, self.read_sensors(sensor_paths)
 
+    def apply_articulation_commands_step_and_read_encoded_sensors(
+        self,
+        commands: tuple[NativeArticulationCommand, ...],
+        count: int,
+        paths: tuple[EntityPath, ...],
+        sensor_requests: tuple[Any, ...],
+    ) -> tuple[tuple[tuple[Matrix, Matrix], ...], tuple[Any, ...]]:
+        """Advance once, then batch-encode selected cameras at the resulting tick."""
+
+        states = self.apply_articulation_commands_step_and_read(commands, count, paths)
+        return states, self.read_encoded_sensors(sensor_requests)
+
     def _apply_usd_articulation(
         self,
         path: EntityPath,
@@ -3324,6 +3336,83 @@ class IsaacLabNativeWorld:
             host[offset : offset + sample_size].view(shape).copy_(tensor, non_blocking=True)
         self._m.torch.cuda.current_stream(device=device).synchronize()
         return tuple((shape, index * sample_size, sample_size) for index in range(len(normalized)))
+
+    def read_encoded_sensors(self, requests: tuple[Any, ...]) -> tuple[Any, ...]:
+        """Encode one coherent RGB camera batch on CUDA and return compressed bytes."""
+
+        from .native_protocols import NativeEncodedSensorFrame
+
+        if not requests:
+            return ()
+        entity_by_path = {
+            entity.path: entity
+            for entity in self._spec.entities
+            if entity.kind is EntityKind.CAMERA_SENSOR and entity.camera is not None
+        }
+        targets: list[tuple[Any, Any, Any]] = []
+        for request in requests:
+            path = request.path
+            camera = self._cameras.get(path)
+            entity = entity_by_path.get(path)
+            if camera is None or entity is None or entity.camera is None:
+                raise KeyError(f"native camera does not exist: {path.value}")
+            if entity.camera.modalities != (CameraModality.RGB,):
+                raise RuntimeError("backend JPEG encoding requires an RGB-only camera")
+            if (
+                request.encoding != "jpeg"
+                or type(request.quality) is not int
+                or not 1 <= request.quality <= 100
+                or request.color_space != "srgb"
+                or request.chroma_subsampling != "4:4:4"
+            ):
+                raise RuntimeError("Isaac encoded camera path supports only JPEG sRGB 4:4:4")
+            targets.append((camera, entity, request))
+
+        assert self._sim is not None
+        self._ensure_camera_render()
+        for camera, _, _ in targets:
+            camera.update(0.0, force_recompute=True)
+
+        try:
+            from torchvision.io import encode_jpeg
+        except Exception as exc:
+            raise RuntimeError("torchvision CUDA JPEG encoder is unavailable") from exc
+
+        tensors = []
+        for camera, _, _ in targets:
+            tensor = getattr(camera.data.output["rgb"], "torch", camera.data.output["rgb"])
+            if tensor.ndim == 4 and tensor.shape[0] == 1:
+                tensor = tensor[0]
+            if tensor.ndim != 3 or tensor.shape[-1] != 3 or tensor.device.type != "cuda":
+                raise RuntimeError("native camera RGB must be one CUDA-resident HWC image")
+            tensors.append(tensor.to(dtype=self._m.torch.uint8).permute(2, 0, 1).contiguous())
+
+        payload_by_index: dict[int, bytes] = {}
+        for quality in sorted({request.quality for _, _, request in targets}):
+            assert type(quality) is int
+            indices = [index for index, (_, _, request) in enumerate(targets) if request.quality == quality]
+            encoded = encode_jpeg([tensors[index] for index in indices], quality=quality)
+            if not isinstance(encoded, list) or len(encoded) != len(indices):
+                raise RuntimeError("CUDA JPEG encoder returned an invalid batch")
+            for index, payload in zip(indices, encoded, strict=True):
+                data = bytes(payload.cpu().numpy())
+                if not data.startswith(b"\xff\xd8\xff"):
+                    raise RuntimeError("CUDA JPEG encoder returned an invalid marker")
+                payload_by_index[index] = data
+
+        return tuple(
+            NativeEncodedSensorFrame(
+                path=request.path,
+                payload=payload_by_index[index],
+                width_px=int(tensor.shape[2]),
+                height_px=int(tensor.shape[1]),
+                encoding=request.encoding,
+                quality=request.quality,
+                color_space=request.color_space,
+                chroma_subsampling=request.chroma_subsampling,
+            )
+            for index, (tensor, (_, _, request)) in enumerate(zip(tensors, targets, strict=True))
+        )
 
     def camera_calibration(self, path: EntityPath) -> NativeCameraCalibration:
         """Read the effective camera state authored into Isaac/USD."""
