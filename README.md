@@ -160,9 +160,12 @@ with Sim(provider=provider) as sim:
 - USD articulations, including robots and non-robot articulated objects;
 - composite USD scenes composed once per environment, with explicitly declared
   embedded rigid bodies and articulations bound to their existing Prims;
+- optional static composite semantics that retain authored support collision while
+  excluding undeclared bodies and private joints from dynamic solve/reset views;
 - immutable static-scene USD composition without rigid-object or contact-sensor wrappers;
 - physical rigid, uniform articulation, and static-scene asset scaling;
 - joint position, velocity, and effort control;
+- cached control-mode gains, with exact rewrites only on mode changes and reset;
 - rigid-body pose/twist, persistent wrench, aggregated normal contact, reset, and scene pose writes;
 - triangle surface deformables and tetrahedral volume deformables;
 - volume-deformable kinematic-node position control;

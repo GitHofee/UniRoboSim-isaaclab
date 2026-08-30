@@ -51,7 +51,7 @@ Segment = tuple[Vector3, Vector3]
 Color = tuple[float, float, float, float]
 
 _COMPOSITE_UNBOUND_RIGID_MODE_KEY = "composite_unbound_rigid_mode"
-_COMPOSITE_UNBOUND_RIGID_MODES = frozenset({"authored", "kinematic"})
+_COMPOSITE_UNBOUND_RIGID_MODES = frozenset({"authored", "kinematic", "static"})
 _POSITION_STIFFNESS_FALLBACK = 1000.0
 _POSITION_DAMPING_FALLBACK = 100.0
 _DEFAULT_CAMERA_RENDERER = "RaytracedLighting"
@@ -392,7 +392,7 @@ def _composite_unbound_rigid_mode(entity: EntitySpec) -> str:
     if type(mode) is not str or mode not in _COMPOSITE_UNBOUND_RIGID_MODES:
         raise ValueError(
             f"composite scene {entity.path.value} metadata {_COMPOSITE_UNBOUND_RIGID_MODE_KEY!r} "
-            "must be exactly 'authored' or 'kinematic'"
+            "must be exactly 'authored', 'kinematic', or 'static'"
         )
     return mode
 
@@ -1032,6 +1032,7 @@ class IsaacLabNativeWorld:
         self._runtime_attachments: dict[tuple[int, str], _RuntimeAttachment] = {}
         self._static_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
         self._composite_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
+        self._composite_scene_modes: dict[EntityPath, str] = {}
         self._embedded_joint_paths: dict[EntityPath, tuple[tuple[str, ...], ...]] = {}
         self._composite_rigid_states: list[_CompositeRigidState] = []
         self._composite_articulation_states: list[_CompositeArticulationState] = []
@@ -1054,6 +1055,7 @@ class IsaacLabNativeWorld:
         self._joint_maps: dict[EntityPath, tuple[int, ...]] = {}
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
         self._initial_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
+        self._articulation_control_modes: dict[EntityPath, list[list[CommandMode | None]]] = {}
         self._initial_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._initial_deformable: dict[EntityPath, tuple[Any, Any | None]] = {}
         self._origins_cpu = _environment_origins(spec.environments.count, config.environment_spacing_m)
@@ -1436,14 +1438,19 @@ class IsaacLabNativeWorld:
                 orientation=entity.pose.orientation_xyzw,
             )
             roots.append(root)
-        if unbound_rigid_mode == "kinematic":
-            self._author_unbound_composite_rigids_kinematic(entity, tuple(roots))
+        if unbound_rigid_mode in {"kinematic", "static"}:
+            self._author_unbound_composite_rigids(entity, tuple(roots), mode=unbound_rigid_mode)
         self._composite_scene_roots[entity.path] = tuple(roots)
+        if not hasattr(self, "_composite_scene_modes"):
+            self._composite_scene_modes = {}
+        self._composite_scene_modes[entity.path] = unbound_rigid_mode
 
-    def _author_unbound_composite_rigids_kinematic(
+    def _author_unbound_composite_rigids(
         self,
         entity: EntitySpec,
         roots: tuple[str, ...],
+        *,
+        mode: str,
     ) -> None:
         """Disable private joints and freeze bodies not owned by embedded FastSim entities."""
 
@@ -1516,7 +1523,6 @@ class IsaacLabNativeWorld:
                     if self._prim_path_string(prim) not in protected_body_paths
                 }
             )
-
         expected_protected_paths = protected_rows[0] if protected_rows else ()
         for environment, actual_protected_paths in enumerate(protected_rows[1:], start=1):
             if actual_protected_paths != expected_protected_paths:
@@ -1545,7 +1551,6 @@ class IsaacLabNativeWorld:
                     f"{len(actual_disabled_joint_paths)}, first_sample={expected_disabled_joint_paths[:8]}, "
                     f"environment_{environment}_sample={actual_disabled_joint_paths[:8]}"
                 )
-
         for row in disabled_joint_rows:
             for relative in expected_disabled_joint_paths:
                 prim = row[relative]
@@ -1560,10 +1565,19 @@ class IsaacLabNativeWorld:
             for relative in expected_relative_paths:
                 prim = row[relative]
                 rigid = self._m.UsdPhysics.RigidBodyAPI(prim)
-                result = rigid.CreateKinematicEnabledAttr().Set(True)
-                if result is False or not bool(rigid.GetKinematicEnabledAttr().Get()):
+                if mode == "kinematic":
+                    result = rigid.CreateKinematicEnabledAttr().Set(True)
+                    accepted = bool(rigid.GetKinematicEnabledAttr().Get())
+                    attribute = "kinematicEnabled=true"
+                elif mode == "static":
+                    result = prim.RemoveAPI(self._m.UsdPhysics.RigidBodyAPI)
+                    accepted = not prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                    attribute = "RigidBodyAPI removal"
+                else:
+                    raise ValueError(f"unsupported composite unbound rigid mode: {mode!r}")
+                if result is False or not accepted:
                     raise RuntimeError(
-                        "failed to author kinematicEnabled on an unbound composite rigid body: "
+                        f"failed to author {attribute} on an unbound composite rigid body: "
                         f"{self._prim_path_string(prim)}"
                     )
 
@@ -2071,6 +2085,9 @@ class IsaacLabNativeWorld:
                 asset.data.joint_stiffness.torch.clone(),
                 asset.data.joint_damping.torch.clone(),
             )
+            self._articulation_control_modes[path] = [
+                [None] * len(native_names) for _ in range(self._spec.environments.count)
+            ]
 
     def _usd_simulation_view(self) -> Any:
         if self._usd_tensor_view is None:
@@ -2167,7 +2184,9 @@ class IsaacLabNativeWorld:
         # Capture provider-authored articulation roots that were not admitted as
         # public embedded entities. They remain lifecycle-managed, but private.
         root_rows: list[dict[str, str]] = []
-        for roots in self._composite_scene_roots.values():
+        for path, roots in self._composite_scene_roots.items():
+            if getattr(self, "_composite_scene_modes", {}).get(path, "authored") == "static":
+                continue
             for root in roots:
                 root_row: dict[str, str] = {}
                 prims = self._m.sim_utils.get_all_matching_child_prims(
@@ -2227,11 +2246,12 @@ class IsaacLabNativeWorld:
         # view. The environment map permits deterministic partial reset without
         # assuming PhysX preserves the caller's path order.
         rigid_by_mode: dict[bool, list[tuple[str, int]]] = {False: [], True: []}
-        environment = 0
-        for roots in self._composite_scene_roots.values():
+        for path, roots in self._composite_scene_roots.items():
+            if getattr(self, "_composite_scene_modes", {}).get(path, "authored") == "static":
+                continue
             reference_relative_paths: tuple[str, ...] | None = None
             reference_modes: dict[str, bool] = {}
-            for root in roots:
+            for environment, root in enumerate(roots):
                 rigid_row: dict[str, Any] = {}
                 prims = self._m.sim_utils.get_all_matching_child_prims(
                     root,
@@ -2260,7 +2280,6 @@ class IsaacLabNativeWorld:
                         raise ValueError("composite rigid-body kinematic mode changed across environments")
                     if absolute not in articulation_links:
                         rigid_by_mode[mode].append((absolute, environment))
-                environment += 1
 
         for kinematic, path_rows in rigid_by_mode.items():
             if not path_rows:
@@ -2395,6 +2414,9 @@ class IsaacLabNativeWorld:
             stiffness, damping = self._initial_articulation_gains[path]
             asset.write_joint_stiffness_to_sim_index(stiffness=stiffness[env_ids], env_ids=env_ids)
             asset.write_joint_damping_to_sim_index(damping=damping[env_ids], env_ids=env_ids)
+            control_modes = self._articulation_control_modes[path]
+            for environment in environment_indices:
+                control_modes[environment] = [None] * len(control_modes[environment])
         for path, view in self._usd_articulation_views.items():
             root_pose, root_velocity, positions, velocities = self._initial_usd_articulation[path]
             indices = self._m.torch.tensor(
@@ -2492,31 +2514,41 @@ class IsaacLabNativeWorld:
         joint_ids = [self._joint_maps[path][index] for index in degree_of_freedom_indices]
         target = self._m.torch.tensor(targets, device=self._sim.device, dtype=self._m.torch.float32)
         zeros = self._m.torch.zeros_like(target)
+        control_modes = self._articulation_control_modes[path]
+        gains_changed = any(
+            control_modes[environment][joint] is not mode for environment in environment_indices for joint in joint_ids
+        )
         if mode is CommandMode.POSITION:
-            initial_stiffness, initial_damping = self._initial_articulation_gains[path]
-            stiffness = initial_stiffness[env_ids][:, joint_ids]
-            damping = initial_damping[env_ids][:, joint_ids]
-            stiffness, damping = _position_command_gains(
-                stiffness,
-                damping,
-                fallback_authored_zero=self._config.position_stiffness is None,
-                fallback_authored_damping=self._config.position_damping is None,
-            )
             asset.set_joint_position_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
             asset.set_joint_velocity_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
             asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
+            if gains_changed:
+                initial_stiffness, initial_damping = self._initial_articulation_gains[path]
+                stiffness = initial_stiffness[env_ids][:, joint_ids]
+                damping = initial_damping[env_ids][:, joint_ids]
+                stiffness, damping = _position_command_gains(
+                    stiffness,
+                    damping,
+                    fallback_authored_zero=self._config.position_stiffness is None,
+                    fallback_authored_damping=self._config.position_damping is None,
+                )
         elif mode is CommandMode.VELOCITY:
-            stiffness = zeros
-            damping = self._m.torch.full_like(target, self._config.velocity_damping)
             asset.set_joint_velocity_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
             asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
+            if gains_changed:
+                stiffness = zeros
+                damping = self._m.torch.full_like(target, self._config.velocity_damping)
         else:
-            stiffness = zeros
-            damping = zeros
             asset.set_joint_effort_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
-        asset.write_joint_stiffness_to_sim_index(stiffness=stiffness, joint_ids=joint_ids, env_ids=env_ids)
-        asset.write_joint_damping_to_sim_index(damping=damping, joint_ids=joint_ids, env_ids=env_ids)
-        asset.write_data_to_sim()
+            if gains_changed:
+                stiffness = zeros
+                damping = zeros
+        if gains_changed:
+            asset.write_joint_stiffness_to_sim_index(stiffness=stiffness, joint_ids=joint_ids, env_ids=env_ids)
+            asset.write_joint_damping_to_sim_index(damping=damping, joint_ids=joint_ids, env_ids=env_ids)
+            for environment in environment_indices:
+                for joint in joint_ids:
+                    control_modes[environment][joint] = mode
 
     def _validate_articulation_command(self, command: NativeArticulationCommand) -> None:
         if type(command) is not NativeArticulationCommand or command.path not in self._joint_maps:
@@ -3566,6 +3598,7 @@ class IsaacLabNativeWorld:
         self._kinematic_rigids.clear()
         self._static_scene_roots.clear()
         self._composite_scene_roots.clear()
+        self._composite_scene_modes.clear()
         self._embedded_joint_paths.clear()
         self._composite_rigid_states.clear()
         self._composite_articulation_states.clear()
@@ -3594,6 +3627,7 @@ class IsaacLabNativeWorld:
             self._debug_draw_interface = None
         self._initial_articulation.clear()
         self._initial_articulation_gains.clear()
+        self._articulation_control_modes.clear()
         self._initial_rigid.clear()
         self._initial_deformable.clear()
         try:

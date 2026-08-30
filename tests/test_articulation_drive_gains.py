@@ -183,6 +183,7 @@ def _world(config: IsaacLabAdapterConfig) -> tuple[IsaacLabNativeWorld, EntityPa
     world._articulations = {path: asset}
     world._usd_articulation_views = {}
     world._joint_maps = {path: (0, 1, 2, 3)}
+    world._articulation_control_modes = {path: [[None, None, None, None]]}
     world._initial_articulation_gains = {
         path: (
             _Tensor(((80_000.0, 240_000.0, 0.0, 1_000.0),)),
@@ -221,6 +222,16 @@ def test_explicit_numeric_position_override_does_not_receive_zero_fallback() -> 
 
     assert asset.stiffness_writes == [[[0.0]]]
     assert asset.damping_writes == [[[0.0]]]
+
+
+def test_repeated_same_mode_command_does_not_rewrite_unchanged_gains() -> None:
+    world, path, asset = _world(IsaacLabAdapterConfig())
+
+    world.apply_articulation(path, CommandMode.POSITION, ((0.1, 0.2),), (0,), (0, 2))
+    world.apply_articulation(path, CommandMode.POSITION, ((0.3, 0.4),), (0,), (0, 2))
+
+    assert asset.stiffness_writes == [[[80_000.0, 1_000.0]]]
+    assert asset.damping_writes == [[[2_000.0, 100.0]]]
 
 
 def test_usd_articulation_reset_indexes_authored_gains_on_their_own_device() -> None:

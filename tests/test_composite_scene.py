@@ -138,6 +138,21 @@ class _JointEnabledAttribute:
         return True
 
 
+class _CollisionEnabledAttribute:
+    def __init__(self, prim: _Prim) -> None:
+        self.prim = prim
+
+    def Get(self) -> bool:
+        return self.prim.collision_enabled
+
+    def Set(self, value: bool) -> bool:
+        self.prim.collision_enabled_writes.append(value)
+        if not self.prim.collision_enabled_write_succeeds:
+            return False
+        self.prim.collision_enabled = value
+        return True
+
+
 class _RigidBodyAPI:
     def __init__(self, prim: _Prim) -> None:
         self.prim = prim
@@ -153,6 +168,17 @@ class _ArticulationRootAPI:
     pass
 
 
+class _CollisionAPI:
+    def __init__(self, prim: _Prim) -> None:
+        self.prim = prim
+
+    def GetCollisionEnabledAttr(self) -> _CollisionEnabledAttribute:
+        return _CollisionEnabledAttribute(self.prim)
+
+    def CreateCollisionEnabledAttr(self) -> _CollisionEnabledAttribute:
+        return _CollisionEnabledAttribute(self.prim)
+
+
 class _Joint:
     def __new__(cls, prim: _Prim) -> Any:
         return prim
@@ -161,6 +187,7 @@ class _Joint:
 class _Physics:
     RigidBodyAPI = _RigidBodyAPI
     ArticulationRootAPI = _ArticulationRootAPI
+    CollisionAPI = _CollisionAPI
     Joint = _Joint
 
 
@@ -188,23 +215,32 @@ class _Prim:
         rigid: bool = False,
         articulation_root: bool = False,
         joint: bool = False,
+        collision: bool = False,
         kinematic: bool = False,
         body0: str | None = None,
         body1: str | None = None,
         kinematic_write_succeeds: bool = True,
+        rigid_api_remove_succeeds: bool = True,
+        collision_enabled_write_succeeds: bool = True,
         joint_write_succeeds: bool = True,
     ) -> None:
         self.path = path
         self.rigid = rigid
         self.articulation_root = articulation_root
         self.joint = joint
+        self.collision = collision
         self.kinematic = kinematic
         self.body0 = body0
         self.body1 = body1
         self.kinematic_write_succeeds = kinematic_write_succeeds
+        self.rigid_api_remove_succeeds = rigid_api_remove_succeeds
+        self.collision_enabled_write_succeeds = collision_enabled_write_succeeds
         self.joint_write_succeeds = joint_write_succeeds
+        self.collision_enabled = True
         self.joint_enabled = True
         self.kinematic_writes: list[bool] = []
+        self.rigid_api_removals: list[object] = []
+        self.collision_enabled_writes: list[bool] = []
         self.joint_enabled_writes: list[bool] = []
 
     def __bool__(self) -> bool:
@@ -221,10 +257,19 @@ class _Prim:
             return self.rigid
         if api is _Physics.ArticulationRootAPI:
             return self.articulation_root
+        if api is _Physics.CollisionAPI:
+            return self.collision
         return False
 
     def IsA(self, schema: object) -> bool:
         return schema is _Physics.Joint and self.joint
+
+    def RemoveAPI(self, api: object) -> bool:
+        self.rigid_api_removals.append(api)
+        if api is not _Physics.RigidBodyAPI or not self.rigid_api_remove_succeeds:
+            return False
+        self.rigid = False
+        return True
 
     def GetBody0Rel(self) -> _Relationship:
         return _Relationship(self.body0)
@@ -302,14 +347,17 @@ def test_descriptor_and_preflight_admit_v6_composite_and_embedded_entities(tmp_p
     assert DESCRIPTOR.capabilities.get(CapabilityId("scene.composite@1")) is not None
     unbound_mode = DESCRIPTOR.capabilities.get(CapabilityId("scene.composite.unbound-rigid-mode@1"))
     assert unbound_mode is not None
-    assert unbound_mode.properties["modes"] == ("authored", "kinematic")
+    assert unbound_mode.properties["modes"] == ("authored", "kinematic", "static")
     assert unbound_mode.properties["default"] == "authored"
     assert (
         unbound_mode.properties["embedded_link_protection"] == "exact-link-or-nearest-rigid-ancestor-within-composite"
     )
-    assert unbound_mode.properties["private_joint_bodies"] == "kinematic"
+    assert unbound_mode.properties["private_joint_bodies"] == FrozenMap(
+        {"kinematic": "kinematic", "static": "static-collider"}
+    )
     assert unbound_mode.properties["embedded_joint_protection"] == "exact-relative-prim-path"
     assert unbound_mode.properties["private_joint_prims"] == "disabled-in-current-stage-before-first-reset"
+    assert unbound_mode.properties["static_authoring"] == "remove-unbound-rigid-body-api-preserve-collision"
     assert DESCRIPTOR.capabilities.get(CapabilityId("entity.embedded-binding@1")) is not None
     formats = DESCRIPTOR.capabilities.get(CapabilityId("asset.formats@1"))
     assert formats is not None and formats.properties["composite_scene"] == ("model/vnd.usd",)
@@ -384,7 +432,8 @@ def test_kinematic_mode_changes_only_unbound_rigid_props(tmp_path: Path) -> None
     embedded_rigid = tuple(_Prim(f"{root}/props/bound_prop", rigid=True) for root in roots)
     embedded = (*_binding_prims(roots), *embedded_rigid)
     props = tuple(_Prim(f"{root}/props/free_prop", rigid=True) for root in roots)
-    sim_utils = _SimUtils(_Stage((*embedded, *props)))
+    colliders = tuple(_Prim(f"{root}/furniture/table/collision", collision=True) for root in roots)
+    sim_utils = _SimUtils(_Stage((*embedded, *props, *colliders)))
     world = object.__new__(IsaacLabNativeWorld)
     world._m = SimpleNamespace(sim_utils=sim_utils, UsdPhysics=_Physics)
     world._spec = spec
@@ -398,6 +447,32 @@ def test_kinematic_mode_changes_only_unbound_rigid_props(tmp_path: Path) -> None
     assert all(prim.kinematic and prim.kinematic_writes == [True] for prim in props)
     assert all(prim.kinematic_writes == [] for prim in embedded)
     assert all(prim.joint_enabled_writes == [] for prim in embedded)
+
+
+def test_static_mode_removes_only_unbound_rigid_apis_and_preserves_collision_schema(tmp_path: Path) -> None:
+    asset = tmp_path / "mixed-room.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    spec = _composite_world(asset, unbound_mode="static", include_embedded_rigid=True)
+    roots = _native_roots(spec)
+    embedded_rigid = tuple(_Prim(f"{root}/props/bound_prop", rigid=True) for root in roots)
+    embedded = (*_binding_prims(roots), *embedded_rigid)
+    props = tuple(_Prim(f"{root}/props/free_prop", rigid=True) for root in roots)
+    colliders = tuple(_Prim(f"{root}/furniture/table/collision", collision=True) for root in roots)
+    sim_utils = _SimUtils(_Stage((*embedded, *props, *colliders)))
+    world = object.__new__(IsaacLabNativeWorld)
+    world._m = SimpleNamespace(sim_utils=sim_utils, UsdPhysics=_Physics)
+    world._spec = spec
+    world._composite_scene_roots = {}
+    world._composite_scene_modes = {}
+    container = next(entity for entity in spec.entities if entity.kind is EntityKind.COMPOSITE_SCENE)
+
+    world._author_composite_scene(container)
+
+    assert all(not prim.rigid and prim.rigid_api_removals == [_Physics.RigidBodyAPI] for prim in props)
+    assert all(prim.rigid_api_removals == [] for prim in embedded)
+    assert all(prim.rigid for prim in embedded if not prim.joint)
+    assert all(prim.collision_enabled and prim.collision_enabled_writes == [] for prim in colliders)
+    assert world._composite_scene_modes[container.path] == "static"
 
 
 def test_kinematic_mode_freezes_joint_connected_private_articulation_bodies(tmp_path: Path) -> None:
@@ -551,6 +626,34 @@ def test_kinematic_mode_rejects_rigid_authoring_failure_on_readback_gate(tmp_pat
     assert world._composite_scene_roots == {}
 
 
+def test_static_mode_rejects_rigid_api_removal_failure(tmp_path: Path) -> None:
+    asset = tmp_path / "mixed-room.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    spec = _composite_world(asset, unbound_mode="static")
+    roots = _native_roots(spec)
+    props = tuple(
+        _Prim(
+            f"{root}/props/free_prop",
+            rigid=True,
+            rigid_api_remove_succeeds=index != 0,
+        )
+        for index, root in enumerate(roots)
+    )
+    sim_utils = _SimUtils(_Stage((*_binding_prims(roots), *props)))
+    world = object.__new__(IsaacLabNativeWorld)
+    world._m = SimpleNamespace(sim_utils=sim_utils, UsdPhysics=_Physics)
+    world._spec = spec
+    world._composite_scene_roots = {}
+    container = next(entity for entity in spec.entities if entity.kind is EntityKind.COMPOSITE_SCENE)
+
+    with pytest.raises(RuntimeError, match="failed to author RigidBodyAPI removal"):
+        world._author_composite_scene(container)
+
+    assert props[0].rigid_api_removals == [_Physics.RigidBodyAPI]
+    assert props[0].rigid
+    assert world._composite_scene_roots == {}
+
+
 @pytest.mark.parametrize("invalid_mode", [None, "", "KINEMATIC", 7, True])
 def test_composite_rejects_invalid_unbound_rigid_mode_before_composition(
     tmp_path: Path,
@@ -567,7 +670,7 @@ def test_composite_rejects_invalid_unbound_rigid_mode_before_composition(
     _RecordedUsdFileCfg.instances.clear()
     container = next(entity for entity in spec.entities if entity.kind is EntityKind.COMPOSITE_SCENE)
 
-    with pytest.raises(ValueError, match="must be exactly 'authored' or 'kinematic'"):
+    with pytest.raises(ValueError, match="must be exactly 'authored', 'kinematic', or 'static'"):
         world._author_composite_scene(container)
 
     assert _RecordedUsdFileCfg.instances == []

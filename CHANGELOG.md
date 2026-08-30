@@ -2,6 +2,12 @@
 
 ## 0.10.6
 
+- Add the `static` composite unbound-body mode. It disables private joints and
+  removes `RigidBodyAPI` only from unbound bodies while preserving authored mesh
+  collision and all explicitly embedded bodies/joints.
+- Keep static composite bodies out of articulation/rigid tensor views and reset
+  caches. Repeated commands in the same joint control mode no longer rewrite
+  unchanged stiffness/damping; mode changes and reset still restore exact gains.
 - Enable Isaac Sim 6's legacy RTX Real-Time implementation at the Kit startup
   boundary when ordinary cameras select `RaytracedLighting`. Isaac Sim 6 keeps
   that implementation disabled by default, so selecting it later through

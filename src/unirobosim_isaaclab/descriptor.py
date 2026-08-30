@@ -90,17 +90,21 @@ CAPABILITIES = CapabilitySet(
             FrozenMap(
                 {
                     "metadata_key": "composite_unbound_rigid_mode",
-                    "modes": ["authored", "kinematic"],
+                    "modes": ["authored", "kinematic", "static"],
                     "default": "authored",
                     "authoring": "current-stage-override-before-first-reset",
                     "unbound_definition": "rigid-body-not-owned-by-fastsim-embedded-binding",
                     "embedded_link_protection": "exact-link-or-nearest-rigid-ancestor-within-composite",
-                    "private_joint_bodies": "kinematic",
+                    "private_joint_bodies": {
+                        "kinematic": "kinematic",
+                        "static": "static-collider",
+                    },
                     "embedded_joint_protection": "exact-relative-prim-path",
                     "private_joint_prims": "disabled-in-current-stage-before-first-reset",
                     "joint_prims": "schemas-preserved",
-                    "write_order": "disable-private-joints-then-kinematic-unbound-bodies",
-                    "collision": "preserved",
+                    "write_order": "disable-private-joints-then-freeze-unbound-bodies",
+                    "static_authoring": "remove-unbound-rigid-body-api-preserve-collision",
+                    "collision": {"authored": "preserved", "kinematic": "preserved", "static": "preserved"},
                     "multi_environment": "identical-relative-selection-required",
                 }
             ),
