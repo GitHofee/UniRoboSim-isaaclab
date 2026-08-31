@@ -27,6 +27,7 @@ from unirobosim import (
     EntityPath,
     EntitySpec,
     KinematicTarget,
+    PackedFloat32Array,
     PointCommandMode,
     Pose,
     WorldSpec,
@@ -41,6 +42,10 @@ from .native_protocols import (
     NativeDebugReport,
     NativeKinematicState,
     NativePhysicsDiagnostics,
+    NativeRenderArticulationState,
+    NativeRenderParticleFluidState,
+    NativeRenderRigidBodyState,
+    NativeRenderStateFrame,
     NativeSensorBatch,
     NativeSensorSample,
     PointBatch,
@@ -319,9 +324,11 @@ def _debug_draw_payload(
 
 @dataclass
 class _FluidSet:
+    system: Any
     points: Any
     initial_positions: tuple[tuple[float, float, float], ...]
     initial_velocities: tuple[tuple[float, float, float], ...]
+    render_state_visualization_enabled: bool = False
 
 
 @dataclass
@@ -841,6 +848,7 @@ class IsaacLabNativeRuntime:
             startup_progress("runtime_importing")
 
         import carb  # type: ignore[import-not-found]
+        import omni.physx as omni_physx  # type: ignore[import-not-found]
 
         if config.enable_cameras:
             expected_anti_aliasing = _ANTI_ALIASING_MODES[config.anti_aliasing]
@@ -942,6 +950,7 @@ class IsaacLabNativeRuntime:
             debug_draw_plugin_path=debug_extension / "bin",
             sim_utils=sim_utils,
             physics_tensors=physics_tensors,
+            omni_physx=omni_physx,
             torch=torch,
             Gf=Gf,
             Usd=Usd,
@@ -1791,15 +1800,14 @@ class IsaacLabNativeWorld:
             points.CreateWidthsAttr().Set(
                 self._m.Vt.FloatArray((fluid.particle_radius_m * 2.0,) * fluid.particle_count)
             )
-            if self._config.fluid_render_mode == "particles":
-                fluid_color = getattr(fluid, "color_rgba", None) or (0.1, 0.45, 1.0, 1.0)
-                points.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
-                    self._m.Vt.Vec3fArray((tuple(fluid_color[:3]),))
-                )
-                points.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.constant).Set(
-                    self._m.Vt.FloatArray((float(fluid_color[3]),))
-                )
-            else:
+            fluid_color = getattr(fluid, "color_rgba", None) or (0.1, 0.45, 1.0, 1.0)
+            points.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+                self._m.Vt.Vec3fArray((tuple(fluid_color[:3]),))
+            )
+            points.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+                self._m.Vt.FloatArray((float(fluid_color[3]),))
+            )
+            if self._config.fluid_render_mode == "isosurface":
                 # The particle set remains active for PhysX, while RTX renders only
                 # the reconstructed surface.  Rendering both is the characteristic
                 # "beads inside a surface" artifact this mode is intended to avoid.
@@ -1817,7 +1825,7 @@ class IsaacLabNativeWorld:
             mass_api.CreateDensityAttr().Set(fluid.rest_density_kg_m3)
             if self._config.fluid_render_mode == "isosurface":
                 self._author_fluid_isosurface(system, material, fluid)
-            sets.append(_FluidSet(points, local_positions, local_velocities))
+            sets.append(_FluidSet(system, points, local_positions, local_velocities))
         self._fluids[entity.path] = tuple(sets)
 
     def _apply_pbd_material(self, material: Any, fluid: Any) -> None:
@@ -2497,6 +2505,456 @@ class IsaacLabNativeWorld:
         self._sync_all_mounted_cameras()
         self._invalidate_render()
 
+    def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
+        """Apply one fully prevalidated frame without calling the physics step API."""
+
+        if type(frame) is not NativeRenderStateFrame:
+            raise ValueError("native render state requires a NativeRenderStateFrame")
+        if (
+            any(type(update) is not NativeRenderArticulationState for update in frame.articulations)
+            or any(type(update) is not NativeRenderRigidBodyState for update in frame.rigid_bodies)
+            or any(type(update) is not NativeRenderParticleFluidState for update in frame.particle_fluids)
+        ):
+            raise ValueError("native render state contains an invalid update type")
+        paths = tuple(
+            update.path
+            for updates in (frame.articulations, frame.rigid_bodies, frame.particle_fluids)
+            for update in updates
+        )
+        if not paths or len(paths) != len(set(paths)):
+            raise ValueError("native render state must contain unique entity paths")
+
+        environment_count = self._spec.environments.count
+        torch = self._m.torch
+
+        def selection(values: tuple[int, ...], size: int, field: str) -> tuple[int, ...]:
+            if (
+                type(values) is not tuple
+                or not values
+                or any(type(index) is not int or index < 0 or index >= size for index in values)
+                or len(values) != len(set(values))
+            ):
+                raise ValueError(f"native render state {field} selection is invalid")
+            return values
+
+        def tensor_payload(value: object, shape: tuple[int, ...], *, device: object = "cpu") -> Any:
+            if isinstance(value, PackedFloat32Array):
+                if sys.byteorder != "little" or value.shape != shape:
+                    raise ValueError("native packed float32 render payload shape or byte order is invalid")
+                tensor = torch.frombuffer(value.data, dtype=torch.float32).clone().reshape(shape)
+                if str(device) != "cpu":
+                    tensor = tensor.to(device=device)
+            else:
+                try:
+                    tensor = torch.tensor(value, device=device, dtype=torch.float32)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("native render state contains an invalid numeric payload") from exc
+                if tuple(int(size) for size in tensor.shape) != shape:
+                    raise ValueError("native render state payload shape is invalid")
+            if not bool(torch.isfinite(tensor).all().item()):
+                raise ValueError("native render state payload must contain only finite values")
+            return tensor
+
+        articulation_stages: list[
+            tuple[str, EntityPath, Any, Any, Any, Any, tuple[int, ...], Any | None, Any | None]
+        ] = []
+        for articulation_update in frame.articulations:
+            if articulation_update.path not in self._joint_maps:
+                raise ValueError("native render state references an unknown articulation")
+            environments = selection(
+                articulation_update.environment_indices,
+                environment_count,
+                "environment",
+            )
+            degrees = selection(
+                articulation_update.degree_of_freedom_indices,
+                len(self._joint_maps[articulation_update.path]),
+                "degree-of-freedom",
+            )
+            joint_shape = (len(environments), len(degrees))
+            native_degrees = tuple(
+                self._joint_maps[articulation_update.path][index] for index in degrees
+            )
+            root_values = (
+                articulation_update.root_positions_m,
+                articulation_update.root_orientations_xyzw,
+                articulation_update.root_linear_velocities_m_s,
+                articulation_update.root_angular_velocities_rad_s,
+            )
+            if any(value is not None for value in root_values) and any(value is None for value in root_values):
+                raise ValueError("native render articulation root state must be supplied as one complete state")
+            if articulation_update.path in self._usd_articulation_views:
+                view = self._usd_articulation_views[articulation_update.path]
+                indices = torch.tensor(environments, device=view.get_dof_positions().device, dtype=torch.int64)
+                positions = view.get_dof_positions()[indices].clone()
+                velocities = view.get_dof_velocities()[indices].clone()
+                target_positions = tensor_payload(
+                    articulation_update.joint_positions,
+                    joint_shape,
+                    device=positions.device,
+                )
+                target_velocities = tensor_payload(
+                    articulation_update.joint_velocities,
+                    joint_shape,
+                    device=velocities.device,
+                )
+                positions[:, list(native_degrees)] = target_positions
+                velocities[:, list(native_degrees)] = target_velocities
+                root_pose = None
+                root_velocity = None
+                if articulation_update.root_positions_m is not None:
+                    assert articulation_update.root_orientations_xyzw is not None
+                    assert articulation_update.root_linear_velocities_m_s is not None
+                    assert articulation_update.root_angular_velocities_rad_s is not None
+                    root_positions = tensor_payload(
+                        articulation_update.root_positions_m,
+                        (len(environments), 3),
+                        device=positions.device,
+                    )
+                    root_orientations = tensor_payload(
+                        articulation_update.root_orientations_xyzw,
+                        (len(environments), 4),
+                        device=positions.device,
+                    )
+                    origins = torch.tensor(
+                        self._origins_cpu,
+                        device=positions.device,
+                        dtype=positions.dtype,
+                    )[indices]
+                    root_pose = torch.cat((root_positions + origins, root_orientations), dim=1)
+                    root_velocity = torch.cat(
+                        (
+                            tensor_payload(
+                                articulation_update.root_linear_velocities_m_s,
+                                (len(environments), 3),
+                                device=positions.device,
+                            ),
+                            tensor_payload(
+                                articulation_update.root_angular_velocities_rad_s,
+                                (len(environments), 3),
+                                device=positions.device,
+                            ),
+                        ),
+                        dim=1,
+                    )
+                    root_norms = torch.linalg.vector_norm(root_orientations, dim=1)
+                    if not bool(
+                        torch.allclose(root_norms, torch.ones_like(root_norms), rtol=0.0, atol=1.0e-6)
+                    ):
+                        raise ValueError("native render articulation root orientations must be unit quaternions")
+                articulation_stages.append(
+                    (
+                        "usd",
+                        articulation_update.path,
+                        view,
+                        indices,
+                        positions,
+                        velocities,
+                        native_degrees,
+                        root_pose,
+                        root_velocity,
+                    )
+                )
+            else:
+                asset = self._articulations.get(articulation_update.path)
+                if asset is None:
+                    raise ValueError("native render state references an unavailable articulation")
+                env_ids = list(environments)
+                positions = asset.data.joint_pos.torch[env_ids].clone()
+                velocities = asset.data.joint_vel.torch[env_ids].clone()
+                target_positions = tensor_payload(
+                    articulation_update.joint_positions,
+                    joint_shape,
+                    device=positions.device,
+                )
+                target_velocities = tensor_payload(
+                    articulation_update.joint_velocities,
+                    joint_shape,
+                    device=velocities.device,
+                )
+                positions[:, list(native_degrees)] = target_positions
+                velocities[:, list(native_degrees)] = target_velocities
+                root_pose = None
+                root_velocity = None
+                if articulation_update.root_positions_m is not None:
+                    assert articulation_update.root_orientations_xyzw is not None
+                    assert articulation_update.root_linear_velocities_m_s is not None
+                    assert articulation_update.root_angular_velocities_rad_s is not None
+                    if self._origins is None:
+                        raise ValueError("native environment origins are unavailable for articulation root state")
+                    root_positions = tensor_payload(
+                        articulation_update.root_positions_m,
+                        (len(environments), 3),
+                        device=positions.device,
+                    )
+                    root_orientations = tensor_payload(
+                        articulation_update.root_orientations_xyzw,
+                        (len(environments), 4),
+                        device=positions.device,
+                    )
+                    root_pose = torch.cat((root_positions + self._origins[env_ids], root_orientations), dim=1)
+                    root_velocity = torch.cat(
+                        (
+                            tensor_payload(
+                                articulation_update.root_linear_velocities_m_s,
+                                (len(environments), 3),
+                                device=positions.device,
+                            ),
+                            tensor_payload(
+                                articulation_update.root_angular_velocities_rad_s,
+                                (len(environments), 3),
+                                device=positions.device,
+                            ),
+                        ),
+                        dim=1,
+                    )
+                    root_norms = torch.linalg.vector_norm(root_orientations, dim=1)
+                    if not bool(
+                        torch.allclose(root_norms, torch.ones_like(root_norms), rtol=0.0, atol=1.0e-6)
+                    ):
+                        raise ValueError("native render articulation root orientations must be unit quaternions")
+                articulation_stages.append(
+                    (
+                        "high",
+                        articulation_update.path,
+                        asset,
+                        env_ids,
+                        positions,
+                        velocities,
+                        native_degrees,
+                        root_pose,
+                        root_velocity,
+                    )
+                )
+
+        rigid_stages: list[tuple[str, EntityPath, Any, Any, Any, Any]] = []
+        for rigid_update in frame.rigid_bodies:
+            if rigid_update.path not in self._kinematic_rigids:
+                raise ValueError("native render state references an unknown rigid body")
+            if self._kinematic_rigids[rigid_update.path]:
+                raise ValueError("native render state rigid updates require a dynamic body")
+            environments = selection(rigid_update.environment_indices, environment_count, "environment")
+            row_count = len(environments)
+            if rigid_update.path in self._usd_rigid_views:
+                target = self._usd_rigid_views[rigid_update.path]
+                transforms = target.get_transforms()
+                indices = torch.tensor(environments, device=transforms.device, dtype=torch.int64)
+                positions = tensor_payload(rigid_update.positions_m, (row_count, 3), device=transforms.device)
+                orientations = tensor_payload(
+                    rigid_update.orientations_xyzw,
+                    (row_count, 4),
+                    device=transforms.device,
+                )
+                linear = tensor_payload(
+                    rigid_update.linear_velocities_m_s,
+                    (row_count, 3),
+                    device=transforms.device,
+                )
+                angular = tensor_payload(
+                    rigid_update.angular_velocities_rad_s,
+                    (row_count, 3),
+                    device=transforms.device,
+                )
+                origins = torch.tensor(self._origins_cpu, device=transforms.device, dtype=transforms.dtype)[indices]
+                poses = torch.cat((positions + origins, orientations), dim=1)
+                velocities = torch.cat((linear, angular), dim=1)
+                rigid_stages.append(("usd", rigid_update.path, target, indices, poses, velocities))
+            else:
+                target = self._rigids.get(rigid_update.path)
+                if target is None or self._sim is None or self._origins is None:
+                    raise ValueError("native render state references an unavailable rigid body")
+                env_ids = list(environments)
+                positions = tensor_payload(rigid_update.positions_m, (row_count, 3), device=self._sim.device)
+                orientations = tensor_payload(
+                    rigid_update.orientations_xyzw,
+                    (row_count, 4),
+                    device=self._sim.device,
+                )
+                linear = tensor_payload(
+                    rigid_update.linear_velocities_m_s,
+                    (row_count, 3),
+                    device=self._sim.device,
+                )
+                angular = tensor_payload(
+                    rigid_update.angular_velocities_rad_s,
+                    (row_count, 3),
+                    device=self._sim.device,
+                )
+                poses = torch.cat((positions + self._origins[env_ids], orientations), dim=1)
+                velocities = torch.cat((linear, angular), dim=1)
+                rigid_stages.append(("high", rigid_update.path, target, env_ids, poses, velocities))
+            quaternion_norms = torch.linalg.vector_norm(orientations, dim=1)
+            if not bool(torch.allclose(quaternion_norms, torch.ones_like(quaternion_norms), rtol=0.0, atol=1.0e-6)):
+                raise ValueError("native render state rigid orientations must be unit quaternions")
+
+        fluid_stages: list[tuple[Any, Any, Any | None]] = []
+        for fluid_update in frame.particle_fluids:
+            sets = self._fluids.get(fluid_update.path)
+            if sets is None:
+                raise ValueError("native render state references an unknown particle fluid")
+            environments = selection(fluid_update.environment_indices, environment_count, "environment")
+            particle_count = len(sets[0].initial_positions)
+            range_count = (
+                fluid_update.positions_m.shape[1]
+                if isinstance(fluid_update.positions_m, PackedFloat32Array)
+                else 0
+            )
+            if not isinstance(fluid_update.positions_m, PackedFloat32Array):
+                try:
+                    range_count = len(fluid_update.positions_m[0])
+                except (IndexError, TypeError) as exc:
+                    raise ValueError("native render particle payload is invalid") from exc
+            fluid_shape = (len(environments), range_count, 3)
+            if (
+                type(fluid_update.first_particle_index) is not int
+                or fluid_update.first_particle_index < 0
+                or range_count <= 0
+                or fluid_update.first_particle_index + range_count > particle_count
+            ):
+                raise ValueError("native render particle range is invalid")
+            positions = tensor_payload(fluid_update.positions_m, fluid_shape)
+            velocities = (
+                None
+                if fluid_update.velocities_m_s is None
+                else tensor_payload(fluid_update.velocities_m_s, fluid_shape)
+            )
+            first = fluid_update.first_particle_index
+            last = first + range_count
+            for row_index, environment in enumerate(environments):
+                fluid_set = sets[environment]
+                current_positions = torch.tensor(
+                    fluid_set.points.GetPointsAttr().Get(),
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                current_velocities = torch.tensor(
+                    fluid_set.points.GetVelocitiesAttr().Get(),
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                if (
+                    tuple(int(size) for size in current_positions.shape) != (particle_count, 3)
+                    or tuple(int(size) for size in current_velocities.shape) != (particle_count, 3)
+                    or not bool(torch.isfinite(current_positions).all().item())
+                    or not bool(torch.isfinite(current_velocities).all().item())
+                ):
+                    raise ValueError("native particle fluid storage is invalid before render-state application")
+                current_positions[first:last] = positions[row_index]
+                if velocities is not None:
+                    current_velocities[first:last] = velocities[row_index]
+                fluid_stages.append(
+                    (
+                        fluid_set,
+                        current_positions,
+                        current_velocities if velocities is not None else None,
+                    )
+                )
+
+        for (
+            kind,
+            path,
+            target,
+            indices,
+            positions,
+            velocities,
+            native_degrees,
+            root_pose,
+            root_velocity,
+        ) in articulation_stages:
+            zeros = torch.zeros_like(positions)
+            if kind == "usd":
+                if root_pose is not None:
+                    assert root_velocity is not None
+                    target.set_root_transforms(root_pose, indices)
+                    target.set_root_velocities(root_velocity, indices)
+                target.set_dof_positions(positions, indices)
+                target.set_dof_velocities(velocities, indices)
+                target.set_dof_position_targets(positions, indices)
+                target.set_dof_velocity_targets(velocities, indices)
+                target.set_dof_actuation_forces(zeros, indices)
+            else:
+                if root_pose is not None:
+                    assert root_velocity is not None
+                    target.write_root_pose_to_sim_index(root_pose=root_pose, env_ids=indices)
+                    target.write_root_velocity_to_sim_index(root_velocity=root_velocity, env_ids=indices)
+                target.write_joint_position_to_sim_index(position=positions, env_ids=indices)
+                target.write_joint_velocity_to_sim_index(velocity=velocities, env_ids=indices)
+                target.set_joint_position_target_index(target=positions, env_ids=indices)
+                target.set_joint_velocity_target_index(target=velocities, env_ids=indices)
+                target.set_joint_effort_target_index(target=zeros, env_ids=indices)
+                control_modes = self._articulation_control_modes[path]
+                for environment in indices:
+                    for degree in native_degrees:
+                        control_modes[environment][degree] = CommandMode.POSITION
+
+        for kind, path, target, indices, poses, velocities in rigid_stages:
+            if kind == "usd":
+                _write_usd_rigid_state(target, poses, velocities, indices, kinematic=False)
+                forces, torques = self._usd_rigid_wrenches[path]
+                forces[indices] = 0.0
+                torques[indices] = 0.0
+            else:
+                _write_high_level_rigid_state(target, poses, velocities, indices, kinematic=False)
+                zeros = torch.zeros((len(indices), 1, 3), device=poses.device, dtype=poses.dtype)
+                target.permanent_wrench_composer.set_forces_and_torques_index(
+                    forces=zeros,
+                    torques=zeros,
+                    env_ids=torch.tensor(indices, device=poses.device, dtype=torch.int64),
+                    is_global=True,
+                )
+
+        assert self._sim is not None
+        # Particle-fluid worlds deliberately disable Isaac Lab Fabric so PhysX can
+        # publish particle state through USD.  In that profile SimulationContext.forward()
+        # is a no-op, which leaves raw USD-backed articulation link transforms at the
+        # previous pose after set_dof_positions().  Refresh PhysX forward kinematics
+        # explicitly before RTX consumes the frame.  This does not simulate or fetch a
+        # physics step and therefore preserves the render-only Replay contract.
+        if any(kind == "usd" for kind, *_ in articulation_stages):
+            self._usd_simulation_view().update_articulations_kinematic()
+        if any(kind == "usd" for kind, *_ in articulation_stages) or any(
+            kind == "usd" for kind, *_ in rigid_stages
+        ):
+            # RTX reads this profile from USD rather than Fabric.  The tensor
+            # setters above mutate PhysX state only; publish those already-computed
+            # transforms to USD without simulate()/fetch_results().
+            self._m.omni_physx.get_physx_interface().update_transformations(
+                False,
+                True,
+                True,
+                False,
+            )
+
+        # Publish recorded particle positions last.  A PhysX-to-USD transform
+        # update can otherwise restore the previous live particle payload over
+        # the state selected by Replay.
+        vec3_array = self._m.Vt.Vec3fArray
+        from_numpy = getattr(vec3_array, "FromNumpy", None)
+        for fluid_set, positions, velocities in fluid_stages:
+            if (
+                self._config.fluid_render_mode == "isosurface"
+                and not fluid_set.render_state_visualization_enabled
+            ):
+                # A PhysX isosurface is generated only by simulation.  Render-only
+                # Replay must not run physics merely to rebuild it, so expose the
+                # recorded particles as the deterministic RTX representation and
+                # disable the stale live-simulation surface for this world.
+                isosurface = self._m.PhysxSchema.PhysxParticleIsosurfaceAPI(fluid_set.system.GetPrim())
+                isosurface.GetIsosurfaceEnabledAttr().Set(False)
+                fluid_set.points.GetVisibilityAttr().Set(self._m.UsdGeom.Tokens.inherited)
+                fluid_set.render_state_visualization_enabled = True
+            position_numpy = positions.contiguous().numpy()
+            position_value = from_numpy(position_numpy) if callable(from_numpy) else vec3_array(position_numpy)
+            fluid_set.points.GetPointsAttr().Set(position_value)
+            if velocities is not None:
+                velocity_numpy = velocities.contiguous().numpy()
+                velocity_value = from_numpy(velocity_numpy) if callable(from_numpy) else vec3_array(velocity_numpy)
+                fluid_set.points.GetVelocitiesAttr().Set(velocity_value)
+        self._sim.forward()
+        self._update_assets(0.0)
+        self._sync_all_mounted_cameras()
+        self._invalidate_render()
+
     def apply_articulation(
         self,
         path: EntityPath,
@@ -2885,6 +3343,9 @@ class IsaacLabNativeWorld:
             )
         assert self._sim is not None
         self._sim.forward()
+        self._update_assets(0.0)
+        self._sync_all_mounted_cameras()
+        self._invalidate_render()
 
     def _attachment_body_path(
         self,

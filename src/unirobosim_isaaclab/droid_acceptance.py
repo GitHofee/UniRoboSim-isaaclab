@@ -892,6 +892,7 @@ def _compose(
         planning_raw=planning_raw,
         simulation_root=simulation_root,
         recording_capture=None,
+        render_state_root=None,
         fluid_emitter_root=fluid_emitter_root,
         scene_command_root=scene_command_root,
         visualization_root=visualization_root,

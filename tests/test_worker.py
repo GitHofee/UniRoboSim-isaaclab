@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 from copy import deepcopy
@@ -23,6 +24,7 @@ from unirobosim import (
     EntityKind,
     EntityPath,
     EntitySpec,
+    PackedFloat32Array,
     ParticleFluidSpec,
     PointCommandMode,
     WorldSpec,
@@ -31,7 +33,12 @@ from unirobosim import (
 from unirobosim_isaaclab import worker as worker_module
 from unirobosim_isaaclab import worker_bootstrap as worker_bootstrap_module
 from unirobosim_isaaclab.config import IsaacLabAdapterConfig
-from unirobosim_isaaclab.native_protocols import NativePhysicsDiagnostics, NativePlanningError
+from unirobosim_isaaclab.native_protocols import (
+    NativePhysicsDiagnostics,
+    NativePlanningError,
+    NativeRenderParticleFluidState,
+    NativeRenderStateFrame,
+)
 from unirobosim_isaaclab.worker import (
     _STARTUP_PHASES,
     IsaacLabWorkerPlanningWorld,
@@ -344,9 +351,9 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     fingerprint = _worker_startup_fingerprint()
     assert worker_bootstrap_module._WORKER_PROGRESS_SCHEMA == worker_module._WORKER_PROGRESS_SCHEMA
     assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/2"
-    assert fingerprint["worker_protocol"] == 3
+    assert fingerprint["worker_protocol"] == 4
     assert fingerprint["adapter"] == {
-        "version": "0.10.6",
+        "version": "0.10.7",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
     }
     core = cast(dict[str, object], fingerprint["core"])
@@ -706,6 +713,41 @@ def test_worker_camera_batch_is_one_request_and_preserves_packed_bytes(tmp_path:
     assert operations == ["build_world", "read_sensors", "close_world", "close_runtime"]
     assert connection.sent[1] == ("read_sensors", (paths,))
     assert connection.closed and not process.alive
+
+
+def test_worker_render_state_is_one_request_and_preserves_packed_float_bytes(tmp_path: Path) -> None:
+    payload = PackedFloat32Array((1, 1, 3), struct.pack("<3f", 1.0, 2.0, 3.0))
+    frame = NativeRenderStateFrame(
+        (),
+        (),
+        (NativeRenderParticleFluidState(EntityPath("/fluid"), payload, None, (0,), 0),),
+    )
+    factory, connection, process = fake_worker_factory(
+        [("ok", None), ("ok", None), ("ok", None), ("ok", None), ("ok", None)]
+    )
+    runtime = IsaacLabWorkerRuntime(IsaacLabAdapterConfig(), worker_factory=factory)
+    world = runtime.build_world(extended_world(make_articulation_asset(tmp_path / "robot.usda")))
+
+    world.apply_render_state(frame)
+
+    operation, args = cast(tuple[str, tuple[object, ...]], connection.sent[-1])
+    assert operation == "apply_render_state"
+    sent = cast(NativeRenderStateFrame, args[0])
+    assert sent.particle_fluids[0].positions_m is payload
+    assert sent.particle_fluids[0].positions_m.data is payload.data
+    world.close()
+    runtime.close()
+    assert connection.closed and not process.alive
+    operations = [cast(tuple[Any, ...], request)[0] for request in connection.sent]
+    assert operations == ["build_world", "apply_render_state", "close_world", "close_runtime"]
+
+    native_runtime = FakeNativeRuntime()
+    native_world = native_runtime.build_world(
+        extended_world(make_articulation_asset(tmp_path / "dispatch.usda"))
+    )
+    returned, result, stop = _dispatch(native_runtime, native_world, ("apply_render_state", (frame,)))
+    assert returned is native_world and result is None and not stop
+    assert native_world.calls[-1] == ("render_state", frame)
 
 
 def test_worker_combines_step_state_and_camera_in_one_request(tmp_path: Path) -> None:

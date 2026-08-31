@@ -11,6 +11,7 @@ from unirobosim import (
     DebugBatch,
     EntityPath,
     KinematicTarget,
+    PackedFloat32Array,
     PlanningArticulationState,
     PlanningAttachment,
     PlanningEntityDescriptor,
@@ -176,10 +177,59 @@ class NativeArticulationCommand:
     degree_of_freedom_indices: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class NativeRenderArticulationState:
+    """One direct articulation joint-state update already mapped to a native path."""
+
+    path: EntityPath
+    joint_positions: Matrix
+    joint_velocities: Matrix
+    environment_indices: tuple[int, ...]
+    degree_of_freedom_indices: tuple[int, ...]
+    root_positions_m: Matrix | None = None
+    root_orientations_xyzw: Matrix | None = None
+    root_linear_velocities_m_s: Matrix | None = None
+    root_angular_velocities_rad_s: Matrix | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRenderRigidBodyState:
+    """One direct rigid root-state update in environment-local world coordinates."""
+
+    path: EntityPath
+    positions_m: Matrix
+    orientations_xyzw: Matrix
+    linear_velocities_m_s: Matrix
+    angular_velocities_rad_s: Matrix
+    environment_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRenderParticleFluidState:
+    """One direct contiguous particle-state range update."""
+
+    path: EntityPath
+    positions_m: PointBatch | PackedFloat32Array
+    velocities_m_s: PointBatch | PackedFloat32Array | None
+    environment_indices: tuple[int, ...]
+    first_particle_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRenderStateFrame:
+    """One fully public-validated render state transaction."""
+
+    articulations: tuple[NativeRenderArticulationState, ...]
+    rigid_bodies: tuple[NativeRenderRigidBodyState, ...]
+    particle_fluids: tuple[NativeRenderParticleFluidState, ...]
+
+
 class NativeWorldDriver(Protocol):
     def physics_diagnostics(self) -> NativePhysicsDiagnostics: ...
 
     def reset(self, environment_indices: tuple[int, ...]) -> None: ...
+
+    def apply_render_state(self, frame: NativeRenderStateFrame) -> None: ...
 
     def apply_articulation(
         self,

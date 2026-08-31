@@ -3,6 +3,7 @@
 from unirobosim import (
     COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
+    RENDER_STATE_CAPABILITY_ID,
     WORLD_SCHEMA_VERSION,
     CapabilityDeclaration,
     CapabilityId,
@@ -159,6 +160,23 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
+        CapabilityDeclaration(
+            RENDER_STATE_CAPABILITY_ID,
+            FrozenMap(
+                {
+                    "atomic_scope": "frame",
+                    "fluid_payloads": ["array-value", "packed-float32-le"],
+                    "physics_advance": False,
+                    "render_invalidation": "once-per-frame",
+                    "state_kinds": [
+                        "articulation-joints",
+                        "articulation-root",
+                        "rigid-root",
+                        "particle-fluid-range",
+                    ],
+                }
+            ),
+        ),
         CapabilityDeclaration(
             CapabilityId("state.kinematics.selected@1"),
             FrozenMap(

@@ -29,6 +29,7 @@ from unirobosim_isaaclab.native_protocols import (
     NativeCameraCalibration,
     NativeKinematicState,
     NativePhysicsDiagnostics,
+    NativeRenderStateFrame,
     NativeSensorBatch,
     NativeSensorSample,
     PointBatch,
@@ -121,6 +122,9 @@ class FakeNativeWorld:
         self.attachments = {
             key: child for key, child in self.attachments.items() if key[0] not in selected
         }
+
+    def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
+        self.calls.append(("render_state", frame))
 
     def apply_articulation(
         self,

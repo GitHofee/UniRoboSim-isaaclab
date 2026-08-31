@@ -34,7 +34,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.6"
+    assert unirobosim_isaaclab.__version__ == "0.10.7"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -43,6 +43,10 @@ def test_public_identity_and_protocol() -> None:
         "ngc-isaaclab-3.0.0",
     ]
     assert CAPABILITIES.get(CapabilityId("state.rigid_body@1")) is not None
+    render_state = CAPABILITIES.get(CapabilityId("render.state.apply@1"))
+    assert render_state is not None
+    assert render_state.properties["physics_advance"] is False
+    assert "packed-float32-le" in render_state.properties["fluid_payloads"]
     assert CAPABILITIES.get(CapabilityId("control.rigid_body.wrench@1")) is not None
     assert CAPABILITIES.get(CapabilityId("contact.net_normal_force@1")) is not None
     assert CAPABILITIES.get(CapabilityId("state.fluid.particles@1")) is not None

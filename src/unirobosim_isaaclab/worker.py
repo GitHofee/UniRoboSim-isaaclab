@@ -38,6 +38,7 @@ from .native_protocols import (
     NativePlanningResource,
     NativePlanningState,
     NativePlanningWorldDriver,
+    NativeRenderStateFrame,
     NativeRuntime,
     NativeSensorBatch,
     NativeSensorSample,
@@ -53,7 +54,7 @@ _STARTUP_ATTEMPTS = 2
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/2"
 _WORKER_PROGRESS_SCHEMA = "unirobosim-isaaclab-worker-progress/1"
-_WORKER_PROTOCOL_VERSION = 3
+_WORKER_PROTOCOL_VERSION = 4
 _PACKED_RGB_BATCH_STATUS = "packed_rgb_batch"
 _SHARED_RGB_BATCH_STATUS = "shared_rgb_batch"
 _SHARED_STEP_STATE_RGB_STATUS = "shared_step_state_rgb"
@@ -393,6 +394,9 @@ def _dispatch(
         return active, active.physics_diagnostics(), False
     if operation == "reset":
         active.reset(cast(tuple[int, ...], args[0]))
+        return active, None, False
+    if operation == "apply_render_state":
+        active.apply_render_state(cast(NativeRenderStateFrame, args[0]))
         return active, None, False
     if operation == "apply_articulation":
         active.apply_articulation(
@@ -1054,6 +1058,10 @@ class IsaacLabWorkerWorld:
     def reset(self, environment_indices: tuple[int, ...]) -> None:
         self._ensure_open("reset")
         self._runtime._request("reset", environment_indices)
+
+    def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
+        self._ensure_open("apply_render_state")
+        self._runtime._request("apply_render_state", frame)
 
     def apply_articulation(
         self,

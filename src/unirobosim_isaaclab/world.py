@@ -7,13 +7,14 @@ import math
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import unquote, urlparse
 
 from unirobosim import (
     ARTICULATION_AXIS_UNITS_MISMATCH,
     ARTICULATION_POSITION_AXIS_UNITS_UNSUPPORTED,
     PHYSICAL_WORLD_SCHEMA_VERSION,
+    RENDER_STATE_CAPABILITY_ID,
     ArrayValue,
     ArticulationCommand,
     ArticulationState,
@@ -38,10 +39,13 @@ from unirobosim import (
     KinematicState,
     KinematicTarget,
     LifecycleError,
+    PackedFloat32Array,
     ParticleFluidCommand,
     ParticleFluidState,
     PointCommandMode,
     Pose,
+    RenderStateFrame,
+    RenderStateResult,
     ResetResult,
     RigidBodyCommand,
     RigidBodyState,
@@ -73,6 +77,10 @@ from .native_protocols import (
     NativeEncodedSensorFrame,
     NativeEncodedSensorRequest,
     NativeKinematicState,
+    NativeRenderArticulationState,
+    NativeRenderParticleFluidState,
+    NativeRenderRigidBodyState,
+    NativeRenderStateFrame,
     NativeSensorSample,
     NativeWorldDriver,
     PointBatch,
@@ -108,6 +116,7 @@ class IsaacLabWorld:
         self._native = native
         self._state = WorldState.READY
         self._step_index = 0
+        self._render_state_revision = 0
         self._reset_count = 0
         self._scene_sequence = 0
         self._scene_results: dict[str, SceneCommandResult] = {}
@@ -333,6 +342,240 @@ class IsaacLabWorld:
             key: child for key, child in self._attachments.items() if key[0] not in selected
         }
         return ResetResult(environments, self._reset_count, self.tick)
+
+    def apply_render_state(self, frame: RenderStateFrame) -> RenderStateResult:
+        """Atomically apply a render frame while preserving the native physics tick."""
+
+        operation = "world.apply_render_state"
+        self._ensure_ready(operation)
+        if self._descriptor.capabilities.get(RENDER_STATE_CAPABILITY_ID) is None:
+            raise UnsupportedCapabilityError(
+                "provider does not support render-state application",
+                operation=operation,
+                backend_id=self._descriptor.provider_id,
+                world_id=self.world_id,
+                details={"capability_id": RENDER_STATE_CAPABILITY_ID.value},
+            ) from None
+        if type(frame) is not RenderStateFrame:
+            raise ValidationError("operation requires a RenderStateFrame", operation=operation)
+
+        articulations: list[NativeRenderArticulationState] = []
+        for articulation_update in frame.articulations:
+            entity = self._validate_handle(articulation_update.handle, operation)
+            if entity.kind is not EntityKind.ARTICULATION:
+                raise CommandError("render state entity is not an articulation", operation=operation)
+            environments = self._indices(
+                articulation_update.environment_indices,
+                self._spec.environments.count,
+                "environment_indices",
+                operation=operation,
+            )
+            degrees = self._indices(
+                articulation_update.degree_of_freedom_indices,
+                len(entity.joint_names),
+                "degree_of_freedom_indices",
+                operation=operation,
+            )
+            expected = (len(environments), len(degrees))
+            if (
+                articulation_update.joint_positions.shape != expected
+                or articulation_update.joint_velocities.shape != expected
+            ):
+                raise CommandError(
+                    "render articulation state shape does not match its selections",
+                    operation=operation,
+                    entity_path=entity.path.value,
+                    details={"expected_shape": list(expected)},
+                )
+            root_values = (
+                articulation_update.root_positions_m,
+                articulation_update.root_orientations_xyzw,
+                articulation_update.root_linear_velocities_m_s,
+                articulation_update.root_angular_velocities_rad_s,
+            )
+            if any(value is not None for value in root_values):
+                if any(value is None for value in root_values):
+                    raise CommandError(
+                        "render articulation root pose and velocity must be supplied together",
+                        operation=operation,
+                        entity_path=entity.path.value,
+                    )
+                assert articulation_update.root_positions_m is not None
+                assert articulation_update.root_orientations_xyzw is not None
+                assert articulation_update.root_linear_velocities_m_s is not None
+                assert articulation_update.root_angular_velocities_rad_s is not None
+                if (
+                    articulation_update.root_positions_m.shape != (len(environments), 3)
+                    or articulation_update.root_orientations_xyzw.shape != (len(environments), 4)
+                    or articulation_update.root_linear_velocities_m_s.shape != (len(environments), 3)
+                    or articulation_update.root_angular_velocities_rad_s.shape != (len(environments), 3)
+                ):
+                    raise CommandError(
+                        "render articulation root state shape does not match its environment selection",
+                        operation=operation,
+                        entity_path=entity.path.value,
+                    )
+            articulations.append(
+                NativeRenderArticulationState(
+                    entity.path,
+                    tuple(
+                        tuple(float(value) for value in row)
+                        for row in articulation_update.joint_positions.rows()
+                    ),
+                    tuple(
+                        tuple(float(value) for value in row)
+                        for row in articulation_update.joint_velocities.rows()
+                    ),
+                    environments,
+                    degrees,
+                    None
+                    if articulation_update.root_positions_m is None
+                    else tuple(
+                        tuple(float(value) for value in row)
+                        for row in articulation_update.root_positions_m.rows()
+                    ),
+                    None
+                    if articulation_update.root_orientations_xyzw is None
+                    else tuple(
+                        tuple(float(value) for value in row)
+                        for row in articulation_update.root_orientations_xyzw.rows()
+                    ),
+                    None
+                    if articulation_update.root_linear_velocities_m_s is None
+                    else tuple(
+                        tuple(float(value) for value in row)
+                        for row in articulation_update.root_linear_velocities_m_s.rows()
+                    ),
+                    None
+                    if articulation_update.root_angular_velocities_rad_s is None
+                    else tuple(
+                        tuple(float(value) for value in row)
+                        for row in articulation_update.root_angular_velocities_rad_s.rows()
+                    ),
+                )
+            )
+
+        rigid_bodies: list[NativeRenderRigidBodyState] = []
+        for rigid_update in frame.rigid_bodies:
+            entity = self._validate_handle(rigid_update.handle, operation)
+            if entity.kind is not EntityKind.RIGID_BODY:
+                raise CommandError("render state entity is not a rigid body", operation=operation)
+            environments = self._indices(
+                rigid_update.environment_indices,
+                self._spec.environments.count,
+                "environment_indices",
+                operation=operation,
+            )
+            row_count = len(environments)
+            if (
+                rigid_update.positions_m.shape != (row_count, 3)
+                or rigid_update.orientations_xyzw.shape != (row_count, 4)
+                or rigid_update.linear_velocities_m_s.shape != (row_count, 3)
+                or rigid_update.angular_velocities_rad_s.shape != (row_count, 3)
+            ):
+                raise CommandError(
+                    "render rigid-body state shape does not match its environment selection",
+                    operation=operation,
+                    entity_path=entity.path.value,
+                )
+            rigid_bodies.append(
+                NativeRenderRigidBodyState(
+                    entity.path,
+                    tuple(tuple(float(value) for value in row) for row in rigid_update.positions_m.rows()),
+                    tuple(
+                        tuple(float(value) for value in row)
+                        for row in rigid_update.orientations_xyzw.rows()
+                    ),
+                    tuple(
+                        tuple(float(value) for value in row)
+                        for row in rigid_update.linear_velocities_m_s.rows()
+                    ),
+                    tuple(
+                        tuple(float(value) for value in row)
+                        for row in rigid_update.angular_velocities_rad_s.rows()
+                    ),
+                    environments,
+                )
+            )
+
+        particle_fluids: list[NativeRenderParticleFluidState] = []
+        for fluid_update in frame.particle_fluids:
+            entity = self._validate_handle(fluid_update.handle, operation)
+            if entity.kind is not EntityKind.PARTICLE_FLUID or entity.particle_fluid is None:
+                raise CommandError("render state entity is not a particle fluid", operation=operation)
+            environments = self._indices(
+                fluid_update.environment_indices,
+                self._spec.environments.count,
+                "environment_indices",
+                operation=operation,
+            )
+            particle_count = fluid_update.positions_m.shape[1]
+            if (
+                fluid_update.positions_m.shape != (len(environments), particle_count, 3)
+                or fluid_update.first_particle_index + particle_count > entity.particle_fluid.particle_count
+                or (
+                    fluid_update.velocities_m_s is not None
+                    and fluid_update.velocities_m_s.shape != fluid_update.positions_m.shape
+                )
+            ):
+                raise CommandError(
+                    "render particle-fluid state range or shape is invalid",
+                    operation=operation,
+                    entity_path=entity.path.value,
+                )
+            positions = fluid_update.positions_m
+            velocities = fluid_update.velocities_m_s
+            particle_fluids.append(
+                NativeRenderParticleFluidState(
+                    entity.path,
+                    positions
+                    if isinstance(positions, PackedFloat32Array)
+                    else cast(
+                        PointBatch,
+                        tuple(
+                            tuple(
+                                tuple(float(component) for component in point)
+                                for point in environment
+                            )
+                            for environment in positions.nested()
+                        ),
+                    ),
+                    None
+                    if velocities is None
+                    else velocities
+                    if isinstance(velocities, PackedFloat32Array)
+                    else cast(
+                        PointBatch,
+                        tuple(
+                            tuple(
+                                tuple(float(component) for component in point)
+                                for point in environment
+                            )
+                            for environment in velocities.nested()
+                        ),
+                    ),
+                    environments,
+                    fluid_update.first_particle_index,
+                )
+            )
+
+        native_frame = NativeRenderStateFrame(
+            tuple(articulations),
+            tuple(rigid_bodies),
+            tuple(particle_fluids),
+        )
+        self._native_call(operation, lambda: self._native.apply_render_state(native_frame))
+        self._pending_articulation_commands.clear()
+        self._render_state_revision += 1
+        self._scene_sequence += 1
+        return RenderStateResult(
+            generation=self.generation,
+            tick=self.tick,
+            state_revision=self._render_state_revision,
+            articulation_count=len(articulations),
+            rigid_body_count=len(rigid_bodies),
+            particle_fluid_count=len(particle_fluids),
+        )
 
     def apply_articulation_command(self, command: ArticulationCommand) -> None:
         operation = "world.apply_articulation_command"
