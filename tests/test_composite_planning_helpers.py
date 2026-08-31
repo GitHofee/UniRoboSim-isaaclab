@@ -14,10 +14,10 @@ from unirobosim import (
     EntityKind,
     EntityPath,
     EntitySpec,
+    ParticleFluidSpec,
     PlanningGeometryLocalPose,
     PlanningJointType,
     PlanningSceneIncompleteError,
-    ParticleFluidSpec,
     WorldSpec,
 )
 
@@ -25,6 +25,7 @@ from unirobosim_isaaclab.native_planning import (
     _bake_mesh_linear_transform,
     _compose_scaled_local_pose,
     _cylinder_pose_scale,
+    _effective_collision_relative_transform,
     _exact_filtered_pair_encoding,
     _MeshInput,
     _path_is_at_or_under,
@@ -93,6 +94,47 @@ def test_embedded_moving_subtree_matching_does_not_claim_anchor_siblings() -> No
     assert _path_is_at_or_under(f"{moving}/panel", moving)
     assert not _path_is_at_or_under("/World/env_0/room/mechanism/frame/panel", moving)
     assert not _path_is_at_or_under("/World/env_0/room/mechanism/doorway", moving)
+
+
+def test_effective_collision_transform_keeps_shared_ancestor_scale() -> None:
+    calls: list[object] = []
+
+    class _Matrix:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def RemoveScaleShear(self) -> _Matrix:
+            calls.append(("remove_scale_shear", self.name))
+            return _Matrix(f"pose({self.name})")
+
+        def GetInverse(self) -> _Matrix:
+            calls.append(("inverse", self.name))
+            return _Matrix(f"inverse({self.name})")
+
+        def __mul__(self, other: object) -> _Matrix:
+            assert isinstance(other, _Matrix)
+            calls.append(("multiply", self.name, other.name))
+            return _Matrix(f"{self.name}*{other.name}")
+
+    class _Cache:
+        def ComputeRelativeTransform(self, prim: object, owner: object) -> tuple[_Matrix, bool]:
+            calls.append(("relative_reset_check", prim, owner))
+            return _Matrix("scale-cancelling-relative"), False
+
+        def GetLocalToWorldTransform(self, value: object) -> _Matrix:
+            calls.append(("world", value))
+            return _Matrix("collision-world" if value == "collision" else "owner-world-with-scale")
+
+    result = _effective_collision_relative_transform(_Cache(), "collision", "owner")
+
+    assert result.name == "collision-world*inverse(pose(owner-world-with-scale))"
+    assert ("multiply", "collision-world", "inverse(pose(owner-world-with-scale))") in calls
+
+
+def test_effective_collision_transform_rejects_reset_stack() -> None:
+    cache = SimpleNamespace(ComputeRelativeTransform=lambda _prim, _owner: (object(), True))
+    with pytest.raises(NativePlanningError, match="collision_geometry_unsupported"):
+        _effective_collision_relative_transform(cache, object(), object())
 
 
 def test_triangle_mesh_canonicalization_preserves_winding_and_holes() -> None:

@@ -643,6 +643,26 @@ def _collision_pose_scale_bake(
     )
 
 
+def _effective_collision_relative_transform(cache: Any, prim: Any, owner_body: Any) -> Any:
+    """Keep ancestor scale while expressing collision geometry in the rigid pose frame.
+
+    ``ComputeRelativeTransform(prim, owner_body)`` cancels every transform shared by
+    the collision Prim and its rigid-body owner.  Isaac Lab authors an EntitySpec
+    scale on such a shared asset root, so using that relative transform silently
+    drops the physical entity scale from planning geometry.  Public rigid/link
+    states expose position and orientation, not scale; therefore collision geometry
+    must instead be relative to the owner's pose-only world transform.
+    """
+
+    _relative, resets = cache.ComputeRelativeTransform(prim, owner_body)
+    if resets:
+        raise NativePlanningError("collision_geometry_unsupported")
+    collision_world = cache.GetLocalToWorldTransform(prim)
+    owner_world = cache.GetLocalToWorldTransform(owner_body)
+    owner_pose_world = owner_world.RemoveScaleShear()
+    return collision_world * owner_pose_world.GetInverse()
+
+
 def _matrix_local_pose(modules: Any, matrix: Any) -> tuple[PlanningGeometryLocalPose, tuple[float, float, float]]:
     pose, scale, reflection = _matrix_pose_scale_reflection(modules, matrix)
     if reflection != (1, 1, 1):
@@ -1792,9 +1812,7 @@ class _PlanningAdmission:
     ) -> tuple[PlanningGeometryDescriptor, ...]:
         self._validate_collision_common(prim)
         cache = self._m.UsdGeom.XformCache()
-        matrix, resets = cache.ComputeRelativeTransform(prim, owner_body)
-        if resets:
-            raise NativePlanningError("collision_geometry_unsupported")
+        matrix = _effective_collision_relative_transform(cache, prim, owner_body)
         mesh_capable = not any(
             prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
         )
@@ -2315,9 +2333,11 @@ class _PlanningAdmission:
         motion: PlanningGeometryMotionClass | None = None,
     ) -> tuple[object, ...]:
         self._validate_collision_common(prim)
-        matrix, resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(prim, owner_body)
-        if resets:
-            raise NativePlanningError("collision_geometry_unsupported")
+        matrix = _effective_collision_relative_transform(
+            self._m.UsdGeom.XformCache(),
+            prim,
+            owner_body,
+        )
         mesh_capable = not any(
             prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
         )
