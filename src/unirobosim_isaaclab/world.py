@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from .provider import IsaacLabSession
 
 _T = TypeVar("_T")
+_NATIVE_DEBUG_OVERLAY_CAPABILITY_ID = CapabilityId("debug.sink.native_overlay@1")
 
 
 def _local_asset_path(uri: str) -> Path | None:
@@ -1077,6 +1078,7 @@ class IsaacLabWorld:
     def publish_debug(self, batch: DebugBatch) -> DebugPublishReport:
         operation = "world.publish_debug"
         self._ensure_ready(operation)
+        self._require_native_debug_overlay(operation)
         if not isinstance(batch, DebugBatch):
             raise ValidationError("publish requires a DebugBatch", operation=operation)
         if any(
@@ -1097,10 +1099,26 @@ class IsaacLabWorld:
     ) -> int:
         operation = "world.clear_debug"
         self._ensure_ready(operation)
+        self._require_native_debug_overlay(operation)
         for name, value in (("layer", layer), ("group", group), ("primitive_id", primitive_id)):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValidationError(f"debug {name} must be a non-empty string", operation=operation)
         return self._native_call(operation, lambda: self._native.clear_debug(layer, group, primitive_id))
+
+    def _require_native_debug_overlay(self, operation: str) -> None:
+        if self._descriptor.capabilities.get(_NATIVE_DEBUG_OVERLAY_CAPABILITY_ID) is not None:
+            return
+        raise UnsupportedCapabilityError(
+            "native debug overlays require rendering; use launch_profile='headless' for offscreen screenshots",
+            operation=operation,
+            backend_id=self._descriptor.provider_id,
+            world_id=self._spec.world_id,
+            details={
+                "capability": str(_NATIVE_DEBUG_OVERLAY_CAPABILITY_ID),
+                "unsupported_launch_profile": "headless-physics",
+                "offscreen_launch_profile": "headless",
+            },
+        ) from None
 
     def step(self, count: int = 1) -> Tick:
         self._ensure_ready("world.step")

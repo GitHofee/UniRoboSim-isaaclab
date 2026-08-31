@@ -854,7 +854,10 @@ def _compose(
         run_id="droid-equivalence-isaaclab",
         mark_scene_mutated=planning_raw._mark_scene_mutated,
     )
-    visualization_root = visualization_module._VisualizationRoot("droid-equivalence-isaaclab")
+    visualization_root = visualization_module._VisualizationRoot(
+        "droid-equivalence-isaaclab",
+        native_overlay_available=projection.launch_profile != "headless-physics",
+    )
     kernel = runtime.RuntimeKernel(
         plan,
         adapter,

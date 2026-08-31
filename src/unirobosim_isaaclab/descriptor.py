@@ -250,25 +250,6 @@ CAPABILITIES = CapabilitySet(
             FrozenMap({"frame": "environment-local-world", "modes": ["position", "velocity"]}),
             limitations=("commands synchronize through native USD particle state; force mode is unsupported",),
         ),
-        CapabilityDeclaration(
-            CapabilityId("debug.sink.native_overlay@1"),
-            FrozenMap(
-                {
-                    "frame": "environment-local-world",
-                    "primitives": [
-                        "point_set",
-                        "line_list",
-                        "coordinate_axes",
-                        "text",
-                        "bounding_box",
-                        "trajectory",
-                    ],
-                    "stable_ids": True,
-                    "stable_key": "layer-group-id",
-                    "text_fallback": "ascii-vector-strokes-or-question-mark",
-                }
-            ),
-        ),
         CapabilityDeclaration(CapabilityId("scene.snapshot@1")),
         CapabilityDeclaration(CapabilityId("scene.delta@1")),
         CapabilityDeclaration(CapabilityId("scene.command.pose@1")),
@@ -326,6 +307,30 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
     )
+)
+
+DEBUG_RENDER_CAPABILITIES = (
+    CapabilityDeclaration(
+        CapabilityId("debug.sink.native_overlay@1"),
+        FrozenMap(
+            {
+                "frame": "environment-local-world",
+                "primitives": [
+                    "point_set",
+                    "line_list",
+                    "coordinate_axes",
+                    "text",
+                    "bounding_box",
+                    "trajectory",
+                ],
+                "stable_ids": True,
+                "stable_key": "layer-group-id",
+                "text_fallback": "ascii-vector-strokes-or-question-mark",
+                "offscreen": True,
+            }
+        ),
+        limitations=("requires a render-capable launch profile; headless-physics is unsupported",),
+    ),
 )
 
 CAMERA_CAPABILITIES = (
@@ -393,10 +398,15 @@ DESCRIPTOR = ProviderDescriptor(
 
 
 def descriptor_for_config(config: object) -> ProviderDescriptor:
-    """Expose camera capabilities only for a launch profile that can render them."""
+    """Expose render-backed capabilities only for profiles that can provide them."""
 
-    if bool(getattr(config, "enable_cameras", False)) and bool(getattr(config, "render", False)):
-        capabilities = CapabilitySet((*CAPABILITIES, *CAMERA_CAPABILITIES))
+    render = bool(getattr(config, "render", False))
+    enable_cameras = bool(getattr(config, "enable_cameras", False))
+    extras = (*DEBUG_RENDER_CAPABILITIES,) if render else ()
+    if render and enable_cameras:
+        extras = (*extras, *CAMERA_CAPABILITIES)
+    if extras:
+        capabilities = CapabilitySet((*CAPABILITIES, *extras))
         anti_aliasing = str(getattr(config, "anti_aliasing", "fxaa"))
         texture_streaming = bool(getattr(config, "texture_streaming", False))
         render_on_step = bool(getattr(config, "render_on_step", True))

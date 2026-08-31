@@ -118,6 +118,12 @@ The complete public profile contract is:
 | `headless-physics` | Headless, cameras and rendering disabled |
 | `visible` | Visible Kit window, cameras enabled, rendering enabled |
 
+Use `headless` for offscreen debug capture. It loads no desktop window, but native
+debug points, lines, frames, labels, boxes, and paths are rendered into scene-camera
+images. `headless-physics` deliberately has no renderer and therefore does not
+advertise the native-overlay capability; an attempted draw reports an actionable
+unsupported-capability error instead of failing inside an Isaac plugin.
+
 Values are case-sensitive. Any other value fails before the Isaac SDK is loaded.
 The adapter does not infer a profile from `DISPLAY`, so batch behavior is stable across
 machines. This selector applies only to normal installed entry-point discovery;

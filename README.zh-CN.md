@@ -111,6 +111,11 @@ UNIROBOSIM_ISAACLAB_LAUNCH_PROFILE=visible python run_simulation.py
 | `headless-physics` | 无头，相机关闭，渲染关闭 |
 | `visible` | 显示 Kit 窗口，相机开启，渲染开启 |
 
+离屏调试截图应使用 `headless`。该档位不创建桌面窗口，但点、线、坐标系、标签、
+包围盒和路径等原生调试图元会进入场景相机画面。`headless-physics` 明确不启动渲染器，
+因此也不会声明原生 Overlay 能力；误调用时会返回可操作的“不支持”错误，而不会再在
+Isaac 插件内部崩溃。
+
 值区分大小写，其他值会在 Isaac SDK 加载前被拒绝。Adapter 不根据 `DISPLAY`
 自动推断档位，因此同一批处理任务在不同机器上的默认行为一致。这个选择器只作用于
 正常的已安装入口发现；`create_provider(IsaacLabAdapterConfig(...))` 仍是显式的

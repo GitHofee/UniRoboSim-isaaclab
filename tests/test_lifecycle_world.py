@@ -7,6 +7,7 @@ import pytest
 from unirobosim import (
     ArrayValue,
     ArticulationCommand,
+    BoxGeometrySpec,
     CameraModality,
     CameraSpec,
     CapabilityId,
@@ -806,6 +807,36 @@ def test_camera_and_debug_endpoints_are_strict_and_backend_neutral() -> None:
         world.publish_debug(DebugBatch((out_of_range,)))
     with pytest.raises(ValidationError):
         world.clear_debug(layer="")
+    session.close()
+
+
+def test_physics_only_world_rejects_native_debug_before_touching_the_sdk() -> None:
+    runtime = FakeNativeRuntime()
+    provider, session = open_test_session(runtime)
+    world = session.build(
+        WorldSpec(
+            "physics-only-debug",
+            (EntitySpec(EntityPath("/box"), EntityKind.RIGID_BODY, box=BoxGeometrySpec()),),
+            environments=EnvironmentSpec(1),
+        )
+    )
+    primitive = DebugPrimitive(
+        "goal",
+        "planning",
+        DebugPrimitiveKind.POINT_SET,
+        ArrayValue.from_nested([[[0.0, 0.0, 0.0]]]),
+        (0,),
+    )
+
+    with pytest.raises(UnsupportedCapabilityError, match="launch_profile='headless'") as publish_error:
+        world.publish_debug(DebugBatch((primitive,)))
+    assert publish_error.value.operation == "world.publish_debug"
+    assert publish_error.value.details["offscreen_launch_profile"] == "headless"
+
+    with pytest.raises(UnsupportedCapabilityError, match="launch_profile='headless'") as clear_error:
+        world.clear_debug(layer="planning")
+    assert clear_error.value.operation == "world.clear_debug"
+    assert runtime.worlds[0].calls == []
     session.close()
 
 

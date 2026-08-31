@@ -34,7 +34,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.7"
+    assert unirobosim_isaaclab.__version__ == "0.10.8"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -55,7 +55,7 @@ def test_public_identity_and_protocol() -> None:
     assert fluid_state is not None
     assert any("raw USD/Omni Physics" in limitation for limitation in fluid_state.limitations)
     assert any("particle reaction loads" in limitation for limitation in fluid_state.limitations)
-    assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("debug.sink.native_overlay@1")) is None
     assert CAPABILITIES.get(CapabilityId("scene.snapshot@1")) is not None
     assert CAPABILITIES.get(CapabilityId("scene.delta@1")) is not None
     pose_command = CAPABILITIES.get(CapabilityId("scene.command.pose@1"))
@@ -93,6 +93,10 @@ def test_public_identity_and_protocol() -> None:
     assert camera_provider.descriptor is not DESCRIPTOR
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.rgb@1")) is not None
     assert camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera.normals@1")) is not None
+    native_debug = camera_provider.descriptor.capabilities.get(CapabilityId("debug.sink.native_overlay@1"))
+    assert native_debug is not None
+    assert native_debug.properties["offscreen"] is True
+    assert any("headless-physics" in limitation for limitation in native_debug.limitations)
     assert camera_provider.descriptor.capabilities.get(CapabilityId("scene.command.pose@1")) is pose_command
     assert camera_provider.descriptor.capabilities.get(CapabilityId("scene.command.drag@1")) is drag_command
     camera_profile = camera_provider.descriptor.capabilities.get(CapabilityId("sensor.camera@1"))
@@ -103,6 +107,8 @@ def test_public_identity_and_protocol() -> None:
     assert camera_provider.descriptor.metadata["render_on_step"] is True
     assert camera_provider.descriptor.metadata["max_render_hz"] is None
     assert camera_provider.descriptor.metadata["fluid_render_mode"] == "particles"
+    physics_only = unirobosim_isaaclab.create_easy_provider(launch_profile="headless-physics")
+    assert physics_only.descriptor.capabilities.get(CapabilityId("debug.sink.native_overlay@1")) is None
     control = CAPABILITIES.get(CapabilityId("control.deformable.points@1"))
     assert control is not None
     assert control.properties == FrozenMap(
