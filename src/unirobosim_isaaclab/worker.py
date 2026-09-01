@@ -31,6 +31,7 @@ from .native_protocols import (
     NativeCameraCalibration,
     NativeEncodedSensorFrame,
     NativeEncodedSensorRequest,
+    NativeEntityPrimState,
     NativeKinematicState,
     NativePhysicsDiagnostics,
     NativePlanningCatalog,
@@ -54,7 +55,7 @@ _STARTUP_ATTEMPTS = 2
 _SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _WORKER_HANDSHAKE_SCHEMA = "unirobosim-isaaclab-worker-startup/2"
 _WORKER_PROGRESS_SCHEMA = "unirobosim-isaaclab-worker-progress/1"
-_WORKER_PROTOCOL_VERSION = 4
+_WORKER_PROTOCOL_VERSION = 5
 _PACKED_RGB_BATCH_STATUS = "packed_rgb_batch"
 _SHARED_RGB_BATCH_STATUS = "shared_rgb_batch"
 _SHARED_STEP_STATE_RGB_STATUS = "shared_step_state_rgb"
@@ -456,8 +457,10 @@ def _dispatch(
         return active, None, False
     if operation == "read_rigid_body":
         return active, active.read_rigid_body(cast(EntityPath, args[0])), False
-    if operation == "set_rigid_body_pose":
-        active.set_rigid_body_pose(
+    if operation == "read_entity_prim_states":
+        return active, active.read_entity_prim_states(cast(tuple[EntityPath, ...], args[0])), False
+    if operation == "set_entity_prim_pose":
+        active.set_entity_prim_pose(
             cast(EntityPath, args[0]),
             cast(Vector3, args[1]),
             cast(Quaternion, args[2]),
@@ -1166,16 +1169,26 @@ class IsaacLabWorkerWorld:
             self._runtime._request("read_rigid_body", path),
         )
 
-    def set_rigid_body_pose(
+    def read_entity_prim_states(
+        self,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[NativeEntityPrimState, ...], ...]:
+        self._ensure_open("read_entity_prim_states")
+        return cast(
+            tuple[tuple[NativeEntityPrimState, ...], ...],
+            self._runtime._request("read_entity_prim_states", paths),
+        )
+
+    def set_entity_prim_pose(
         self,
         path: EntityPath,
         position_m: Vector3,
         orientation_xyzw: Quaternion,
         environment_index: int,
     ) -> None:
-        self._ensure_open("set_rigid_body_pose")
+        self._ensure_open("set_entity_prim_pose")
         self._runtime._request(
-            "set_rigid_body_pose",
+            "set_entity_prim_pose",
             path,
             position_m,
             orientation_xyzw,

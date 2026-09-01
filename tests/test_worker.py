@@ -351,9 +351,9 @@ def test_worker_startup_fingerprint_is_exact_and_versioned() -> None:
     fingerprint = _worker_startup_fingerprint()
     assert worker_bootstrap_module._WORKER_PROGRESS_SCHEMA == worker_module._WORKER_PROGRESS_SCHEMA
     assert fingerprint["schema"] == "unirobosim-isaaclab-worker-startup/2"
-    assert fingerprint["worker_protocol"] == 4
+    assert fingerprint["worker_protocol"] == 5
     assert fingerprint["adapter"] == {
-        "version": "0.10.11",
+        "version": "0.10.12",
         "origin": str(Path(worker_module.__file__).resolve().parent / "__init__.py"),
     }
     core = cast(dict[str, object], fingerprint["core"])
@@ -470,7 +470,7 @@ def test_dispatches_complete_native_world_protocol(tmp_path: Path) -> None:
     world, _, _ = _dispatch(
         runtime,
         world,
-        ("set_rigid_body_pose", (EntityPath("/props/marker"), (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 1)),
+        ("set_entity_prim_pose", (EntityPath("/props/marker"), (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 1)),
     )
     world, moved, _ = _dispatch(runtime, world, ("read_rigid_body", (EntityPath("/props/marker"),)))
     assert moved[0][1] == (1.0, 2.0, 3.0)
@@ -644,7 +644,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         rigid_zeros,
         rigid_zeros,
     )
-    world.set_rigid_body_pose(EntityPath("/props/marker"), (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 1)
+    world.set_entity_prim_pose(EntityPath("/props/marker"), (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), 1)
     assert world.read_contact(EntityPath("/props/marker")) == contacts
     world.apply_deformable_position(EntityPath("/soft/jelly"), (((0.0, 0.0, 1.0),),), (0,), (0,))
     assert world.read_deformable(EntityPath("/soft/jelly")) == (points, zeros)
@@ -675,7 +675,7 @@ def test_worker_runtime_and_world_proxy_complete_protocol(tmp_path: Path) -> Non
         "read_articulation",
         "apply_rigid_body_wrench",
         "read_rigid_body",
-        "set_rigid_body_pose",
+        "set_entity_prim_pose",
         "read_contact",
         "apply_deformable_position",
         "read_deformable",

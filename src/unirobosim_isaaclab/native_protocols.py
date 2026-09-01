@@ -98,6 +98,15 @@ class NativeKinematicState:
     angular_velocity_rad_s: Vector3
 
 
+@dataclass(frozen=True, slots=True)
+class NativeEntityPrimState:
+    """World state of the imported entity asset-root Prim, not a root link."""
+
+    pose: Pose
+    linear_velocity_m_s: Vector3 = (0.0, 0.0, 0.0)
+    angular_velocity_rad_s: Vector3 = (0.0, 0.0, 0.0)
+
+
 class NativePlanningError(RuntimeError):
     """Bounded private failure transported across the native worker seam."""
 
@@ -281,7 +290,12 @@ class NativeWorldDriver(Protocol):
 
     def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]: ...
 
-    def set_rigid_body_pose(
+    def read_entity_prim_states(
+        self,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[NativeEntityPrimState, ...], ...]: ...
+
+    def set_entity_prim_pose(
         self,
         path: EntityPath,
         position_m: Vector3,

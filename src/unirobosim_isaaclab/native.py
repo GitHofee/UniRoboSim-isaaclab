@@ -42,6 +42,7 @@ from .native_protocols import (
     NativeArticulationCommand,
     NativeCameraCalibration,
     NativeDebugReport,
+    NativeEntityPrimState,
     NativeKinematicState,
     NativePhysicsDiagnostics,
     NativeRenderArticulationState,
@@ -1072,6 +1073,8 @@ class IsaacLabNativeWorld:
         self._usd_rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
         self._kinematic_rigids: dict[EntityPath, bool] = {}
         self._entity_specs = {entity.path: entity for entity in spec.entities}
+        self._entity_prim_path_cache: dict[tuple[EntityPath, int], str] = {}
+        self._entity_prim_physical_root_cache: dict[tuple[EntityPath, int], bool] = {}
         self._runtime_attachments: dict[tuple[int, str], _RuntimeAttachment] = {}
         self._static_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
         self._composite_scene_roots: dict[EntityPath, tuple[str, ...]] = {}
@@ -1104,6 +1107,7 @@ class IsaacLabNativeWorld:
         self._initial_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
         self._articulation_control_modes: dict[EntityPath, list[list[CommandMode | None]]] = {}
         self._initial_rigid: dict[EntityPath, tuple[Any, Any]] = {}
+        self._initial_entity_prim_poses: dict[EntityPath, tuple[Pose, ...]] = {}
         self._initial_deformable: dict[EntityPath, tuple[Any, Any | None]] = {}
         self._origins_cpu = _environment_origins(spec.environments.count, config.environment_spacing_m)
         self._origins: Any | None = None
@@ -1345,6 +1349,14 @@ class IsaacLabNativeWorld:
         self._initialize_rigids()
         self._initialize_deformables()
         self.reset(tuple(range(self._spec.environments.count)))
+        self._initial_entity_prim_poses = {
+            path: tuple(state.pose for state in row)
+            for path, row in zip(
+                tuple(entity.path for entity in self._spec.entities),
+                self.read_entity_prim_states(tuple(entity.path for entity in self._spec.entities)),
+                strict=True,
+            )
+        }
         if self._cameras:
             self._ensure_camera_render()
             for camera in self._cameras.values():
@@ -2673,6 +2685,10 @@ class IsaacLabNativeWorld:
                 fluid_set.points.GetVelocitiesAttr().Set(self._m.Vt.Vec3fArray(fluid_set.initial_velocities))
         for camera in self._cameras.values():
             camera.reset(env_ids=env_ids)
+        for path, poses in getattr(self, "_initial_entity_prim_poses", {}).items():
+            for environment in environment_indices:
+                if not self._entity_prim_is_physical_root(path, environment):
+                    self._write_entity_prim_pose(path, environment, poses[environment])
         reset_debug_keys = tuple(
             key for key, mode in self._debug_lifetimes.items() if mode is not DebugLifetimeMode.MANUAL
         )
@@ -3478,7 +3494,178 @@ class IsaacLabNativeWorld:
             for values in (positions, orientations, linear_velocities, angular_velocities)
         )  # type: ignore[return-value]
 
-    def set_rigid_body_pose(
+    def _entity_prim_path(self, path: EntityPath, environment_index: int) -> str:
+        key = (path, environment_index)
+        cached = self._entity_prim_path_cache.get(key)
+        if cached is not None:
+            return cached
+        entity = self._entity_specs.get(path)
+        if entity is None:
+            raise KeyError(f"entity {path.value!r} does not exist")
+        if not 0 <= environment_index < self._spec.environments.count:
+            raise IndexError("entity Prim environment index is out of range")
+        binding = entity.embedded_binding
+        if binding is None:
+            result = f"/World/env_{environment_index}/{_native_name(path)}"
+            self._entity_prim_path_cache[key] = result
+            return result
+        roots = self._composite_scene_roots.get(binding.container_path)
+        if roots is None or environment_index >= len(roots):
+            raise KeyError(f"embedded entity container for {path.value!r} is unavailable")
+        relative_paths = tuple(
+            item.relative_prim_path for item in (*binding.link_prims, *binding.joint_prims)
+        )
+        parts = tuple(relative.split("/") for relative in relative_paths)
+        common: list[str] = []
+        for values in zip(*parts, strict=False):
+            if len(set(values)) != 1:
+                break
+            common.append(values[0])
+        if not common:
+            raise ValueError(f"embedded entity {path.value!r} has no distinct common USD Prim")
+        result = f"{roots[environment_index]}/{'/'.join(common)}"
+        self._entity_prim_path_cache[key] = result
+        return result
+
+    def _entity_prim_is_physical_root(self, path: EntityPath, environment_index: int) -> bool:
+        key = (path, environment_index)
+        cached = self._entity_prim_physical_root_cache.get(key)
+        if cached is not None:
+            return cached
+        entity = self._entity_specs[path]
+        if entity.kind not in {EntityKind.RIGID_BODY, EntityKind.ARTICULATION}:
+            self._entity_prim_physical_root_cache[key] = False
+            return False
+        try:
+            result = self._entity_prim_path(path, environment_index) == self._attachment_body_path(
+                path, None, environment_index
+            )
+        except (KeyError, ValueError):
+            result = False
+        self._entity_prim_physical_root_cache[key] = result
+        return result
+
+    def _read_usd_entity_prim_pose(self, path: EntityPath, environment_index: int) -> Pose:
+        stage = self._m.sim_utils.get_current_stage()
+        prim_path = self._entity_prim_path(path, environment_index)
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid() or not self._m.UsdGeom.Xformable(prim):
+            raise ValueError(f"entity USD Prim is absent or not transformable: {prim_path}")
+        matrix = self._m.UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+        translation = matrix.ExtractTranslation()
+        rotation = matrix.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+        origin = self._origins_cpu[environment_index]
+        return Pose(
+            tuple(float(translation[index]) - float(origin[index]) for index in range(3)),  # type: ignore[arg-type]
+            (
+                float(imaginary[0]),
+                float(imaginary[1]),
+                float(imaginary[2]),
+                float(rotation.GetReal()),
+            ),
+        )
+
+    def _write_entity_prim_pose(self, path: EntityPath, environment_index: int, pose: Pose) -> None:
+        stage = self._m.sim_utils.get_current_stage()
+        prim_path = self._entity_prim_path(path, environment_index)
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid() or not self._m.UsdGeom.Xformable(prim):
+            raise ValueError(f"entity USD Prim is absent or not transformable: {prim_path}")
+        self._m.sim_utils.standardize_xform_ops(prim)
+        parent = prim.GetParent()
+        origin = self._origins_cpu[environment_index]
+        absolute_position = tuple(float(pose.position[index]) + float(origin[index]) for index in range(3))
+        desired = self._m.Gf.Matrix4d(1.0)
+        desired.SetRotateOnly(
+            self._m.Gf.Quatd(
+                float(pose.orientation_xyzw[3]),
+                self._m.Gf.Vec3d(*pose.orientation_xyzw[:3]),
+            )
+        )
+        desired.SetTranslateOnly(self._m.Gf.Vec3d(*absolute_position))
+        if parent and parent.IsValid() and str(parent.GetPath()) != "/":
+            parent_world = self._m.UsdGeom.XformCache().GetLocalToWorldTransform(parent)
+            local = desired * parent_world.GetInverse()
+        else:
+            local = desired
+        translation = local.ExtractTranslation()
+        rotation = local.ExtractRotationQuat()
+        translate_attribute = prim.GetAttribute("xformOp:translate")
+        orient_attribute = prim.GetAttribute("xformOp:orient")
+        if not translate_attribute or not orient_attribute:
+            raise ValueError(f"entity USD Prim has no standardized pose attributes: {prim_path}")
+        translate_attribute.Set(translation)
+        orientation_value = orient_attribute.Get()
+        imaginary = rotation.GetImaginary()
+        if isinstance(orientation_value, self._m.Gf.Quatf):
+            orientation = self._m.Gf.Quatf(
+                float(rotation.GetReal()),
+                self._m.Gf.Vec3f(float(imaginary[0]), float(imaginary[1]), float(imaginary[2])),
+            )
+        elif isinstance(orientation_value, self._m.Gf.Quath):
+            orientation = self._m.Gf.Quath(
+                float(rotation.GetReal()),
+                self._m.Gf.Vec3h(float(imaginary[0]), float(imaginary[1]), float(imaginary[2])),
+            )
+        else:
+            orientation = rotation
+        orient_attribute.Set(orientation)
+
+    def read_entity_prim_states(
+        self,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[NativeEntityPrimState, ...], ...]:
+        result: list[tuple[NativeEntityPrimState, ...]] = []
+        for path in paths:
+            if path not in self._entity_specs:
+                raise KeyError(f"entity {path.value!r} does not exist")
+            entity = self._entity_specs[path]
+            physical_root = tuple(
+                self._entity_prim_is_physical_root(path, environment)
+                for environment in range(self._spec.environments.count)
+            )
+            rigid_state = (
+                self.read_rigid_body(path)
+                if entity.kind is EntityKind.RIGID_BODY and any(physical_root)
+                else None
+            )
+            row: list[NativeEntityPrimState] = []
+            for environment in range(self._spec.environments.count):
+                if physical_root[environment]:
+                    if entity.kind is EntityKind.ARTICULATION:
+                        state = self.read_selected_kinematics(
+                            (KinematicTarget("entity-prim", path, None),), environment
+                        )[0]
+                        pose = Pose(state.position_m, state.orientation_xyzw)
+                        linear = state.linear_velocity_m_s
+                        angular = state.angular_velocity_rad_s
+                    else:
+                        assert rigid_state is not None
+                        positions, orientations, linear_rows, angular_rows = rigid_state
+                        position_row = positions[environment]
+                        orientation_row = orientations[environment]
+                        linear_row = linear_rows[environment]
+                        angular_row = angular_rows[environment]
+                        pose = Pose(
+                            (float(position_row[0]), float(position_row[1]), float(position_row[2])),
+                            (
+                                float(orientation_row[0]),
+                                float(orientation_row[1]),
+                                float(orientation_row[2]),
+                                float(orientation_row[3]),
+                            ),
+                        )
+                        linear = (float(linear_row[0]), float(linear_row[1]), float(linear_row[2]))
+                        angular = (float(angular_row[0]), float(angular_row[1]), float(angular_row[2]))
+                else:
+                    pose = self._read_usd_entity_prim_pose(path, environment)
+                    linear = angular = (0.0, 0.0, 0.0)
+                row.append(NativeEntityPrimState(pose, linear, angular))
+            result.append(tuple(row))
+        return tuple(result)
+
+    def _set_physical_rigid_body_pose(
         self,
         path: EntityPath,
         position_m: Vector3,
@@ -3519,6 +3706,88 @@ class IsaacLabNativeWorld:
                 self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
                 env_ids,
                 kinematic=self._kinematic_rigids[path],
+            )
+
+    def set_rigid_body_pose(
+        self,
+        path: EntityPath,
+        position_m: Vector3,
+        orientation_xyzw: tuple[float, float, float, float],
+        environment_index: int,
+    ) -> None:
+        """Private physical-body helper retained for adapter unit tests.
+
+        Entity-level callers must use :meth:`set_entity_prim_pose`.
+        """
+
+        self._set_physical_rigid_body_pose(path, position_m, orientation_xyzw, environment_index)
+        assert self._sim is not None
+        self._sim.forward()
+        self._update_assets(0.0)
+        self._sync_all_mounted_cameras()
+        self._invalidate_render()
+
+    def _set_physical_articulation_root_pose(
+        self,
+        path: EntityPath,
+        pose: Pose,
+        environment_index: int,
+    ) -> None:
+        if path in self._usd_articulation_views:
+            view = self._usd_articulation_views[path]
+            transforms = view.get_root_transforms().clone()
+            origin = self._m.torch.tensor(
+                self._origins_cpu[environment_index], device=transforms.device, dtype=transforms.dtype
+            )
+            transforms[environment_index, :3] = (
+                self._m.torch.tensor(pose.position, device=transforms.device, dtype=transforms.dtype) + origin
+            )
+            transforms[environment_index, 3:] = self._m.torch.tensor(
+                pose.orientation_xyzw, device=transforms.device, dtype=transforms.dtype
+            )
+            indices = self._m.torch.tensor((environment_index,), device=transforms.device, dtype=self._m.torch.int64)
+            view.set_root_transforms(transforms[indices], indices)
+            view.set_root_velocities(
+                self._m.torch.zeros((1, 6), device=transforms.device, dtype=transforms.dtype), indices
+            )
+            return
+        asset = self._articulations[path]
+        assert self._sim is not None and self._origins is not None
+        root_pose = self._m.torch.tensor(
+            ((*pose.position, *pose.orientation_xyzw),), device=self._sim.device, dtype=self._m.torch.float32
+        )
+        root_pose[:, :3] += self._origins[environment_index : environment_index + 1]
+        env_ids = self._m.torch.tensor((environment_index,), device=self._sim.device, dtype=self._m.torch.int64)
+        asset.write_root_pose_to_sim_index(root_pose=root_pose, env_ids=env_ids)
+        asset.write_root_velocity_to_sim_index(
+            root_velocity=self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
+            env_ids=env_ids,
+        )
+
+    def set_entity_prim_pose(
+        self,
+        path: EntityPath,
+        position_m: Vector3,
+        orientation_xyzw: tuple[float, float, float, float],
+        environment_index: int,
+    ) -> None:
+        entity = self._entity_specs.get(path)
+        if entity is None or entity.kind not in {EntityKind.RIGID_BODY, EntityKind.ARTICULATION}:
+            raise ValueError("entity Prim pose can be set only for a rigid body or articulation")
+        target = Pose(position_m, orientation_xyzw)
+        old_entity = self.read_entity_prim_states((path,))[0][environment_index].pose
+        old_physical_root = self._attachment_endpoint_pose(path, None, environment_index)
+        target_physical_root = _compose_pose(target, _relative_pose(old_entity, old_physical_root))
+        if not self._entity_prim_is_physical_root(path, environment_index):
+            self._write_entity_prim_pose(path, environment_index, target)
+        if entity.kind is EntityKind.ARTICULATION:
+            self._set_physical_articulation_root_pose(path, target_physical_root, environment_index)
+        else:
+            self._set_physical_rigid_body_pose(
+                path,
+                target_physical_root.position,
+                target_physical_root.orientation_xyzw,
+                environment_index,
             )
         assert self._sim is not None
         self._sim.forward()
@@ -4305,6 +4574,9 @@ class IsaacLabNativeWorld:
         self._initial_articulation_gains.clear()
         self._articulation_control_modes.clear()
         self._initial_rigid.clear()
+        self._initial_entity_prim_poses.clear()
+        self._entity_prim_path_cache.clear()
+        self._entity_prim_physical_root_cache.clear()
         self._initial_deformable.clear()
         try:
             if sim is not None:

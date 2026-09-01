@@ -27,6 +27,7 @@ from unirobosim_isaaclab.native_protocols import (
     Matrix,
     NativeArticulationCommand,
     NativeCameraCalibration,
+    NativeEntityPrimState,
     NativeKinematicState,
     NativePhysicsDiagnostics,
     NativeRenderStateFrame,
@@ -103,6 +104,17 @@ class FakeNativeWorld:
             entity.path: [((0.0, 0.0, 1.0), entity.pose.orientation_xyzw) for _ in range(spec.environments.count)]
             for entity in spec.entities
             if entity.kind is EntityKind.RIGID_BODY
+        }
+        self.entity_prim_poses = {
+            entity.path: [
+                (
+                    Pose((0.0, 0.0, 1.0), entity.pose.orientation_xyzw)
+                    if entity.kind is EntityKind.RIGID_BODY
+                    else entity.pose
+                )
+                for _ in range(spec.environments.count)
+            ]
+            for entity in spec.entities
         }
         self.attachments: dict[tuple[int, str], EntityPath] = {}
 
@@ -196,15 +208,28 @@ class FakeNativeWorld:
             tuple((0.0, 0.0, 0.0) for _ in range(count)),
         )
 
-    def set_rigid_body_pose(
+    def read_entity_prim_states(
+        self,
+        paths: tuple[EntityPath, ...],
+    ) -> tuple[tuple[NativeEntityPrimState, ...], ...]:
+        self.calls.append(("read_entity_prim_states", paths))
+        return tuple(
+            tuple(NativeEntityPrimState(pose) for pose in self.entity_prim_poses[path])
+            for path in paths
+        )
+
+    def set_entity_prim_pose(
         self,
         path: EntityPath,
         position_m: tuple[float, float, float],
         orientation_xyzw: tuple[float, float, float, float],
         environment_index: int,
     ) -> None:
-        self.calls.append(("set_rigid_body_pose", (path, position_m, orientation_xyzw, environment_index)))
-        self.rigid_poses[path][environment_index] = (position_m, orientation_xyzw)
+        self.calls.append(("set_entity_prim_pose", (path, position_m, orientation_xyzw, environment_index)))
+        pose = Pose(position_m, orientation_xyzw)
+        self.entity_prim_poses[path][environment_index] = pose
+        if path in self.rigid_poses:
+            self.rigid_poses[path][environment_index] = (position_m, orientation_xyzw)
 
     def attach_rigid_body(
         self,

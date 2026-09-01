@@ -76,6 +76,7 @@ from .native_protocols import (
     NativeCameraCalibration,
     NativeEncodedSensorFrame,
     NativeEncodedSensorRequest,
+    NativeEntityPrimState,
     NativeKinematicState,
     NativeRenderArticulationState,
     NativeRenderParticleFluidState,
@@ -1451,47 +1452,53 @@ class IsaacLabWorld:
             color = (0.2, 0.85, 0.45, 0.9)
         return SceneVisual("body", SceneVisualKind.BOX, dimensions_m=dimensions, color_rgba=color)
 
-    def _rigid_pose(self, path: EntityPath, environment: int) -> Pose:
-        state = self.read_rigid_body(self.resolve(path))
-        return Pose(
-            tuple(float(value) for value in state.positions_m.rows()[environment]),  # type: ignore[arg-type]
-            tuple(float(value) for value in state.orientations_xyzw.rows()[environment]),  # type: ignore[arg-type]
+    def _entity_prim_pose(self, path: EntityPath, environment: int) -> Pose:
+        rows = self._native_call(
+            "world.scene.entity_prim_state",
+            lambda: self._native.read_entity_prim_states((path,)),
+            entity_path=path.value,
         )
+        return rows[0][environment].pose
 
     def _scene_entities(self) -> tuple[SceneEntityState, ...]:
         result: list[SceneEntityState] = []
-        for entity in self._spec.entities:
-            rigid_state = (
-                self.read_rigid_body(self.resolve(entity.path)) if entity.kind is EntityKind.RIGID_BODY else None
+        paths = tuple(entity.path for entity in self._spec.entities)
+        prim_rows = self._native_call(
+            "world.scene_snapshot.entity_prim_states",
+            lambda: self._native.read_entity_prim_states(paths),
+        )
+        if len(prim_rows) != len(paths) or any(
+            len(row) != self._spec.environments.count
+            or any(not isinstance(item, NativeEntityPrimState) for item in row)
+            for row in prim_rows
+        ):
+            raise UniRoboSimError(
+                "native entity Prim state batch shape is invalid",
+                operation="world.scene_snapshot",
             )
+        prim_by_path = dict(zip(paths, prim_rows, strict=True))
+        for entity in self._spec.entities:
             articulation_state = (
                 self.read_articulation(self.resolve(entity.path)) if entity.kind is EntityKind.ARTICULATION else None
             )
             for environment in range(self._spec.environments.count):
-                if rigid_state is not None:
-                    pose = Pose(
-                        tuple(float(value) for value in rigid_state.positions_m.rows()[environment]),  # type: ignore[arg-type]
-                        tuple(float(value) for value in rigid_state.orientations_xyzw.rows()[environment]),  # type: ignore[arg-type]
-                    )
-                    linear = tuple(float(value) for value in rigid_state.linear_velocities_m_s.rows()[environment])
-                    angular = tuple(float(value) for value in rigid_state.angular_velocities_rad_s.rows()[environment])
-                    joints: tuple[float, ...] = ()
-                else:
-                    pose = entity.pose
-                    linear = angular = (0.0, 0.0, 0.0)
-                    joints = (
-                        ()
-                        if articulation_state is None
-                        else tuple(float(value) for value in articulation_state.joint_positions.rows()[environment])
-                    )
+                prim_state = prim_by_path[entity.path][environment]
+                pose = prim_state.pose
+                linear = prim_state.linear_velocity_m_s
+                angular = prim_state.angular_velocity_rad_s
+                joints = (
+                    ()
+                    if articulation_state is None
+                    else tuple(float(value) for value in articulation_state.joint_positions.rows()[environment])
+                )
                 result.append(
                     SceneEntityState(
                         entity.path,
                         entity.kind,
                         environment,
                         pose,
-                        linear,  # type: ignore[arg-type]
-                        angular,  # type: ignore[arg-type]
+                        linear,
+                        angular,
                         entity.joint_names,
                         joints,
                         (self._proxy_visual(entity),),
@@ -1561,10 +1568,10 @@ class IsaacLabWorld:
             del self._scene_results[next(iter(self._scene_results))]
         return result
 
-    def _set_rigid_pose(self, path: EntityPath, environment: int, pose: Pose) -> None:
+    def _set_entity_prim_pose(self, path: EntityPath, environment: int, pose: Pose) -> None:
         self._native_call(
             "world.apply_scene_command",
-            lambda: self._native.set_rigid_body_pose(
+            lambda: self._native.set_entity_prim_pose(
                 path,
                 pose.position,
                 pose.orientation_xyzw,
@@ -1594,22 +1601,24 @@ class IsaacLabWorld:
         if entity is None or command.environment_index >= self._spec.environments.count:
             return self._scene_result(command, SceneCommandStatus.REJECTED, "target_not_found", "target does not exist")
         attachment_command = command.kind in {SceneCommandKind.ATTACH, SceneCommandKind.DETACH}
+        pose_command = command.kind is SceneCommandKind.SET_POSE
         if entity.kind is not EntityKind.RIGID_BODY and not (
-            attachment_command and entity.kind is EntityKind.ARTICULATION
+            entity.kind is EntityKind.ARTICULATION and (attachment_command or pose_command)
         ):
             return self._scene_result(
                 command,
                 SceneCommandStatus.REJECTED,
                 "unsupported_entity_kind",
-                "scene manipulation requires a rigid body, or an articulation attachment endpoint",
+                "scene manipulation requires a rigid body or articulation entity",
             )
         environment = command.environment_index
         if command.kind is SceneCommandKind.SET_POSE:
             assert command.target_pose is not None
-            self._set_rigid_pose(entity.path, environment, command.target_pose)
+            self._set_entity_prim_pose(entity.path, environment, command.target_pose)
         elif command.kind is SceneCommandKind.ATTACH:
             assert command.attachment_id is not None
             assert command.parent_entity_path is not None
+            attachment_id = command.attachment_id
             parent = self._entities.get(command.parent_entity_path)
             if parent is None:
                 return self._scene_result(
@@ -1625,7 +1634,7 @@ class IsaacLabWorld:
                     "unsupported_parent_kind",
                     "attachment parent must be a rigid body or articulation",
                 )
-            key = (environment, command.attachment_id)
+            key = (environment, attachment_id)
             if key in self._attachments:
                 return self._scene_result(
                     command,
@@ -1646,7 +1655,7 @@ class IsaacLabWorld:
             self._native_call(
                 "world.apply_scene_command",
                 lambda: self._native.attach_rigid_body(
-                    command.attachment_id,
+                    attachment_id,
                     parent.path,
                     command.parent_link_name,
                     entity.path,
@@ -1659,7 +1668,8 @@ class IsaacLabWorld:
             self._attachments[key] = (entity.path, command.child_link_name)
         elif command.kind is SceneCommandKind.DETACH:
             assert command.attachment_id is not None
-            key = (environment, command.attachment_id)
+            attachment_id = command.attachment_id
+            key = (environment, attachment_id)
             child = self._attachments.get(key)
             if child is None or child[0] != entity.path:
                 return self._scene_result(
@@ -1671,7 +1681,7 @@ class IsaacLabWorld:
             self._native_call(
                 "world.apply_scene_command",
                 lambda: self._native.detach_rigid_body(
-                    command.attachment_id,
+                    attachment_id,
                     entity.path,
                     environment,
                 ),
@@ -1686,7 +1696,11 @@ class IsaacLabWorld:
                 )
             if command.drag_id in self._drags:
                 return self._scene_result(command, SceneCommandStatus.REJECTED, "drag_exists", "drag already exists")
-            self._drags[command.drag_id] = (entity.path, environment, self._rigid_pose(entity.path, environment))
+            self._drags[command.drag_id] = (
+                entity.path,
+                environment,
+                self._entity_prim_pose(entity.path, environment),
+            )
         else:
             assert command.drag_id is not None
             active = self._drags.get(command.drag_id)
@@ -1694,9 +1708,9 @@ class IsaacLabWorld:
                 return self._scene_result(command, SceneCommandStatus.REJECTED, "drag_not_active", "drag is not active")
             if command.kind is SceneCommandKind.DRAG_UPDATE:
                 assert command.target_pose is not None
-                self._set_rigid_pose(entity.path, environment, command.target_pose)
+                self._set_entity_prim_pose(entity.path, environment, command.target_pose)
             elif command.kind is SceneCommandKind.DRAG_CANCEL:
-                self._set_rigid_pose(entity.path, environment, active[2])
+                self._set_entity_prim_pose(entity.path, environment, active[2])
                 del self._drags[command.drag_id]
             else:
                 del self._drags[command.drag_id]

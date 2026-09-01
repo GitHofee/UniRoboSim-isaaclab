@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.12
+
+- Read entity state from the spawned asset-root USD Prim instead of substituting
+  an articulation root-body pose.
+- Apply entity-level pose commands to the same Prim and move all physical bodies
+  coherently while preserving their relative transform and joint state.
+- Keep planning entity frames on the entity Prim and physical link frames on their
+  native bodies; batch scene-state Prim reads across entities.
+
 ## 0.10.11
 
 - Render UniRoboSim triangle-mesh debug resources as filled USD meshes with

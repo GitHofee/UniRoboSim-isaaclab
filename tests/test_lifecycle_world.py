@@ -298,7 +298,13 @@ def test_scene_snapshot_delta_and_transactional_rigid_drag(tmp_path: Path) -> No
         EntityPath("/robots/arm"),
         target_pose=Pose(),
     )
-    assert world.apply_scene_command(articulation).error_code == "unsupported_entity_kind"
+    assert world.apply_scene_command(articulation).status is SceneCommandStatus.APPLIED
+    moved_arm = next(
+        entity
+        for entity in world.scene_snapshot().entities
+        if entity.path == EntityPath("/robots/arm") and entity.environment_index == 0
+    )
+    assert moved_arm.pose == Pose()
     with pytest.raises(ValidationError):
         world.apply_scene_command(object())  # type: ignore[arg-type]
 

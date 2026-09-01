@@ -133,6 +133,8 @@ class _EntityBinding:
     root_link_id: str
     link_id_by_name: dict[str, str]
     joint_bindings: tuple[_JointBinding, ...]
+    entity_prim_paths: tuple[str, ...]
+    entity_prim_link_name: str | None = None
     state_source: str = "asset"
     tensor_bodies: _TensorBodyBinding | None = None
     static_poses: tuple[dict[str, PlanningPose], ...] = ()
@@ -1199,7 +1201,7 @@ class _PlanningAdmission:
                 )
             )
             self._frames[frame_id] = _FrameBinding(frame_id, spec.path, "link", name)
-        self._frames[entity_frame_id] = _FrameBinding(entity_frame_id, spec.path, "entity", root_name)
+        self._frames[entity_frame_id] = _FrameBinding(entity_frame_id, spec.path, "entity_prim", None)
 
         self._declared_frames(
             spec,
@@ -1245,6 +1247,11 @@ class _PlanningAdmission:
                 link_id_by_name[root_name],
                 link_id_by_name,
                 tuple(joint_bindings),
+                tuple(
+                    str(self._entity_root(spec, environment).GetPath())
+                    for environment in range(self._world._spec.environments.count)
+                ),
+                root_name if str(root.GetPath()) in bodies else None,
             ),
         )
 
@@ -1450,6 +1457,11 @@ class _PlanningAdmission:
                 "",
                 link_id_by_name,
                 (),
+                tuple(
+                    str(self._entity_root(spec, environment).GetPath())
+                    for environment in range(self._world._spec.environments.count)
+                ),
+                None,
                 "tensor",
                 tensor_binding,
                 tuple(static_poses),
@@ -1616,7 +1628,7 @@ class _PlanningAdmission:
                 )
             )
             self._frames[frame_id] = _FrameBinding(frame_id, spec.path, "link", name)
-        self._frames[entity_frame_id] = _FrameBinding(entity_frame_id, spec.path, "entity", root_name)
+        self._frames[entity_frame_id] = _FrameBinding(entity_frame_id, spec.path, "entity_prim", None)
         if parse_planning_frame_declarations(spec.metadata.get("planning_frame_declarations")) is not None:
             raise NativePlanningError("frame_ambiguous")
 
@@ -1662,6 +1674,15 @@ class _PlanningAdmission:
                 link_id_by_name[root_name],
                 link_id_by_name,
                 tuple(joint_bindings),
+                tuple(
+                    self._world._entity_prim_path(spec.path, environment)
+                    for environment in range(self._world._spec.environments.count)
+                ),
+                (
+                    root_name
+                    if self._world._entity_prim_path(spec.path, 0) == moving_root
+                    else None
+                ),
                 "usd_articulation" if spec.kind is EntityKind.ARTICULATION else "tensor",
                 tensor_binding,
             ),
@@ -2603,6 +2624,7 @@ class _PlanningAdmission:
             entity_states.append(PlanningEntityState(PLANNING_SYSTEM_ENTITY_ID, _IDENTITY_POSE, _ZERO_TWIST))
         link_states: list[PlanningLinkState] = []
         entity_pose_by_path: dict[EntityPath, PlanningPose] = {}
+        xform_cache = self._m.UsdGeom.XformCache()
 
         for path, binding in self._entities.items():
             origin = self._world._origins_cpu[environment_index]
@@ -2646,16 +2668,28 @@ class _PlanningAdmission:
                 poses[path, name] = pose
                 twists[path, name] = twist
                 link_states.append(PlanningLinkState(binding.link_id_by_name[name], pose, twist))
-            if binding.static_poses:
-                root_pose = binding.static_poses[environment_index][_COMPOSITE_ENTITY_POSE]
-                root_twist = _ZERO_TWIST
-                poses[path, _COMPOSITE_ENTITY_POSE] = root_pose
-                twists[path, _COMPOSITE_ENTITY_POSE] = root_twist
+            if binding.entity_prim_link_name is not None:
+                entity_pose = poses[path, binding.entity_prim_link_name]
+                entity_twist = twists[path, binding.entity_prim_link_name]
             else:
-                root_pose = poses[path, binding.root_link_name]
-                root_twist = twists[path, binding.root_link_name]
-            entity_pose_by_path[path] = root_pose
-            entity_states.append(PlanningEntityState(binding.entity_id, root_pose, root_twist))
+                prim = self._stage.GetPrimAtPath(binding.entity_prim_paths[environment_index])
+                if not prim or not prim.IsValid() or not self._m.UsdGeom.Xformable(prim):
+                    raise NativePlanningError("native_failure")
+                prim_pose, _prim_scale = _matrix_local_pose(
+                    self._m,
+                    xform_cache.GetLocalToWorldTransform(prim),
+                )
+                entity_pose = PlanningPose(
+                    _WORLD_FRAME_ID,
+                    tuple(prim_pose.position_m[axis] - origin[axis] for axis in range(3)),  # type: ignore[arg-type]
+                    prim_pose.orientation_xyzw,
+                )
+                entity_twist = _ZERO_TWIST
+            if binding.static_poses:
+                poses[path, _COMPOSITE_ENTITY_POSE] = entity_pose
+                twists[path, _COMPOSITE_ENTITY_POSE] = entity_twist
+            entity_pose_by_path[path] = entity_pose
+            entity_states.append(PlanningEntityState(binding.entity_id, entity_pose, entity_twist))
             if binding.state_source == "asset" and path in self._world._articulations:
                 assert asset is not None
                 joint_names = tuple(asset.joint_names)
@@ -2712,7 +2746,9 @@ class _PlanningAdmission:
             if frame.entity_path is None:
                 continue
             binding = self._entities[frame.entity_path]
-            if frame.source in {"entity", "link", "static_entity"}:
+            if frame.source == "entity_prim":
+                frame_poses[frame_id] = entity_pose_by_path[frame.entity_path]
+            elif frame.source in {"link", "static_entity"}:
                 assert frame.source_name is not None
                 frame_poses[frame_id] = poses[frame.entity_path, frame.source_name]
             elif frame.source == "joint":
