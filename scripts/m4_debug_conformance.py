@@ -1,4 +1,4 @@
-"""Real Isaac M4 six-primitive native overlay, trace and video conformance."""
+"""Real Isaac M4 native overlay, trace and video conformance."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from unirobosim import (
     DebugBudget,
     DebugBus,
     DebugLifetime,
+    DebugMeshResource,
+    DebugMeshStyle,
     DebugPrimitive,
     DebugPrimitiveKind,
     DebugTraceReader,
@@ -32,6 +34,23 @@ from unirobosim import (
 )
 
 from unirobosim_isaaclab import IsaacLabAdapterConfig, create_provider
+
+_MESH_RESOURCE = DebugMeshResource(
+    "m4.unit_tetrahedron",
+    ArrayValue.from_nested(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+        dtype="float32",
+    ),
+    ArrayValue.from_nested(
+        ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
+        dtype="int32",
+    ),
+)
 
 
 def _primitive(kind: DebugPrimitiveKind, frame: int) -> DebugPrimitive:
@@ -73,6 +92,15 @@ def _primitive(kind: DebugPrimitiveKind, frame: int) -> DebugPrimitive:
             geometry_m=ArrayValue.from_nested([[[2.0, 0.0, 0.35, 0.8, 0.8, 0.8, 0.0, 0.0, 0.0, 1.0]]]),
             **(common | {"color_rgba": (1.0, 0.1, 0.2, 1.0)}),
         )
+    if kind is DebugPrimitiveKind.MESH_INSTANCE:
+        return DebugPrimitive(
+            geometry_m=ArrayValue.from_nested(
+                [[[1.6, -0.25, 0.55, 0.0, 0.0, 0.0, 1.0, 0.45, 0.45, 0.45]]]
+            ),
+            mesh_resource_id=_MESH_RESOURCE.resource_id,
+            mesh_style=DebugMeshStyle.SOLID_WITH_EDGES,
+            **(common | {"color_rgba": (0.15, 0.45, 1.0, 0.7)}),
+        )
     trajectory = tuple(
         (
             0.55 + index * 0.34,
@@ -95,6 +123,7 @@ def _batch(frame: int) -> DebugBatch:
         sim_time_s=frame / 30.0,
         world_generation=1,
         event_id=f"native-frame-{frame:04d}",
+        mesh_resources=(_MESH_RESOURCE,),
     )
 
 
@@ -203,7 +232,7 @@ def run(output_dir: Path, *, frames: int = 90) -> dict[str, Any]:
             world.close()
 
             result["checks"] = [
-                {"name": "native_all_six_primitives_visible_and_updated", "passed": True},
+                {"name": "native_all_primitives_visible_and_updated", "passed": True},
                 {"name": "native_stable_key_group_clear_and_step_lifetime", "passed": True},
                 {"name": "native_trace_replay_matches_final_active_state", "passed": True},
                 {"name": "native_rgb_capture_nonconstant", "passed": True},

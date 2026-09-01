@@ -21,6 +21,8 @@ from unirobosim import (
     CommandMode,
     DebugBatch,
     DebugLifetimeMode,
+    DebugMeshResource,
+    DebugMeshStyle,
     DebugPrimitive,
     DebugPrimitiveKind,
     EntityKind,
@@ -319,6 +321,38 @@ def _debug_draw_payload(
         line_ends=tuple(line_ends),
         line_colors=tuple(line_colors),
         line_widths=tuple(line_widths),
+    )
+
+
+def _triangle_edges(resource: DebugMeshResource) -> tuple[tuple[int, int], ...]:
+    """Return deterministic unique undirected edges for one immutable mesh."""
+
+    edges: set[tuple[int, int]] = set()
+    values = resource.triangle_indices.values
+    for offset in range(0, len(values), 3):
+        triangle = (int(values[offset]), int(values[offset + 1]), int(values[offset + 2]))
+        for left, right in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])):
+            edges.add((left, right) if left < right else (right, left))
+    return tuple(sorted(edges))
+
+
+def _mesh_instance_rows(
+    primitive: DebugPrimitive,
+    origins: tuple[Vector3, ...],
+) -> tuple[tuple[Vector3, tuple[float, float, float, float], Vector3], ...]:
+    """Lower environment-local TRS rows into global positions and portable XYZW rotations."""
+
+    if primitive.kind is not DebugPrimitiveKind.MESH_INSTANCE:
+        return ()
+    nested = primitive.geometry_m.nested()
+    return tuple(
+        (
+            _offset(row[:3], origins[environment]),
+            cast(tuple[float, float, float, float], tuple(float(value) for value in row[3:7])),
+            cast(Vector3, tuple(float(value) for value in row[7:10])),
+        )
+        for row_index, environment in enumerate(primitive.environment_indices)
+        for row in nested[row_index]
     )
 
 
@@ -1058,6 +1092,10 @@ class IsaacLabNativeWorld:
         self._debug_overlay: NativeDebugOverlay | None = None
         self._debug_expirations: dict[tuple[str, str, str], int | None] = {}
         self._debug_lifetimes: dict[tuple[str, str, str], DebugLifetimeMode] = {}
+        self._debug_mesh_resources: dict[str, DebugMeshResource] = {}
+        self._debug_mesh_paths: dict[tuple[str, str, str], str] = {}
+        self._debug_mesh_resource_ids: dict[tuple[str, str, str], str] = {}
+        self._debug_mesh_signatures: dict[tuple[str, str, str], tuple[object, ...]] = {}
         self._step_index = 0
         self._render_revision = 0
         self._rendered_revision = -1
@@ -1099,6 +1137,105 @@ class IsaacLabNativeWorld:
         overlay = self._debug_overlay
         assert overlay is not None
         return overlay
+
+    @staticmethod
+    def _debug_mesh_path(key: tuple[str, str, str]) -> str:
+        identity = "\0".join(key).encode("utf-8")
+        return f"/World/UniRoboSimDebug/Instances/debug_{hashlib.sha256(identity).hexdigest()[:24]}"
+
+    def _author_debug_mesh_resource(
+        self,
+        root_path: str,
+        resource: DebugMeshResource,
+        primitive: DebugPrimitive,
+    ) -> None:
+        stage = self._m.sim_utils.get_current_stage()
+        prototype_path = f"{root_path}/Prototypes/mesh"
+        self._m.UsdGeom.Xform.Define(stage, prototype_path)
+        mesh = self._m.UsdGeom.Mesh.Define(stage, f"{prototype_path}/surface")
+        vertices = tuple(
+            (float(values[0]), float(values[1]), float(values[2]))
+            for values in resource.vertices_m.nested()
+        )
+        triangles = tuple(
+            (int(values[0]), int(values[1]), int(values[2]))
+            for values in resource.triangle_indices.nested()
+        )
+        mesh.CreatePointsAttr().Set(self._m.Vt.Vec3fArray(vertices))
+        mesh.CreateFaceVertexCountsAttr().Set(self._m.Vt.IntArray([3] * len(triangles)))
+        mesh.CreateFaceVertexIndicesAttr().Set(self._m.Vt.IntArray([index for face in triangles for index in face]))
+        mesh.CreateSubdivisionSchemeAttr().Set(self._m.UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr().Set(True)
+        mesh.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+            self._m.Vt.Vec3fArray([primitive.color_rgba[:3]])
+        )
+        mesh.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+            self._m.Vt.FloatArray([primitive.color_rgba[3]])
+        )
+        mesh.CreateVisibilityAttr().Set(
+            self._m.UsdGeom.Tokens.invisible
+            if primitive.mesh_style is DebugMeshStyle.WIREFRAME
+            else self._m.UsdGeom.Tokens.inherited
+        )
+
+        edges = _triangle_edges(resource)
+        curves = self._m.UsdGeom.BasisCurves.Define(stage, f"{prototype_path}/edges")
+        curves.CreateTypeAttr().Set(self._m.UsdGeom.Tokens.linear)
+        curves.CreateWrapAttr().Set(self._m.UsdGeom.Tokens.nonperiodic)
+        curves.CreatePointsAttr().Set(
+            self._m.Vt.Vec3fArray([vertices[index] for edge in edges for index in edge])
+        )
+        curves.CreateCurveVertexCountsAttr().Set(self._m.Vt.IntArray([2] * len(edges)))
+        curves.CreateWidthsAttr().Set(self._m.Vt.FloatArray([max(0.0005, primitive.size)]))
+        curves.SetWidthsInterpolation(self._m.UsdGeom.Tokens.constant)
+        curves.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+            self._m.Vt.Vec3fArray([primitive.color_rgba[:3]])
+        )
+        curves.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+            self._m.Vt.FloatArray([primitive.color_rgba[3]])
+        )
+        curves.CreateVisibilityAttr().Set(
+            self._m.UsdGeom.Tokens.inherited
+            if primitive.mesh_style in {DebugMeshStyle.WIREFRAME, DebugMeshStyle.SOLID_WITH_EDGES}
+            else self._m.UsdGeom.Tokens.invisible
+        )
+
+    def _upsert_debug_mesh(self, primitive: DebugPrimitive) -> None:
+        assert primitive.kind is DebugPrimitiveKind.MESH_INSTANCE
+        assert primitive.mesh_resource_id is not None
+        resource = self._debug_mesh_resources.get(primitive.mesh_resource_id)
+        if resource is None:
+            raise RuntimeError(f"debug mesh resource is unavailable: {primitive.mesh_resource_id}")
+        key = primitive.key
+        root_path = self._debug_mesh_path(key)
+        stage = self._m.sim_utils.get_current_stage()
+        signature = (primitive.mesh_resource_id, primitive.color_rgba, primitive.mesh_style, primitive.size)
+        if self._debug_mesh_signatures.get(key) != signature or not stage.GetPrimAtPath(root_path).IsValid():
+            stage.RemovePrim(root_path)
+            instancer = self._m.UsdGeom.PointInstancer.Define(stage, root_path)
+            self._author_debug_mesh_resource(root_path, resource, primitive)
+            instancer.CreatePrototypesRel().SetTargets([self._m.Sdf.Path(f"{root_path}/Prototypes/mesh")])
+            self._debug_mesh_paths[key] = root_path
+            self._debug_mesh_resource_ids[key] = primitive.mesh_resource_id
+            self._debug_mesh_signatures[key] = signature
+        else:
+            instancer = self._m.UsdGeom.PointInstancer(stage.GetPrimAtPath(root_path))
+
+        rows = _mesh_instance_rows(primitive, self._origins_cpu)
+        instancer.CreatePositionsAttr().Set(self._m.Vt.Vec3fArray([row[0] for row in rows]))
+        instancer.CreateOrientationsAttr().Set(
+            self._m.Vt.QuathArray(
+                [
+                    self._m.Gf.Quath(
+                        row[1][3],
+                        self._m.Gf.Vec3h(row[1][0], row[1][1], row[1][2]),
+                    )
+                    for row in rows
+                ]
+            )
+        )
+        instancer.CreateScalesAttr().Set(self._m.Vt.Vec3fArray([row[2] for row in rows]))
+        instancer.CreateProtoIndicesAttr().Set(self._m.Vt.IntArray([0] * len(rows)))
 
     def _build(self) -> None:
         sim_utils = self._m.sim_utils
@@ -3984,6 +4121,11 @@ class IsaacLabNativeWorld:
         )
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport:
+        for resource in batch.mesh_resources:
+            cached = self._debug_mesh_resources.get(resource.resource_id)
+            if cached is not None and cached.content_sha256 != resource.content_sha256:
+                raise RuntimeError(f"debug mesh resource changed under stable ID: {resource.resource_id}")
+            self._debug_mesh_resources[resource.resource_id] = resource
         for primitive in batch.primitives:
             key = primitive.key
             if primitive.lifetime.mode is DebugLifetimeMode.FRAME:
@@ -3995,10 +4137,21 @@ class IsaacLabNativeWorld:
                 expiration = None
             self._debug_expirations[key] = expiration
             self._debug_lifetimes[key] = primitive.lifetime.mode
-        overlay = self._native_debug_overlay()
-        overlay.upsert(batch.primitives)
+        portable_primitives = tuple(
+            primitive for primitive in batch.primitives if primitive.kind is not DebugPrimitiveKind.MESH_INSTANCE
+        )
+        mesh_primitives = tuple(
+            primitive for primitive in batch.primitives if primitive.kind is DebugPrimitiveKind.MESH_INSTANCE
+        )
+        if portable_primitives:
+            self._native_debug_overlay().upsert(portable_primitives)
+        for primitive in mesh_primitives:
+            self._upsert_debug_mesh(primitive)
         self._flush_debug_render()
-        return len(batch.primitives), 0, overlay.active_count
+        active_keys = set(self._debug_mesh_paths)
+        if self._debug_overlay is not None:
+            active_keys.update(self._debug_overlay.keys)
+        return len(batch.primitives), 0, len(active_keys)
 
     def _flush_debug_render(self) -> None:
         self._invalidate_render()
@@ -4009,16 +4162,29 @@ class IsaacLabNativeWorld:
             self._mark_rendered()
 
     def _remove_debug_keys(self, keys: tuple[tuple[str, str, str], ...]) -> None:
+        changed = False
+        stage = self._m.sim_utils.get_current_stage()
         for key in keys:
-            self._debug_expirations.pop(key)
-            self._debug_lifetimes.pop(key)
-        if self._native_debug_overlay().remove(keys):
+            self._debug_expirations.pop(key, None)
+            self._debug_lifetimes.pop(key, None)
+            path = self._debug_mesh_paths.pop(key, None)
+            self._debug_mesh_resource_ids.pop(key, None)
+            self._debug_mesh_signatures.pop(key, None)
+            if path is not None:
+                stage.RemovePrim(path)
+                changed = True
+        if self._debug_overlay is not None and self._debug_overlay.remove(keys):
+            changed = True
+        if changed:
             self._flush_debug_render()
 
     def clear_debug(self, layer: str | None, group: str | None, primitive_id: str | None) -> int:
+        active_keys = set(self._debug_mesh_paths)
+        if self._debug_overlay is not None:
+            active_keys.update(self._debug_overlay.keys)
         keys = tuple(
             key
-            for key in self._native_debug_overlay().keys
+            for key in active_keys
             if (layer is None or key[0] == layer)
             and (group is None or key[1] == group)
             and (primitive_id is None or key[2] == primitive_id)
@@ -4122,6 +4288,13 @@ class IsaacLabNativeWorld:
         self._runtime_attachments.clear()
         self._debug_expirations.clear()
         self._debug_lifetimes.clear()
+        if self._debug_mesh_paths:
+            stage = self._m.sim_utils.get_current_stage()
+            stage.RemovePrim("/World/UniRoboSimDebug")
+        self._debug_mesh_resources.clear()
+        self._debug_mesh_paths.clear()
+        self._debug_mesh_resource_ids.clear()
+        self._debug_mesh_signatures.clear()
         if self._debug_overlay is not None:
             self._debug_overlay.close()
             self._debug_overlay = None

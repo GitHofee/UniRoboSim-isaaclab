@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.11
+
+- Render UniRoboSim triangle-mesh debug resources as filled USD meshes with
+  optional edge overlays and batched point-instanced transforms.
+- Cache immutable topology by content digest; repeated updates change only instance
+  pose, scale, color, opacity, and lifetime state.
+- Keep every authored debug primitive free of collision and rigid-body APIs.
+
 ## 0.10.10
 
 - Add `entity.scale.composite_scene@1` and preserve positive XYZ scale through
