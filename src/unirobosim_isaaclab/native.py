@@ -66,6 +66,37 @@ _DEFAULT_CAMERA_RENDERER = "RaytracedLighting"
 _ISOSURFACE_CAMERA_RENDERER = "RealTimePathTracing"
 
 
+def _normalized_quaternion_xyzw(rotation: Any) -> tuple[float, float, float, float]:
+    imaginary = rotation.GetImaginary()
+    components = (
+        float(imaginary[0]),
+        float(imaginary[1]),
+        float(imaginary[2]),
+        float(rotation.GetReal()),
+    )
+    norm = math.sqrt(sum(component * component for component in components))
+    if not math.isfinite(norm) or norm <= 1.0e-12:
+        raise ValueError("USD transform contains an invalid rotation quaternion")
+    normalized = tuple(component / norm for component in components)
+    return (normalized[0], normalized[1], normalized[2], normalized[3])
+
+
+def _pose_from_world_matrix(matrix: Any, origin: tuple[float, float, float]) -> Pose:
+    """Extract a pose after removing authored scale and shear from a USD matrix."""
+
+    translation = matrix.ExtractTranslation()
+    pose_matrix = matrix.RemoveScaleShear()
+    orientation = _normalized_quaternion_xyzw(pose_matrix.ExtractRotationQuat())
+    return Pose(
+        (
+            float(translation[0]) - float(origin[0]),
+            float(translation[1]) - float(origin[1]),
+            float(translation[2]) - float(origin[2]),
+        ),
+        orientation,
+    )
+
+
 def _position_command_gains(
     stiffness: Any,
     damping: Any,
@@ -3552,18 +3583,10 @@ class IsaacLabNativeWorld:
         if not prim or not prim.IsValid() or not self._m.UsdGeom.Xformable(prim):
             raise ValueError(f"entity USD Prim is absent or not transformable: {prim_path}")
         matrix = self._m.UsdGeom.XformCache().GetLocalToWorldTransform(prim)
-        translation = matrix.ExtractTranslation()
-        rotation = matrix.ExtractRotationQuat()
-        imaginary = rotation.GetImaginary()
         origin = self._origins_cpu[environment_index]
-        return Pose(
-            tuple(float(translation[index]) - float(origin[index]) for index in range(3)),  # type: ignore[arg-type]
-            (
-                float(imaginary[0]),
-                float(imaginary[1]),
-                float(imaginary[2]),
-                float(rotation.GetReal()),
-            ),
+        return _pose_from_world_matrix(
+            matrix,
+            (float(origin[0]), float(origin[1]), float(origin[2])),
         )
 
     def _write_entity_prim_pose(self, path: EntityPath, environment_index: int, pose: Pose) -> None:
@@ -3590,26 +3613,30 @@ class IsaacLabNativeWorld:
         else:
             local = desired
         translation = local.ExtractTranslation()
-        rotation = local.ExtractRotationQuat()
+        orientation_xyzw = _normalized_quaternion_xyzw(
+            local.RemoveScaleShear().ExtractRotationQuat()
+        )
         translate_attribute = prim.GetAttribute("xformOp:translate")
         orient_attribute = prim.GetAttribute("xformOp:orient")
         if not translate_attribute or not orient_attribute:
             raise ValueError(f"entity USD Prim has no standardized pose attributes: {prim_path}")
         translate_attribute.Set(translation)
         orientation_value = orient_attribute.Get()
-        imaginary = rotation.GetImaginary()
         if isinstance(orientation_value, self._m.Gf.Quatf):
             orientation = self._m.Gf.Quatf(
-                float(rotation.GetReal()),
-                self._m.Gf.Vec3f(float(imaginary[0]), float(imaginary[1]), float(imaginary[2])),
+                orientation_xyzw[3],
+                self._m.Gf.Vec3f(*orientation_xyzw[:3]),
             )
         elif isinstance(orientation_value, self._m.Gf.Quath):
             orientation = self._m.Gf.Quath(
-                float(rotation.GetReal()),
-                self._m.Gf.Vec3h(float(imaginary[0]), float(imaginary[1]), float(imaginary[2])),
+                orientation_xyzw[3],
+                self._m.Gf.Vec3h(*orientation_xyzw[:3]),
             )
         else:
-            orientation = rotation
+            orientation = self._m.Gf.Quatd(
+                orientation_xyzw[3],
+                self._m.Gf.Vec3d(*orientation_xyzw[:3]),
+            )
         orient_attribute.Set(orientation)
 
     def read_entity_prim_states(

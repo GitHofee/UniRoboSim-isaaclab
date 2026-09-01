@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.13
+
+- Remove scale and shear from an entity Prim's USD world matrix before extracting
+  its pose rotation, then explicitly normalize the quaternion at the strict API
+  boundary.
+- Apply the same scale-independent rotation rule when writing entity-level poses;
+  authored entity scale and articulation joint state remain unchanged.
+- Regress the observed scale-1.5 articulated coffee-machine transform and reject
+  degenerate or non-finite USD rotations explicitly.
+
 ## 0.10.12
 
 - Read entity state from the spawned asset-root USD Prim instead of substituting
