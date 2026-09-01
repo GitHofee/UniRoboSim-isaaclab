@@ -786,6 +786,12 @@ def _compose_pose(parent: Pose, child: Pose) -> Pose:
     )
 
 
+def _retarget_physical_root_pose(target_entity: Pose, source_entity: Pose, source_root: Pose) -> Pose:
+    """Move a physical root by the exact entity-frame transform it currently has."""
+
+    return _compose_pose(target_entity, _relative_pose(source_entity, source_root))
+
+
 def _transform_position(
     vector: tuple[float, float, float],
     translation: tuple[float, float, float],
@@ -1393,6 +1399,48 @@ class IsaacLabNativeWorld:
             for camera in self._cameras.values():
                 camera.update(0.0, force_recompute=True)
 
+    def _configure_high_level_initial_root_pose(
+        self,
+        entity: EntitySpec,
+        asset: Any,
+        physical_root_paths: tuple[str, ...],
+    ) -> None:
+        """Translate the public entity-Prim pose into Isaac's physical-root initial state."""
+
+        if len(physical_root_paths) != self._spec.environments.count:
+            raise ValueError(
+                f"physical root count for {entity.path.value} does not match the environment count"
+            )
+        targets = tuple(
+            _retarget_physical_root_pose(
+                entity.pose,
+                self._read_usd_entity_prim_pose(entity.path, environment),
+                self._read_usd_prim_pose(physical_root_path, environment),
+            )
+            for environment, physical_root_path in enumerate(physical_root_paths)
+        )
+        first = targets[0]
+        for target in targets[1:]:
+            position_error = max(abs(left - right) for left, right in zip(first.position, target.position, strict=True))
+            orientation_dot = abs(
+                sum(
+                    left * right
+                    for left, right in zip(
+                        first.orientation_xyzw,
+                        target.orientation_xyzw,
+                        strict=True,
+                    )
+                )
+            )
+            if position_error > 1.0e-6 or abs(orientation_dot - 1.0) > 1.0e-6:
+                raise ValueError(
+                    f"authored entity-to-root transform for {entity.path.value} differs across environments"
+                )
+        asset.cfg.init_state = asset.cfg.init_state.replace(
+            pos=first.position,
+            rot=first.orientation_xyzw,
+        )
+
     def _author_articulation(self, entity: EntitySpec) -> None:
         assert entity.asset_uri is not None
         if self._has_fluid:
@@ -1420,7 +1468,16 @@ class IsaacLabNativeWorld:
                 )
             },
         )
-        self._articulations[entity.path] = self._m.Articulation(cfg)
+        asset = self._m.Articulation(cfg)
+        self._articulations[entity.path] = asset
+        root_paths = tuple(
+            root + _articulation_mount_body_suffix(self._m, root, None)
+            for root in (
+                f"/World/env_{environment}/{_native_name(entity.path)}"
+                for environment in range(self._spec.environments.count)
+            )
+        )
+        self._configure_high_level_initial_root_pose(entity, asset, root_paths)
 
     def _author_usd_articulation(self, entity: EntitySpec) -> None:
         """Author an articulation through USD for particle-readback worlds."""
@@ -1502,9 +1559,11 @@ class IsaacLabNativeWorld:
                 rot=entity.pose.orientation_xyzw,
             ),
         )
-        self._rigids[entity.path] = self._m.RigidObject(cfg)
+        asset = self._m.RigidObject(cfg)
+        self._rigids[entity.path] = asset
         body_suffix: str | None = None
         kinematic: bool | None = None
+        root_paths: list[str] = []
         for index in range(self._spec.environments.count):
             root = f"/World/env_{index}/{name}"
             rigid_prims = self._m.sim_utils.get_all_matching_child_prims(
@@ -1516,6 +1575,7 @@ class IsaacLabNativeWorld:
                     f"rigid asset must contain exactly one UsdPhysics.RigidBodyAPI prim; found {len(rigid_prims)}"
                 )
             rigid_prim = rigid_prims[0]
+            root_paths.append(rigid_prim.GetPath().pathString)
             current_kinematic = _is_kinematic_rigid(rigid_prim, self._m.UsdPhysics)
             if kinematic is None:
                 kinematic = current_kinematic
@@ -1529,6 +1589,7 @@ class IsaacLabNativeWorld:
             elif suffix != body_suffix:
                 raise ValueError("rigid body prim must have the same relative path in every environment")
         assert body_suffix is not None and kinematic is not None
+        self._configure_high_level_initial_root_pose(entity, asset, tuple(root_paths))
         self._kinematic_rigids[entity.path] = kinematic
         contact_cfg = self._m.ContactSensorCfg(
             prim_path=f"/World/env_.*/{name}{body_suffix}",
@@ -3576,17 +3637,22 @@ class IsaacLabNativeWorld:
         self._entity_prim_physical_root_cache[key] = result
         return result
 
-    def _read_usd_entity_prim_pose(self, path: EntityPath, environment_index: int) -> Pose:
+    def _read_usd_prim_pose(self, prim_path: str, environment_index: int) -> Pose:
         stage = self._m.sim_utils.get_current_stage()
-        prim_path = self._entity_prim_path(path, environment_index)
         prim = stage.GetPrimAtPath(prim_path)
         if not prim or not prim.IsValid() or not self._m.UsdGeom.Xformable(prim):
-            raise ValueError(f"entity USD Prim is absent or not transformable: {prim_path}")
+            raise ValueError(f"USD Prim is absent or not transformable: {prim_path}")
         matrix = self._m.UsdGeom.XformCache().GetLocalToWorldTransform(prim)
         origin = self._origins_cpu[environment_index]
         return _pose_from_world_matrix(
             matrix,
             (float(origin[0]), float(origin[1]), float(origin[2])),
+        )
+
+    def _read_usd_entity_prim_pose(self, path: EntityPath, environment_index: int) -> Pose:
+        return self._read_usd_prim_pose(
+            self._entity_prim_path(path, environment_index),
+            environment_index,
         )
 
     def _write_entity_prim_pose(self, path: EntityPath, environment_index: int, pose: Pose) -> None:
@@ -3804,7 +3870,7 @@ class IsaacLabNativeWorld:
         target = Pose(position_m, orientation_xyzw)
         old_entity = self.read_entity_prim_states((path,))[0][environment_index].pose
         old_physical_root = self._attachment_endpoint_pose(path, None, environment_index)
-        target_physical_root = _compose_pose(target, _relative_pose(old_entity, old_physical_root))
+        target_physical_root = _retarget_physical_root_pose(target, old_entity, old_physical_root)
         if not self._entity_prim_is_physical_root(path, environment_index):
             self._write_entity_prim_pose(path, environment_index, target)
         if entity.kind is EntityKind.ARTICULATION:

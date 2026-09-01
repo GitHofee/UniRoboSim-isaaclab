@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.14
+
+- Interpret high-level Isaac Lab articulation and USD rigid `init_state` as a
+  physical-root pose while keeping the public WorldSpec pose in the entity Prim
+  frame.
+- Capture the authored entity-to-root transform after USD composition and reuse
+  the same retargeting rule as runtime entity-level `set_pose`.
+- Preserve non-zero root translation and rotation offsets through initial spawn
+  and reset; the real G2 `base_x_link` retains its authored `+0.040822 m` offset.
+
 ## 0.10.13
 
 - Remove scale and shear from an entity Prim's USD world matrix before extracting
