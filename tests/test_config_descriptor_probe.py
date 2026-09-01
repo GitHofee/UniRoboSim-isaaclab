@@ -34,7 +34,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.9"
+    assert unirobosim_isaaclab.__version__ == "0.10.10"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -75,6 +75,7 @@ def test_public_identity_and_protocol() -> None:
     assert CAPABILITIES.get(CapabilityId("entity.scale.rigid@1")) is not None
     assert CAPABILITIES.get(CapabilityId("entity.scale.articulation.uniform@1")) is not None
     assert CAPABILITIES.get(CapabilityId("entity.scale.static_scene@1")) is not None
+    assert CAPABILITIES.get(CapabilityId("entity.scale.composite_scene@1")) is not None
     planning = CAPABILITIES.get(CapabilityId("planning.scene@2"))
     assert planning is not None
     assert planning.properties["collision_authority"] == "composed-usd-and-physx-effective"

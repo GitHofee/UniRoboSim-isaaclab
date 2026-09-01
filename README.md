@@ -169,7 +169,8 @@ with Sim(provider=provider) as sim:
 - optional static composite semantics that retain authored support collision while
   excluding undeclared bodies and private joints from dynamic solve/reset views;
 - immutable static-scene USD composition without rigid-object or contact-sensor wrappers;
-- physical rigid, uniform articulation, and static-scene asset scaling;
+- physical XYZ rigid/static-scene scaling, uniform articulation scaling, and
+  capability-gated composite-scene scaling;
 - joint position, velocity, and effort control;
 - cached control-mode gains, with exact rewrites only on mode changes and reset;
 - rigid-body pose/twist, persistent wrench, aggregated normal contact, reset, and scene pose writes;
@@ -195,9 +196,15 @@ The headless camera profile renders on sensor reads instead of every physics tic
 
 In this Isaac Sim profile, particle state is read through PhysX/USD rather than a public particle tensor API. Rigid + fluid + camera + debug is verified together. Contact-force readback for bridged rigid bodies, and a same-world mix of particle fluid with tensor-backed articulations or deformables, fail explicitly instead of returning misleading data.
 
+Non-uniform composite USD scale is supported only after authoring produces a static
+scene with Mesh or Cube collision. Composite scenes with embedded rigid bodies or
+articulations use uniform scale, because a non-uniform transform cannot preserve
+their rigid poses, joint anchors, and inertia consistently. Pre-cook such an asset at
+the target dimensions when non-uniform scaling of a mechanism is required.
+
 ## Planning-scene compatibility
 
-Adapter 0.10.6 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
+Adapter 0.10.10 requires UniRoboSim Core `>=0.10,<0.11` and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Applications that used the earlier semantic frame-role draft must migrate those meanings to their task or annotation layer and keep only the neutral physical frame declaration in the simulator contract. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
 Static and composite USD scenes expose immutable planning resources plus live world
 transforms. Degenerate faces with fewer than three vertices are skipped; invalid

@@ -1401,8 +1401,13 @@ class _PlanningAdmission:
                 raise NativePlanningError("topology_unsupported")
             tensor_rows.append(row)
             root_local, root_scale = _matrix_local_pose(self._m, cache.GetLocalToWorldTransform(environment_root))
-            if any(abs(value - 1.0) > 1.0e-8 for value in root_scale):
-                raise NativePlanningError("collision_geometry_unsupported")
+            # Composite scale is already baked into each collision geometry by
+            # ``_effective_collision_relative_transform``.  Planning entity
+            # state carries pose only, so retaining the same scale here would
+            # double-apply it.  Static composite roots may therefore expose an
+            # arbitrary positive XYZ scale while their world pose remains the
+            # scale-free transform below.
+            del root_scale
             origin = self._world._origins_cpu[environment_index]
             static_poses.append(
                 {

@@ -41,6 +41,8 @@ def _composite_world(
     environments: int = 2,
     unbound_mode: object = _UNSET,
     include_embedded_rigid: bool = False,
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    include_door: bool = True,
 ) -> WorldSpec:
     container_path = EntityPath("/scene")
     metadata = FrozenMap() if unbound_mode is _UNSET else FrozenMap({"composite_unbound_rigid_mode": unbound_mode})
@@ -49,6 +51,7 @@ def _composite_world(
         EntityKind.COMPOSITE_SCENE,
         asset_uri=asset.as_uri(),
         metadata=metadata,
+        scale_xyz=scale,
     )
     door = EntitySpec(
         EntityPath("/scene/door"),
@@ -65,7 +68,7 @@ def _composite_world(
             joint_prims=(EmbeddedPrimBinding("door_hinge", JOINT),),
         ),
     )
-    entities = [door, container]
+    entities = [door, container] if include_door else [container]
     if include_embedded_rigid:
         entities.insert(
             1,
@@ -359,12 +362,39 @@ def test_descriptor_and_preflight_admit_v6_composite_and_embedded_entities(tmp_p
     assert unbound_mode.properties["private_joint_prims"] == "disabled-in-current-stage-before-first-reset"
     assert unbound_mode.properties["static_authoring"] == "remove-unbound-rigid-body-api-preserve-collision"
     assert DESCRIPTOR.capabilities.get(CapabilityId("entity.embedded-binding@1")) is not None
+    assert DESCRIPTOR.capabilities.get(CapabilityId("entity.scale.composite_scene@1")) is not None
     formats = DESCRIPTOR.capabilities.get(CapabilityId("asset.formats@1"))
     assert formats is not None and formats.properties["composite_scene"] == ("model/vnd.usd",)
 
     asset.unlink()
     with pytest.raises(WorldBuildError, match="existing local USD"):
         IsaacLabWorld.validate_build_spec(spec, backend_id="nvidia.isaaclab")
+
+
+def test_preflight_allows_xyz_scale_for_static_only_composite_scene(tmp_path: Path) -> None:
+    asset = tmp_path / "static-room.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    spec = _composite_world(
+        asset,
+        environments=1,
+        unbound_mode="static",
+        scale=(0.1, 0.2, 0.15),
+        include_door=False,
+    )
+
+    IsaacLabWorld.validate_build_spec(spec, backend_id="nvidia.isaaclab")
+
+
+def test_preflight_rejects_xyz_scale_with_embedded_articulation(tmp_path: Path) -> None:
+    asset = tmp_path / "articulated-room.usda"
+    asset.write_text("#usda 1.0\n", encoding="utf-8")
+    spec = _composite_world(asset, scale=(0.1, 0.2, 0.15))
+
+    with pytest.raises(WorldBuildError, match="pre-cooked USD") as caught:
+        IsaacLabWorld.validate_build_spec(spec, backend_id="nvidia.isaaclab")
+
+    assert caught.value.details["detail_code"] == "COMPOSITE_SCALE_REQUIRES_COOKING"
+    assert caught.value.details["scale_xyz"] == (0.1, 0.2, 0.15)
 
 
 def test_composite_authors_once_then_binds_exact_prims_without_respawn(tmp_path: Path) -> None:

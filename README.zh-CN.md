@@ -159,7 +159,7 @@ with Sim(provider=provider) as sim:
 - 可选的复合场景静态语义：保留 authored 支撑碰撞，同时让未声明 body 和私有 joint
   不进入动态求解与 reset view；
 - 不经刚体或接触传感器包装的不可变静态场景 USD 组合；
-- 刚体、均匀缩放铰接体与静态场景资产的物理缩放；
+- 刚体/静态场景 XYZ 物理缩放、铰接体等比缩放，以及受能力门禁的复合场景缩放；
 - 关节位置、速度和力矩控制；
 - 缓存关节控制模式增益，只在模式改变和 reset 时精确重写；
 - 刚体位姿/速度、持续 wrench、聚合接触、reset 和场景位姿写入；
@@ -185,9 +185,13 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 此 Isaac Sim profile 的粒子状态通过 PhysX/USD 读取，而不是公开粒子 Tensor API。刚体 + 流体 + 相机 + Debug 已完成混合验证。桥接刚体的接触力，以及粒子流体与 Tensor 铰接体/柔性体同场景组合，会明确失败，不返回误导性结果。
 
+复合 USD 的非等比缩放只在 author 后得到静态场景、且启用的碰撞 Prim 为 Mesh 或 Cube
+时支持。含内嵌刚体或铰接体的复合场景只能等比缩放，因为非等比根变换无法同时保持刚体
+位姿、关节锚点和惯量的一致性。如确实需要非等比缩放机构，应先将资产离线烹制为目标尺寸。
+
 ## Planning Scene 兼容性
 
-Adapter 0.10.6 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
+Adapter 0.10.10 要求 UniRoboSim Core `>=0.10,<0.11`，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义。使用过早期 semantic frame-role 草案的应用，需要将这些含义迁移到自己的任务或标注层，在仿真合同中只保留中立的物理 frame 声明；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
 
 静态和复合 USD 场景会提供不可变 planning resource 与实时 world transform。
 少于三个顶点的退化 face 会被跳过；非法索引、不一致的方向数据，以及没有任何

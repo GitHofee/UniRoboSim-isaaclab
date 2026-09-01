@@ -1449,10 +1449,52 @@ class IsaacLabNativeWorld:
             roots.append(root)
         if unbound_rigid_mode in {"kinematic", "static"}:
             self._author_unbound_composite_rigids(entity, tuple(roots), mode=unbound_rigid_mode)
+        self._validate_authored_composite_scale(entity, tuple(roots))
         self._composite_scene_roots[entity.path] = tuple(roots)
         if not hasattr(self, "_composite_scene_modes"):
             self._composite_scene_modes = {}
         self._composite_scene_modes[entity.path] = unbound_rigid_mode
+
+    def _validate_authored_composite_scale(self, entity: EntitySpec, roots: tuple[str, ...]) -> None:
+        """Fail closed when native USD cannot represent an anisotropic physical scene."""
+
+        if len(set(entity.scale_xyz)) == 1:
+            return
+        for root in roots:
+            invalid_physics = self._m.sim_utils.get_all_matching_child_prims(
+                root,
+                lambda prim: (
+                    prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                    or prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI)
+                    or (
+                        prim.IsA(self._m.UsdPhysics.Joint)
+                        and self._m.UsdPhysics.Joint(prim).GetJointEnabledAttr().Get() is not False
+                    )
+                ),
+            )
+            if invalid_physics:
+                paths = tuple(self._prim_path_string(prim) for prim in invalid_physics[:8])
+                raise ValueError(
+                    "non-uniform composite-scene scale requires a static physical scene after authoring; "
+                    f"remaining rigid/articulation/joint prims={paths}"
+                )
+            collision_prims = self._m.sim_utils.get_all_matching_child_prims(
+                root,
+                lambda prim: (
+                    prim.HasAPI(self._m.UsdPhysics.CollisionAPI)
+                    and self._m.UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False
+                ),
+            )
+            unsupported = tuple(
+                self._prim_path_string(prim)
+                for prim in collision_prims
+                if not (prim.IsA(self._m.UsdGeom.Mesh) or prim.IsA(self._m.UsdGeom.Cube))
+            )
+            if unsupported:
+                raise ValueError(
+                    "non-uniform composite-scene scale supports Mesh and Cube collision only; "
+                    f"unsupported collision prims={unsupported[:8]}"
+                )
 
     def _author_unbound_composite_rigids(
         self,

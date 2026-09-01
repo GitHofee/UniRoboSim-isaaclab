@@ -142,6 +142,27 @@ class IsaacLabWorld:
     @staticmethod
     def validate_build_spec(spec: WorldSpec, *, backend_id: str) -> None:
         for entity in spec.entities:
+            if entity.kind is EntityKind.COMPOSITE_SCENE and len(set(entity.scale_xyz)) != 1:
+                embedded = tuple(
+                    candidate.path.value
+                    for candidate in spec.entities
+                    if candidate.embedded_binding is not None
+                    and candidate.embedded_binding.container_path == entity.path
+                )
+                if embedded:
+                    raise WorldBuildError(
+                        "non-uniform composite-scene scale cannot preserve embedded rigid/articulation kinematics; "
+                        "use uniform scale or a pre-cooked USD",
+                        operation="session.build.preflight",
+                        backend_id=backend_id,
+                        world_id=spec.world_id,
+                        entity_path=entity.path.value,
+                        details={
+                            "detail_code": "COMPOSITE_SCALE_REQUIRES_COOKING",
+                            "embedded_entities": embedded,
+                            "scale_xyz": entity.scale_xyz,
+                        },
+                    ) from None
             if entity.kind in {EntityKind.ARTICULATION, EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE}:
                 if entity.embedded_binding is not None:
                     continue

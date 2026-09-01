@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.10
+
+- Add `entity.scale.composite_scene@1` and preserve positive XYZ scale through
+  native USD composition and planning-geometry extraction.
+- Allow non-uniform scale for static composite USD scenes whose enabled collision
+  Prims are Mesh or Cube. Keep uniform scale available to articulated composites.
+- Reject non-uniform composite scale with embedded or remaining dynamic physics
+  before it can create invalid PhysX rigid-body transforms.
+
 ## 0.10.6
 
 - Add the `static` composite unbound-body mode. It disables private joints and

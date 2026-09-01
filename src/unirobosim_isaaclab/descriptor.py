@@ -133,6 +133,18 @@ CAPABILITIES = CapabilitySet(
             FrozenMap({"axes": "xyz", "semantics": "physical"}),
         ),
         CapabilityDeclaration(
+            CapabilityId("entity.scale.composite_scene@1"),
+            FrozenMap(
+                {
+                    "axes": "xyz",
+                    "authoring": "usd-file-config-scale",
+                    "semantics": "native-effective-physical",
+                    "planning_geometry": "native-effective-inventory",
+                    "invalid_asset_behavior": "fail-closed",
+                }
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("state.rigid_body@1"),
             FrozenMap({"frame": "environment-local-world", "pose_origin": "root-link"}),
         ),
