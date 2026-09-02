@@ -786,6 +786,33 @@ def _compose_pose(parent: Pose, child: Pose) -> Pose:
     )
 
 
+def _attachment_joint_frames(
+    parent_body_pose: Pose,
+    child_body_pose: Pose,
+    parent_T_child: Pose | None,
+) -> tuple[Pose, Pose, Pose]:
+    """Resolve the public relation and USD rigid-body-local joint frames.
+
+    ``UsdPhysics.Joint`` local poses are expressed in the coordinate systems of
+    the rigid-body Prims targeted by ``body0`` and ``body1``.  PhysX performs its
+    own rigid-body-Prim-to-center-of-mass conversion; pre-converting these values
+    to COM space applies the offset twice and makes the body jump when the joint
+    is first solved.
+    """
+
+    relative = parent_T_child or _relative_pose(parent_body_pose, child_body_pose)
+    joint_world_pose = (
+        child_body_pose
+        if parent_T_child is None
+        else _compose_pose(parent_body_pose, parent_T_child)
+    )
+    return (
+        relative,
+        _relative_pose(parent_body_pose, joint_world_pose),
+        _relative_pose(child_body_pose, joint_world_pose),
+    )
+
+
 def _retarget_physical_root_pose(target_entity: Pose, source_entity: Pose, source_root: Pose) -> Pose:
     """Move a physical root by the exact entity-frame transform it currently has."""
 
@@ -4580,69 +4607,6 @@ class IsaacLabNativeWorld:
             cast(tuple[float, float, float, float], orientations[environment_index]),
         )
 
-    def _attachment_center_of_mass_pose(
-        self,
-        path: EntityPath,
-        link_name: str | None,
-        environment_index: int,
-    ) -> Pose:
-        """Return the PhysX actor frame used by a runtime joint endpoint."""
-        origin = self._origins_cpu[environment_index]
-        if path in self._articulations:
-            asset = self._articulations[path]
-            if link_name is None:
-                row = asset.data.root_com_pose_w.torch[environment_index].detach().cpu().tolist()
-            else:
-                matches = tuple(index for index, name in enumerate(asset.body_names) if name == link_name)
-                if len(matches) != 1:
-                    raise KeyError(f"attachment link {link_name!r} must identify exactly one body")
-                row = (
-                    asset.data.body_com_pose_w.torch[environment_index, matches[0]]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-        elif path in self._rigids:
-            if link_name is not None:
-                entity = self._entity_specs[path]
-                if link_name != entity.root_link_name:
-                    raise KeyError(f"attachment link {link_name!r} does not identify the rigid root body")
-            row = self._rigids[path].data.root_com_pose_w.torch[environment_index].detach().cpu().tolist()
-        elif path in self._usd_articulation_views:
-            if link_name is None:
-                row = (
-                    self._usd_articulation_views[path]
-                    .get_root_transforms()[environment_index]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-            else:
-                self.read_selected_kinematics(
-                    (KinematicTarget("attachment-com", path, link_name),), environment_index
-                )
-                row = (
-                    self._selected_link_views[path, link_name]
-                    .get_transforms()[environment_index]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-        elif path in self._usd_rigid_views:
-            row = (
-                self._usd_rigid_views[path]
-                .get_transforms()[environment_index]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-        else:
-            raise KeyError(f"attachment entity {path.value!r} has no native rigid-body state")
-        return Pose(
-            tuple(float(row[index]) - float(origin[index]) for index in range(3)),  # type: ignore[arg-type]
-            tuple(float(row[index]) for index in range(3, 7)),  # type: ignore[arg-type]
-        )
-
     def attach_rigid_body(
         self,
         attachment_id: str,
@@ -4675,21 +4639,10 @@ class IsaacLabNativeWorld:
         child_endpoint_pose = self._attachment_endpoint_pose(
             child_path, child_link_name, environment_index
         )
-        relative = parent_T_child or _relative_pose(parent_endpoint_pose, child_endpoint_pose)
-        joint_world_pose = (
-            child_endpoint_pose
-            if parent_T_child is None
-            else _compose_pose(parent_endpoint_pose, parent_T_child)
-        )
-        # Runtime physics joints consume the PhysX actor/center-of-mass frames.  The
-        # public relation remains expressed between the selected logical link frames.
-        parent_actor_T_joint = _relative_pose(
-            self._attachment_center_of_mass_pose(parent_path, parent_link_name, environment_index),
-            joint_world_pose,
-        )
-        child_actor_T_joint = _relative_pose(
-            self._attachment_center_of_mass_pose(child_path, child_link_name, environment_index),
+        relative, parent_body_T_joint, child_body_T_joint = _attachment_joint_frames(
+            parent_endpoint_pose,
             child_endpoint_pose,
+            parent_T_child,
         )
         digest = hashlib.sha256(attachment_id.encode("utf-8")).hexdigest()[:24]
         joint_root = f"/World/env_{environment_index}/unirobosim_runtime_attachments"
@@ -4701,18 +4654,18 @@ class IsaacLabNativeWorld:
         fixed = self._m.UsdPhysics.FixedJoint.Define(stage, joint_path)
         fixed.CreateBody0Rel().SetTargets((self._m.Sdf.Path(parent_body_path),))
         fixed.CreateBody1Rel().SetTargets((self._m.Sdf.Path(child_body_path),))
-        fixed.CreateLocalPos0Attr().Set(self._m.Gf.Vec3f(*parent_actor_T_joint.position))
+        fixed.CreateLocalPos0Attr().Set(self._m.Gf.Vec3f(*parent_body_T_joint.position))
         fixed.CreateLocalRot0Attr().Set(
             self._m.Gf.Quatf(
-                parent_actor_T_joint.orientation_xyzw[3],
-                self._m.Gf.Vec3f(*parent_actor_T_joint.orientation_xyzw[:3]),
+                parent_body_T_joint.orientation_xyzw[3],
+                self._m.Gf.Vec3f(*parent_body_T_joint.orientation_xyzw[:3]),
             )
         )
-        fixed.CreateLocalPos1Attr().Set(self._m.Gf.Vec3f(*child_actor_T_joint.position))
+        fixed.CreateLocalPos1Attr().Set(self._m.Gf.Vec3f(*child_body_T_joint.position))
         fixed.CreateLocalRot1Attr().Set(
             self._m.Gf.Quatf(
-                child_actor_T_joint.orientation_xyzw[3],
-                self._m.Gf.Vec3f(*child_actor_T_joint.orientation_xyzw[:3]),
+                child_body_T_joint.orientation_xyzw[3],
+                self._m.Gf.Vec3f(*child_body_T_joint.orientation_xyzw[:3]),
             )
         )
         fixed.CreateJointEnabledAttr().Set(True)

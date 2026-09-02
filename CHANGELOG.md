@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.16
+
+- Express runtime USD FixedJoint local poses in the coordinate frames of the
+  rigid-body Prims targeted by `body0` and `body1`, never in PhysX COM frames.
+- Preserve the child's exact world pose when `parent_T_child` is omitted, even
+  when either endpoint has a translated or rotated center of mass.
+
 ## 0.10.15
 
 - Implement `checkpoint@1` for articulations, rigid bodies, deformables, particle
