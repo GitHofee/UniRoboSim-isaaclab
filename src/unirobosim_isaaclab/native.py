@@ -1144,6 +1144,7 @@ class IsaacLabNativeWorld:
         self._initial_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
         self._articulation_control_modes: dict[EntityPath, list[list[CommandMode | None]]] = {}
         self._initial_rigid: dict[EntityPath, tuple[Any, Any]] = {}
+        self._rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
         self._initial_entity_prim_poses: dict[EntityPath, tuple[Pose, ...]] = {}
         self._initial_deformable: dict[EntityPath, tuple[Any, Any | None]] = {}
         self._origins_cpu = _environment_origins(spec.environments.count, config.environment_spacing_m)
@@ -2606,6 +2607,18 @@ class IsaacLabNativeWorld:
             root_pose[:, :3] += self._origins
             root_velocity = asset.data.default_root_vel.torch.clone()
             self._initial_rigid[path] = (root_pose, root_velocity)
+            self._rigid_wrenches[path] = (
+                self._m.torch.zeros(
+                    (self._spec.environments.count, 3),
+                    device=root_pose.device,
+                    dtype=root_pose.dtype,
+                ),
+                self._m.torch.zeros(
+                    (self._spec.environments.count, 3),
+                    device=root_pose.device,
+                    dtype=root_pose.dtype,
+                ),
+            )
 
     def _initialize_deformables(self) -> None:
         torch = self._m.torch
@@ -2747,6 +2760,11 @@ class IsaacLabNativeWorld:
                 kinematic=self._kinematic_rigids[path],
             )
             self._contacts[path].reset(env_ids=env_ids)
+            stored_wrench = getattr(self, "_rigid_wrenches", {}).get(path)
+            if stored_wrench is not None:
+                forces, torques = stored_wrench
+                forces[env_ids] = 0.0
+                torques[env_ids] = 0.0
         for path, view in self._usd_rigid_views.items():
             transforms, velocities = self._initial_usd_rigid[path]
             indices = self._m.torch.tensor(
@@ -2761,9 +2779,11 @@ class IsaacLabNativeWorld:
                 indices,
                 kinematic=self._kinematic_rigids[path],
             )
-            forces, torques = self._usd_rigid_wrenches[path]
-            forces[indices] = 0.0
-            torques[indices] = 0.0
+            stored_wrench = getattr(self, "_usd_rigid_wrenches", {}).get(path)
+            if stored_wrench is not None:
+                forces, torques = stored_wrench
+                forces[indices] = 0.0
+                torques[indices] = 0.0
         for path, asset in self._deformables.items():
             state, target = self._initial_deformable[path]
             asset.write_nodal_state_to_sim_index(state[env_ids], env_ids=env_ids)
@@ -3548,12 +3568,606 @@ class IsaacLabNativeWorld:
         env_ids = self._m.torch.tensor(environment_indices, device=self._sim.device, dtype=self._m.torch.int64)
         forces = self._m.torch.tensor(forces_n, device=self._sim.device, dtype=self._m.torch.float32).unsqueeze(1)
         torques = self._m.torch.tensor(torques_n_m, device=self._sim.device, dtype=self._m.torch.float32).unsqueeze(1)
+        stored_forces, stored_torques = self._rigid_wrenches[path]
+        stored_forces[list(environment_indices)] = forces[:, 0, :].to(
+            device=stored_forces.device,
+            dtype=stored_forces.dtype,
+        )
+        stored_torques[list(environment_indices)] = torques[:, 0, :].to(
+            device=stored_torques.device,
+            dtype=stored_torques.dtype,
+        )
         asset.permanent_wrench_composer.set_forces_and_torques_index(
             forces=forces,
             torques=torques,
             env_ids=env_ids,
             is_global=True,
         )
+
+    @staticmethod
+    def _checkpoint_values(tensor: Any) -> object:
+        return tensor.detach().cpu().tolist()
+
+    def _checkpoint_tensor(self, value: object, reference: Any, label: str) -> Any:
+        try:
+            tensor = self._m.torch.tensor(value, device=reference.device, dtype=reference.dtype)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise ValueError(f"checkpoint {label} is not a numeric tensor") from error
+        if tuple(int(size) for size in tensor.shape) != tuple(int(size) for size in reference.shape):
+            raise ValueError(f"checkpoint {label} shape is invalid")
+        if not bool(self._m.torch.isfinite(tensor).all().item()):
+            raise ValueError(f"checkpoint {label} contains a non-finite value")
+        return tensor
+
+    @staticmethod
+    def _checkpoint_map(value: object, expected: set[str], label: str) -> dict[str, object]:
+        if type(value) is not dict or set(value) != expected:
+            raise ValueError(f"checkpoint {label} identity set is invalid")
+        return cast(dict[str, object], value)
+
+    def capture_checkpoint(self) -> dict[str, object]:
+        """Capture all mutable physical state without advancing physics or rendering."""
+
+        values = self._checkpoint_values
+        articulations: dict[str, object] = {}
+        for path, asset in self._articulations.items():
+            articulations[path.value] = {
+                "kind": "isaaclab",
+                "root_pose": values(asset.data.root_link_pose_w.torch),
+                "root_velocity": values(asset.data.root_link_vel_w.torch),
+                "joint_position": values(asset.data.joint_pos.torch),
+                "joint_velocity": values(asset.data.joint_vel.torch),
+                "position_target": values(asset.data.joint_pos_target.torch),
+                "velocity_target": values(asset.data.joint_vel_target.torch),
+                "effort_target": values(asset.data.joint_effort_target.torch),
+                "stiffness": values(asset.data.joint_stiffness.torch),
+                "damping": values(asset.data.joint_damping.torch),
+                "control_modes": [
+                    [None if mode is None else mode.value for mode in environment]
+                    for environment in self._articulation_control_modes[path]
+                ],
+            }
+        for path, view in self._usd_articulation_views.items():
+            articulations[path.value] = {
+                "kind": "usd",
+                "root_pose": values(view.get_root_transforms()),
+                "root_velocity": values(view.get_root_velocities()),
+                "joint_position": values(view.get_dof_positions()),
+                "joint_velocity": values(view.get_dof_velocities()),
+                "position_target": values(view.get_dof_position_targets()),
+                "velocity_target": values(view.get_dof_velocity_targets()),
+                "effort_target": values(view.get_dof_actuation_forces()),
+                "stiffness": values(view.get_dof_stiffnesses()),
+                "damping": values(view.get_dof_dampings()),
+            }
+
+        rigids: dict[str, object] = {}
+        for path, asset in self._rigids.items():
+            forces, torques = self._rigid_wrenches[path]
+            rigids[path.value] = {
+                "kind": "isaaclab",
+                "pose": values(asset.data.root_link_pose_w.torch),
+                "velocity": values(asset.data.root_link_vel_w.torch),
+                "force": values(forces),
+                "torque": values(torques),
+            }
+        for path, view in self._usd_rigid_views.items():
+            forces, torques = self._usd_rigid_wrenches[path]
+            rigids[path.value] = {
+                "kind": "usd",
+                "pose": values(view.get_transforms()),
+                "velocity": values(view.get_velocities()),
+                "force": values(forces),
+                "torque": values(torques),
+            }
+
+        deformables = {
+            path.value: {
+                "state": values(asset.data.nodal_state_w.torch),
+                "kinematic_target": (
+                    None
+                    if self._initial_deformable[path][1] is None
+                    else values(asset.data.nodal_kinematic_target.torch)
+                ),
+            }
+            for path, asset in self._deformables.items()
+        }
+        fluids: dict[str, object] = {}
+        for path in self._fluids:
+            positions, velocities = self.read_particle_fluid(path)
+            fluids[path.value] = {"positions": positions, "velocities": velocities}
+
+        composite_rigids = tuple(
+            {
+                "pose": values(state.view.get_transforms()),
+                "velocity": values(state.view.get_velocities()),
+            }
+            for state in self._composite_rigid_states
+        )
+        composite_articulations = tuple(
+            {
+                "root_pose": values(state.view.get_root_transforms()),
+                "root_velocity": values(state.view.get_root_velocities()),
+                "joint_position": values(state.view.get_dof_positions()),
+                "joint_velocity": values(state.view.get_dof_velocities()),
+                "position_target": values(state.view.get_dof_position_targets()),
+                "velocity_target": values(state.view.get_dof_velocity_targets()),
+                "effort_target": values(state.view.get_dof_actuation_forces()),
+                "stiffness": values(state.view.get_dof_stiffnesses()),
+                "damping": values(state.view.get_dof_dampings()),
+            }
+            for state in self._composite_articulation_states
+        )
+        attachments = tuple(
+            {
+                "attachment_id": attachment.attachment_id,
+                "environment_index": attachment.environment_index,
+                "parent_path": attachment.parent_path.value,
+                "parent_link_name": attachment.parent_link_name,
+                "child_path": attachment.child_path.value,
+                "child_link_name": attachment.child_link_name,
+                "parent_T_child": {
+                    "position": attachment.parent_T_child.position,
+                    "orientation_xyzw": attachment.parent_T_child.orientation_xyzw,
+                },
+            }
+            for _, attachment in sorted(self._runtime_attachments.items())
+        )
+        return {
+            "schema": "nvidia.isaaclab.native-state/1",
+            "articulations": articulations,
+            "rigids": rigids,
+            "deformables": deformables,
+            "fluids": fluids,
+            "composite_rigids": composite_rigids,
+            "composite_articulations": composite_articulations,
+            "attachments": attachments,
+        }
+
+    def _stage_checkpoint(self, state: dict[str, object]) -> dict[str, object]:
+        if state.get("schema") != "nvidia.isaaclab.native-state/1" or set(state) != {
+            "schema",
+            "articulations",
+            "rigids",
+            "deformables",
+            "fluids",
+            "composite_rigids",
+            "composite_articulations",
+            "attachments",
+        }:
+            raise ValueError("checkpoint native schema is invalid")
+        staged: dict[str, object] = {
+            "articulations": {},
+            "rigids": {},
+            "deformables": {},
+            "fluids": {},
+            "composite_rigids": [],
+            "composite_articulations": [],
+            "attachments": [],
+        }
+        articulation_records = self._checkpoint_map(
+            state.get("articulations"),
+            {path.value for path in self._articulations} | {path.value for path in self._usd_articulation_views},
+            "articulation",
+        )
+        staged_articulations = cast(dict[EntityPath, dict[str, Any]], staged["articulations"])
+        for path in (*self._articulations, *self._usd_articulation_views):
+            record = articulation_records[path.value]
+            if type(record) is not dict:
+                raise ValueError("checkpoint articulation record is invalid")
+            high_level = path in self._articulations
+            asset_or_view = self._articulations[path] if high_level else self._usd_articulation_views[path]
+            references = (
+                {
+                    "root_pose": asset_or_view.data.root_link_pose_w.torch,
+                    "root_velocity": asset_or_view.data.root_link_vel_w.torch,
+                    "joint_position": asset_or_view.data.joint_pos.torch,
+                    "joint_velocity": asset_or_view.data.joint_vel.torch,
+                    "position_target": asset_or_view.data.joint_pos_target.torch,
+                    "velocity_target": asset_or_view.data.joint_vel_target.torch,
+                    "effort_target": asset_or_view.data.joint_effort_target.torch,
+                    "stiffness": asset_or_view.data.joint_stiffness.torch,
+                    "damping": asset_or_view.data.joint_damping.torch,
+                }
+                if high_level
+                else {
+                    "root_pose": asset_or_view.get_root_transforms(),
+                    "root_velocity": asset_or_view.get_root_velocities(),
+                    "joint_position": asset_or_view.get_dof_positions(),
+                    "joint_velocity": asset_or_view.get_dof_velocities(),
+                    "position_target": asset_or_view.get_dof_position_targets(),
+                    "velocity_target": asset_or_view.get_dof_velocity_targets(),
+                    "effort_target": asset_or_view.get_dof_actuation_forces(),
+                    "stiffness": asset_or_view.get_dof_stiffnesses(),
+                    "damping": asset_or_view.get_dof_dampings(),
+                }
+            )
+            expected_kind = "isaaclab" if high_level else "usd"
+            expected_fields = {"kind", *references}
+            if high_level:
+                expected_fields.add("control_modes")
+            if record.get("kind") != expected_kind or set(record) != expected_fields:
+                raise ValueError("checkpoint articulation representation is invalid")
+            staged_record = {
+                name: self._checkpoint_tensor(record[name], reference, f"{path.value}.{name}")
+                for name, reference in references.items()
+            }
+            if high_level:
+                raw_modes = record["control_modes"]
+                expected_modes = self._articulation_control_modes[path]
+                if (
+                    type(raw_modes) is not list
+                    or len(raw_modes) != len(expected_modes)
+                    or any(type(row) is not list or len(row) != len(expected_modes[index])
+                           for index, row in enumerate(raw_modes))
+                ):
+                    raise ValueError("checkpoint articulation control modes are invalid")
+                try:
+                    staged_record["control_modes"] = [
+                        [None if value is None else CommandMode(value) for value in row]
+                        for row in raw_modes
+                    ]
+                except (TypeError, ValueError) as error:
+                    raise ValueError("checkpoint articulation control modes are invalid") from error
+            staged_articulations[path] = staged_record
+
+        rigid_records = self._checkpoint_map(
+            state.get("rigids"),
+            {path.value for path in self._rigids} | {path.value for path in self._usd_rigid_views},
+            "rigid",
+        )
+        staged_rigids = cast(dict[EntityPath, dict[str, Any]], staged["rigids"])
+        for path in (*self._rigids, *self._usd_rigid_views):
+            record = rigid_records[path.value]
+            if type(record) is not dict:
+                raise ValueError("checkpoint rigid record is invalid")
+            high_level = path in self._rigids
+            asset_or_view = self._rigids[path] if high_level else self._usd_rigid_views[path]
+            forces, torques = self._rigid_wrenches[path] if high_level else self._usd_rigid_wrenches[path]
+            references = {
+                "pose": asset_or_view.data.root_link_pose_w.torch if high_level else asset_or_view.get_transforms(),
+                "velocity": (
+                    asset_or_view.data.root_link_vel_w.torch if high_level else asset_or_view.get_velocities()
+                ),
+                "force": forces,
+                "torque": torques,
+            }
+            expected_kind = "isaaclab" if high_level else "usd"
+            if record.get("kind") != expected_kind or set(record) != {"kind", *references}:
+                raise ValueError("checkpoint rigid representation is invalid")
+            staged_rigids[path] = {
+                name: self._checkpoint_tensor(record[name], reference, f"{path.value}.{name}")
+                for name, reference in references.items()
+            }
+
+        deformable_records = self._checkpoint_map(
+            state.get("deformables"),
+            {path.value for path in self._deformables},
+            "deformable",
+        )
+        staged_deformables = cast(dict[EntityPath, dict[str, Any]], staged["deformables"])
+        for path, asset in self._deformables.items():
+            record = deformable_records[path.value]
+            if type(record) is not dict or set(record) != {"state", "kinematic_target"}:
+                raise ValueError("checkpoint deformable record is invalid")
+            target_reference = self._initial_deformable[path][1]
+            raw_target = record["kinematic_target"]
+            if (target_reference is None) != (raw_target is None):
+                raise ValueError("checkpoint deformable kinematic target is invalid")
+            staged_deformables[path] = {
+                "state": self._checkpoint_tensor(
+                    record["state"], asset.data.nodal_state_w.torch, f"{path.value}.state"
+                ),
+                "kinematic_target": (
+                    None
+                    if target_reference is None
+                    else self._checkpoint_tensor(raw_target, target_reference, f"{path.value}.kinematic_target")
+                ),
+            }
+
+        fluid_records = self._checkpoint_map(
+            state.get("fluids"),
+            {path.value for path in self._fluids},
+            "fluid",
+        )
+        staged_fluids = cast(dict[EntityPath, tuple[PointBatch, PointBatch]], staged["fluids"])
+        for path, sets in self._fluids.items():
+            record = fluid_records[path.value]
+            if type(record) is not dict or set(record) != {"positions", "velocities"}:
+                raise ValueError("checkpoint fluid record is invalid")
+            position_rows: list[tuple[Vector3, ...]] = []
+            velocity_rows: list[tuple[Vector3, ...]] = []
+            for name, output in (("positions", position_rows), ("velocities", velocity_rows)):
+                raw = record[name]
+                if type(raw) not in {list, tuple} or len(raw) != len(sets):
+                    raise ValueError("checkpoint fluid environment count is invalid")
+                for environment, row in enumerate(raw):
+                    if type(row) not in {list, tuple} or len(row) != len(sets[environment].initial_positions):
+                        raise ValueError("checkpoint fluid particle count is invalid")
+                    vectors: list[Vector3] = []
+                    for vector in row:
+                        if type(vector) not in {list, tuple} or len(vector) != 3:
+                            raise ValueError("checkpoint fluid vector is invalid")
+                        converted = tuple(float(component) for component in vector)
+                        if not all(math.isfinite(component) for component in converted):
+                            raise ValueError("checkpoint fluid vector is non-finite")
+                        vectors.append(cast(Vector3, converted))
+                    output.append(tuple(vectors))
+            staged_fluids[path] = (tuple(position_rows), tuple(velocity_rows))
+
+        def stage_composites(key: str, states: list[Any], fields: tuple[str, ...]) -> list[dict[str, Any]]:
+            raw_records = state.get(key)
+            if not isinstance(raw_records, (list, tuple)) or len(raw_records) != len(states):
+                raise ValueError(f"checkpoint {key} count is invalid")
+            output: list[dict[str, Any]] = []
+            for index, (raw, composite) in enumerate(zip(raw_records, states, strict=True)):
+                if type(raw) is not dict or set(raw) != set(fields):
+                    raise ValueError(f"checkpoint {key} record is invalid")
+                getters = {
+                    "pose": composite.view.get_transforms,
+                    "velocity": composite.view.get_velocities,
+                    "root_pose": composite.view.get_root_transforms,
+                    "root_velocity": composite.view.get_root_velocities,
+                    "joint_position": composite.view.get_dof_positions,
+                    "joint_velocity": composite.view.get_dof_velocities,
+                    "position_target": composite.view.get_dof_position_targets,
+                    "velocity_target": composite.view.get_dof_velocity_targets,
+                    "effort_target": composite.view.get_dof_actuation_forces,
+                    "stiffness": composite.view.get_dof_stiffnesses,
+                    "damping": composite.view.get_dof_dampings,
+                }
+                output.append(
+                    {
+                        field: self._checkpoint_tensor(raw[field], getters[field](), f"{key}.{index}.{field}")
+                        for field in fields
+                    }
+                )
+            return output
+
+        staged["composite_rigids"] = stage_composites(
+            "composite_rigids",
+            self._composite_rigid_states,
+            ("pose", "velocity"),
+        )
+        staged["composite_articulations"] = stage_composites(
+            "composite_articulations",
+            self._composite_articulation_states,
+            (
+                "root_pose",
+                "root_velocity",
+                "joint_position",
+                "joint_velocity",
+                "position_target",
+                "velocity_target",
+                "effort_target",
+                "stiffness",
+                "damping",
+            ),
+        )
+
+        raw_attachments = state.get("attachments")
+        if not isinstance(raw_attachments, (list, tuple)):
+            raise ValueError("checkpoint attachments are invalid")
+        staged_attachments = cast(list[_RuntimeAttachment], staged["attachments"])
+        attachment_keys: set[tuple[int, str]] = set()
+        attachment_children: set[tuple[int, EntityPath, str | None]] = set()
+        expected_attachment_fields = {
+            "attachment_id",
+            "environment_index",
+            "parent_path",
+            "parent_link_name",
+            "child_path",
+            "child_link_name",
+            "parent_T_child",
+        }
+        for raw in raw_attachments:
+            if type(raw) is not dict or set(raw) != expected_attachment_fields:
+                raise ValueError("checkpoint attachment record is invalid")
+            attachment_id = raw["attachment_id"]
+            environment = raw["environment_index"]
+            parent_value = raw["parent_path"]
+            child_value = raw["child_path"]
+            parent_link = raw["parent_link_name"]
+            child_link = raw["child_link_name"]
+            relative_value = raw["parent_T_child"]
+            if (
+                type(attachment_id) is not str
+                or not attachment_id
+                or type(environment) is not int
+                or not 0 <= environment < self._spec.environments.count
+                or type(parent_value) is not str
+                or type(child_value) is not str
+                or (parent_link is not None and type(parent_link) is not str)
+                or (child_link is not None and type(child_link) is not str)
+                or type(relative_value) is not dict
+                or set(relative_value) != {"position", "orientation_xyzw"}
+            ):
+                raise ValueError("checkpoint attachment record is invalid")
+            try:
+                parent = EntityPath(parent_value)
+                child = EntityPath(child_value)
+                relative = Pose(
+                    tuple(relative_value["position"]),
+                    tuple(relative_value["orientation_xyzw"]),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("checkpoint attachment record is invalid") from error
+            key = (environment, attachment_id)
+            child_key = (environment, child, child_link)
+            if (
+                parent not in self._entity_specs
+                or child not in self._entity_specs
+                or key in attachment_keys
+                or child_key in attachment_children
+            ):
+                raise ValueError("checkpoint attachment identity is invalid")
+            attachment_keys.add(key)
+            attachment_children.add(child_key)
+            staged_attachments.append(
+                _RuntimeAttachment(
+                    attachment_id,
+                    environment,
+                    parent,
+                    parent_link,
+                    child,
+                    child_link,
+                    relative,
+                    "",
+                )
+            )
+        return staged
+
+    def _apply_staged_checkpoint(self, staged: dict[str, object]) -> None:
+        stage = self._m.sim_utils.get_current_stage()
+        for attachment in tuple(self._runtime_attachments.values()):
+            stage.RemovePrim(attachment.joint_prim_path)
+        self._runtime_attachments.clear()
+
+        env_ids = list(range(self._spec.environments.count))
+        articulations = cast(dict[EntityPath, dict[str, Any]], staged["articulations"])
+        for path, asset in self._articulations.items():
+            record = articulations[path]
+            asset.reset(env_ids=env_ids)
+            asset.write_root_pose_to_sim_index(root_pose=record["root_pose"], env_ids=env_ids)
+            asset.write_root_link_velocity_to_sim_index(root_velocity=record["root_velocity"], env_ids=env_ids)
+            asset.write_joint_position_to_sim_index(position=record["joint_position"], env_ids=env_ids)
+            asset.write_joint_velocity_to_sim_index(velocity=record["joint_velocity"], env_ids=env_ids)
+            asset.set_joint_position_target_index(target=record["position_target"], env_ids=env_ids)
+            asset.set_joint_velocity_target_index(target=record["velocity_target"], env_ids=env_ids)
+            asset.set_joint_effort_target_index(target=record["effort_target"], env_ids=env_ids)
+            asset.write_joint_stiffness_to_sim_index(stiffness=record["stiffness"], env_ids=env_ids)
+            asset.write_joint_damping_to_sim_index(damping=record["damping"], env_ids=env_ids)
+            asset.write_data_to_sim()
+            self._articulation_control_modes[path] = [list(row) for row in record["control_modes"]]
+        for path, view in self._usd_articulation_views.items():
+            record = articulations[path]
+            indices = self._m.torch.arange(
+                view.count,
+                device=record["joint_position"].device,
+                dtype=self._m.torch.int64,
+            )
+            view.set_root_transforms(record["root_pose"], indices)
+            view.set_root_velocities(record["root_velocity"], indices)
+            view.set_dof_positions(record["joint_position"], indices)
+            view.set_dof_velocities(record["joint_velocity"], indices)
+            view.set_dof_position_targets(record["position_target"], indices)
+            view.set_dof_velocity_targets(record["velocity_target"], indices)
+            view.set_dof_actuation_forces(record["effort_target"], indices)
+            view.set_dof_stiffnesses(record["stiffness"], indices)
+            view.set_dof_dampings(record["damping"], indices)
+
+        rigids = cast(dict[EntityPath, dict[str, Any]], staged["rigids"])
+        for path, asset in self._rigids.items():
+            record = rigids[path]
+            _write_high_level_rigid_state(
+                asset,
+                record["pose"],
+                record["velocity"],
+                env_ids,
+                kinematic=self._kinematic_rigids[path],
+            )
+            forces, torques = self._rigid_wrenches[path]
+            forces.copy_(record["force"])
+            torques.copy_(record["torque"])
+            asset.permanent_wrench_composer.set_forces_and_torques_index(
+                forces=forces.unsqueeze(1),
+                torques=torques.unsqueeze(1),
+                env_ids=env_ids,
+                is_global=True,
+            )
+            self._contacts[path].reset(env_ids=env_ids)
+        for path, view in self._usd_rigid_views.items():
+            record = rigids[path]
+            indices = self._m.torch.arange(view.count, device=record["pose"].device, dtype=self._m.torch.int64)
+            _write_usd_rigid_state(
+                view,
+                record["pose"],
+                record["velocity"],
+                indices,
+                kinematic=self._kinematic_rigids[path],
+            )
+            forces, torques = self._usd_rigid_wrenches[path]
+            forces.copy_(record["force"])
+            torques.copy_(record["torque"])
+
+        deformables = cast(dict[EntityPath, dict[str, Any]], staged["deformables"])
+        for path, asset in self._deformables.items():
+            record = deformables[path]
+            asset.write_nodal_state_to_sim_index(record["state"], env_ids=env_ids)
+            if record["kinematic_target"] is not None:
+                asset.write_nodal_kinematic_target_to_sim_index(record["kinematic_target"], env_ids=env_ids)
+            asset.reset(env_ids=env_ids)
+
+        fluids = cast(dict[EntityPath, tuple[PointBatch, PointBatch]], staged["fluids"])
+        for path, (positions, velocities) in fluids.items():
+            for environment, fluid_set in enumerate(self._fluids[path]):
+                fluid_set.points.GetPointsAttr().Set(self._m.Vt.Vec3fArray(positions[environment]))
+                fluid_set.points.GetVelocitiesAttr().Set(self._m.Vt.Vec3fArray(velocities[environment]))
+
+        for rigid_state, record in zip(
+            self._composite_rigid_states,
+            cast(list[dict[str, Any]], staged["composite_rigids"]),
+            strict=True,
+        ):
+            indices = self._m.torch.arange(
+                rigid_state.view.count, device=record["pose"].device, dtype=self._m.torch.int64
+            )
+            _write_usd_rigid_state(
+                rigid_state.view,
+                record["pose"],
+                record["velocity"],
+                indices,
+                kinematic=rigid_state.kinematic,
+            )
+        for articulation_state, record in zip(
+            self._composite_articulation_states,
+            cast(list[dict[str, Any]], staged["composite_articulations"]),
+            strict=True,
+        ):
+            indices = self._m.torch.arange(
+                articulation_state.view.count,
+                device=record["joint_position"].device,
+                dtype=self._m.torch.int64,
+            )
+            articulation_state.view.set_root_transforms(record["root_pose"], indices)
+            articulation_state.view.set_root_velocities(record["root_velocity"], indices)
+            articulation_state.view.set_dof_positions(record["joint_position"], indices)
+            articulation_state.view.set_dof_velocities(record["joint_velocity"], indices)
+            articulation_state.view.set_dof_position_targets(record["position_target"], indices)
+            articulation_state.view.set_dof_velocity_targets(record["velocity_target"], indices)
+            articulation_state.view.set_dof_actuation_forces(record["effort_target"], indices)
+            articulation_state.view.set_dof_stiffnesses(record["stiffness"], indices)
+            articulation_state.view.set_dof_dampings(record["damping"], indices)
+
+        assert self._sim is not None
+        self._sim.forward()
+        self._update_assets(0.0)
+        for attachment in cast(list[_RuntimeAttachment], staged["attachments"]):
+            self.attach_rigid_body(
+                attachment.attachment_id,
+                attachment.parent_path,
+                attachment.parent_link_name,
+                attachment.child_path,
+                attachment.child_link_name,
+                attachment.environment_index,
+                attachment.parent_T_child,
+            )
+        self._update_assets(0.0)
+        self._sync_all_mounted_cameras()
+        self._invalidate_render()
+
+    def restore_checkpoint(self, state: dict[str, object]) -> None:
+        """Preflight a complete payload and roll back if native application fails."""
+
+        if type(state) is not dict:
+            raise ValueError("checkpoint native state must be a dictionary")
+        staged = self._stage_checkpoint(state)
+        rollback = self._stage_checkpoint(self.capture_checkpoint())
+        try:
+            self._apply_staged_checkpoint(staged)
+        except BaseException:
+            self._apply_staged_checkpoint(rollback)
+            raise
 
     def read_rigid_body(self, path: EntityPath) -> tuple[Matrix, Matrix, Matrix, Matrix]:
         if path in self._usd_rigid_views:
@@ -3961,7 +4575,10 @@ class IsaacLabNativeWorld:
             )[0]
             return Pose(state.position_m, state.orientation_xyzw)
         positions, orientations, _linear, _angular = self.read_rigid_body(path)
-        return Pose(positions[environment_index], orientations[environment_index])
+        return Pose(
+            cast(tuple[float, float, float], positions[environment_index]),
+            cast(tuple[float, float, float, float], orientations[environment_index]),
+        )
 
     def _attachment_center_of_mass_pose(
         self,
@@ -4667,6 +5284,7 @@ class IsaacLabNativeWorld:
         self._initial_articulation_gains.clear()
         self._articulation_control_modes.clear()
         self._initial_rigid.clear()
+        self._rigid_wrenches.clear()
         self._initial_entity_prim_poses.clear()
         self._entity_prim_path_cache.clear()
         self._entity_prim_physical_root_cache.clear()

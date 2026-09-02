@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.15
+
+- Implement `checkpoint@1` for articulations, rigid bodies, deformables, particle
+  fluids, composite physics, persistent control targets, wrenches, and runtime
+  attachments.
+- Restore atomically with native preflight and rollback while preserving the live
+  World clock.
+
 ## 0.10.14
 
 - Interpret high-level Isaac Lab articulation and USD rigid `init_state` as a

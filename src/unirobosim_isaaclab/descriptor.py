@@ -1,6 +1,7 @@
 """Backend identity and launch-profile-aware capabilities."""
 
 from unirobosim import (
+    CHECKPOINT_CAPABILITY_ID,
     COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
     RENDER_STATE_CAPABILITY_ID,
@@ -56,6 +57,17 @@ CAPABILITIES = CapabilitySet(
         CapabilityDeclaration(
             CapabilityId("world.multi-environment@1"),
             FrozenMap({"isolation": "physx-environment-origins"}),
+        ),
+        CapabilityDeclaration(
+            CHECKPOINT_CAPABILITY_ID,
+            FrozenMap(
+                {
+                    "atomic_scope": "world",
+                    "clock_rewind": False,
+                    "fidelity": "physical",
+                    "payload_schema": "nvidia.isaaclab.physical-checkpoint/1",
+                }
+            ),
         ),
         CapabilityDeclaration(
             CapabilityId("scene.static@1"),

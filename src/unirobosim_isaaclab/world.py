@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -22,6 +23,8 @@ from unirobosim import (
     BuildReport,
     CameraModality,
     CapabilityId,
+    CheckpointFidelity,
+    CheckpointRestoreResult,
     CommandError,
     ContactState,
     DebugBatch,
@@ -67,6 +70,7 @@ from unirobosim import (
     UnsupportedCapabilityError,
     ValidationError,
     WorldBuildError,
+    WorldCheckpoint,
     WorldSpec,
     WorldState,
 )
@@ -121,6 +125,7 @@ class IsaacLabWorld:
         self._render_state_revision = 0
         self._reset_count = 0
         self._scene_sequence = 0
+        self._checkpoint_state_revision = 0
         self._scene_results: dict[str, SceneCommandResult] = {}
         self._drags: dict[str, tuple[EntityPath, int, Pose]] = {}
         self._attachments: dict[tuple[int, str], tuple[EntityPath, str | None]] = {}
@@ -365,6 +370,116 @@ class IsaacLabWorld:
             key: child for key, child in self._attachments.items() if key[0] not in selected
         }
         return ResetResult(environments, self._reset_count, self.tick)
+
+    def create_checkpoint(self) -> WorldCheckpoint:
+        operation = "world.create_checkpoint"
+        self._ensure_ready(operation)
+        if self._pending_articulation_commands:
+            raise ValidationError(
+                "checkpoint capture requires an empty pending articulation-command buffer",
+                operation=operation,
+            )
+        state = self._native_call(operation, self._native.capture_checkpoint)
+        try:
+            payload = json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise UniRoboSimError(
+                "Isaac Lab produced an invalid checkpoint payload",
+                operation=operation,
+                backend_id=self._descriptor.provider_id,
+                world_id=self.world_id,
+                cause=error,
+            ) from error
+        return WorldCheckpoint(
+            provider_id=self._descriptor.provider_id,
+            world_id=self.world_id,
+            source_generation=self.generation,
+            source_tick=self.tick,
+            payload_schema="nvidia.isaaclab.physical-checkpoint/1",
+            fidelity=CheckpointFidelity.PHYSICAL,
+            payload=payload,
+            entity_count=len(self._entities),
+        )
+
+    def restore_checkpoint(self, checkpoint: WorldCheckpoint) -> CheckpointRestoreResult:
+        operation = "world.restore_checkpoint"
+        self._ensure_ready(operation)
+        if type(checkpoint) is not WorldCheckpoint:
+            raise ValidationError("operation requires a WorldCheckpoint", operation=operation)
+        if self._pending_articulation_commands:
+            raise ValidationError(
+                "checkpoint restore requires an empty pending articulation-command buffer",
+                operation=operation,
+            )
+        if (
+            checkpoint.provider_id != self._descriptor.provider_id
+            or checkpoint.world_id != self.world_id
+            or checkpoint.payload_schema != "nvidia.isaaclab.physical-checkpoint/1"
+            or checkpoint.entity_count != len(self._entities)
+        ):
+            raise ValidationError("checkpoint identity differs from the active world", operation=operation)
+        try:
+            state = json.loads(checkpoint.payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValidationError("checkpoint payload is invalid", operation=operation) from error
+        if type(state) is not dict:
+            raise ValidationError("checkpoint payload is invalid", operation=operation)
+        restored_attachments = self._checkpoint_attachments(state, operation=operation)
+        self._native_call(operation, lambda: self._native.restore_checkpoint(state))
+        self._scene_results.clear()
+        self._drags.clear()
+        self._attachments = restored_attachments
+        self._scene_sequence += 1
+        self._checkpoint_state_revision += 1
+        return CheckpointRestoreResult(
+            generation=self.generation,
+            tick=self.tick,
+            state_revision=self._checkpoint_state_revision,
+            restored_entity_count=len(self._entities),
+        )
+
+    def _checkpoint_attachments(
+        self,
+        state: dict[str, object],
+        *,
+        operation: str,
+    ) -> dict[tuple[int, str], tuple[EntityPath, str | None]]:
+        raw = state.get("attachments")
+        if type(raw) is not list:
+            raise ValidationError("checkpoint attachment state is invalid", operation=operation)
+        restored: dict[tuple[int, str], tuple[EntityPath, str | None]] = {}
+        for value in raw:
+            if type(value) is not dict:
+                raise ValidationError("checkpoint attachment state is invalid", operation=operation)
+            attachment_id = value.get("attachment_id")
+            environment = value.get("environment_index")
+            child_value = value.get("child_path")
+            child_link = value.get("child_link_name")
+            if (
+                type(attachment_id) is not str
+                or not attachment_id
+                or type(environment) is not int
+                or not 0 <= environment < self._spec.environments.count
+                or type(child_value) is not str
+                or (child_link is not None and type(child_link) is not str)
+            ):
+                raise ValidationError("checkpoint attachment state is invalid", operation=operation)
+            try:
+                child = EntityPath(child_value)
+            except (TypeError, ValueError) as error:
+                raise ValidationError("checkpoint attachment state is invalid", operation=operation) from error
+            key = (environment, attachment_id)
+            if (
+                child not in self._entities
+                or key in restored
+                or any(
+                    candidate_environment == environment and candidate == (child, child_link)
+                    for (candidate_environment, _), candidate in restored.items()
+                )
+            ):
+                raise ValidationError("checkpoint attachment state is invalid", operation=operation)
+            restored[key] = (child, child_link)
+        return restored
 
     def apply_render_state(self, frame: RenderStateFrame) -> RenderStateResult:
         """Atomically apply a render frame while preserving the native physics tick."""

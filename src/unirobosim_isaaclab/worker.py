@@ -396,6 +396,11 @@ def _dispatch(
     if operation == "reset":
         active.reset(cast(tuple[int, ...], args[0]))
         return active, None, False
+    if operation == "capture_checkpoint":
+        return active, active.capture_checkpoint(), False
+    if operation == "restore_checkpoint":
+        active.restore_checkpoint(cast(dict[str, object], args[0]))
+        return active, None, False
     if operation == "apply_render_state":
         active.apply_render_state(cast(NativeRenderStateFrame, args[0]))
         return active, None, False
@@ -1061,6 +1066,14 @@ class IsaacLabWorkerWorld:
     def reset(self, environment_indices: tuple[int, ...]) -> None:
         self._ensure_open("reset")
         self._runtime._request("reset", environment_indices)
+
+    def capture_checkpoint(self) -> dict[str, object]:
+        self._ensure_open("capture_checkpoint")
+        return cast(dict[str, object], self._runtime._request("capture_checkpoint"))
+
+    def restore_checkpoint(self, state: dict[str, object]) -> None:
+        self._ensure_open("restore_checkpoint")
+        self._runtime._request("restore_checkpoint", state)
 
     def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
         self._ensure_open("apply_render_state")

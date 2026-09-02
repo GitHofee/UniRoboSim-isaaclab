@@ -191,7 +191,7 @@ EasyAPI 默认使用 FXAA 并关闭纹理流式加载，以保持相机的全分
 
 ## Planning Scene 兼容性
 
-Adapter 0.10.14 要求 UniRoboSim Core `>=0.10.4,<0.11`，并将实体位姿定义为导入资产根 USD Prim 的位姿。物理 root link 与其他 child link 的位姿继续通过显式 planning link state 提供。初始创建会读取 USD 作者态的 entity-to-physical-root 变换，将公共 entity pose 换算成 Isaac Lab 的 physical-root `init_state`；运行时 `set_pose` 复用同一换算规则，reset 同时恢复两个坐标系。实体级位姿读写会先从 USD 矩阵移除 scale 与 shear，再提取并显式归一化四元数；set pose 针对同一个 Prim，并在不改变 articulation joint 状态和已写入 scale 的前提下整体移动关联物理刚体。Adapter 同时支持以原生 USD 实心覆盖物渲染资源型调试网格，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
+Adapter 0.10.15 要求 UniRoboSim Core `>=0.10.5,<0.11`，新增物理检查点，并将实体位姿定义为导入资产根 USD Prim 的位姿。物理 root link 与其他 child link 的位姿继续通过显式 planning link state 提供。初始创建会读取 USD 作者态的 entity-to-physical-root 变换，将公共 entity pose 换算成 Isaac Lab 的 physical-root `init_state`；运行时 `set_pose` 复用同一换算规则，reset 同时恢复两个坐标系。实体级位姿读写会先从 USD 矩阵移除 scale 与 shear，再提取并显式归一化四元数；set pose 针对同一个 Prim，并在不改变 articulation joint 状态和已写入 scale 的前提下整体移动关联物理刚体。Adapter 同时支持以原生 USD 实心覆盖物渲染资源型调试网格，并提供 `planning.scene@2`。Named planning frame 是由 `name`、`owner_link_name` 和 `source` 声明的物理参考系，不承载 grasp、place、handle 或任务语义；旧声明 schema 会被明确拒绝。PhysX `convexHull` 碰撞 carrier 既可以自身就是 Mesh，也可以是仅含一个且没有嵌套 `PhysicsCollisionAPI` 的后代 Mesh 的容器；多 Mesh 歧义和嵌套碰撞 carrier 仍会 fail closed。
 
 静态和复合 USD 场景会提供不可变 planning resource 与实时 world transform。
 少于三个顶点的退化 face 会被跳过；非法索引、不一致的方向数据，以及没有任何

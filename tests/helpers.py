@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,10 @@ class FakeNativeWorld:
             for entity in spec.entities
         }
         self.attachments: dict[tuple[int, str], EntityPath] = {}
+        self.checkpoint_state: dict[str, object] = {
+            "schema": "nvidia.isaaclab.native-state/1",
+            "attachments": [],
+        }
 
     def physics_diagnostics(self) -> NativePhysicsDiagnostics:
         return NativePhysicsDiagnostics(
@@ -134,6 +139,14 @@ class FakeNativeWorld:
         self.attachments = {
             key: child for key, child in self.attachments.items() if key[0] not in selected
         }
+
+    def capture_checkpoint(self) -> dict[str, object]:
+        self.calls.append(("capture_checkpoint", None))
+        return copy.deepcopy(self.checkpoint_state)
+
+    def restore_checkpoint(self, state: dict[str, object]) -> None:
+        self.calls.append(("restore_checkpoint", copy.deepcopy(state)))
+        self.checkpoint_state = copy.deepcopy(state)
 
     def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
         self.calls.append(("render_state", frame))

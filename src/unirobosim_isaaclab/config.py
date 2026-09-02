@@ -101,7 +101,9 @@ class IsaacLabAdapterConfig:
             try:
                 normalized = float(value)
             except (TypeError, ValueError):
-                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate") from None
+                raise ValidationError(
+                    f"{name} must be finite and positive", operation="isaaclab.config.validate"
+                ) from None
             if not math.isfinite(normalized) or normalized <= 0.0:
                 raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate")
             object.__setattr__(self, name, normalized)
@@ -112,7 +114,9 @@ class IsaacLabAdapterConfig:
             try:
                 normalized = float(value)
             except (TypeError, ValueError):
-                raise ValidationError(f"{name} must be finite and non-negative", operation="isaaclab.config.validate") from None
+                raise ValidationError(
+                    f"{name} must be finite and non-negative", operation="isaaclab.config.validate"
+                ) from None
             if not math.isfinite(normalized) or normalized < 0.0:
                 raise ValidationError(f"{name} must be finite and non-negative", operation="isaaclab.config.validate")
             object.__setattr__(self, name, normalized)
@@ -125,7 +129,9 @@ class IsaacLabAdapterConfig:
             try:
                 normalized = float(value)
             except (TypeError, ValueError):
-                raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate") from None
+                raise ValidationError(
+                    f"{name} must be finite and positive", operation="isaaclab.config.validate"
+                ) from None
             if not math.isfinite(normalized) or normalized <= 0.0:
                 raise ValidationError(f"{name} must be finite and positive", operation="isaaclab.config.validate")
             object.__setattr__(self, name, normalized)
@@ -151,7 +157,7 @@ class IsaacLabAdapterConfig:
             "position_stiffness": self.position_stiffness,
             "position_damping": self.position_damping,
         }
-        normalized: dict[str, float] = {}
+        normalized_gains: dict[str, float] = {}
         for name, value in optional_gains.items():
             if value is None:
                 continue
@@ -165,7 +171,7 @@ class IsaacLabAdapterConfig:
                 ) from exc
             if not math.isfinite(gain) or gain < 0.0:
                 raise ValidationError(f"{name} must be non-negative and finite", operation="isaaclab.config.validate")
-            normalized[name] = gain
+            normalized_gains[name] = gain
         if isinstance(self.velocity_damping, bool):
             raise ValidationError("velocity_damping must be numeric", operation="isaaclab.config.validate")
         try:
@@ -178,7 +184,7 @@ class IsaacLabAdapterConfig:
             raise ValidationError(
                 "velocity_damping must be non-negative and finite", operation="isaaclab.config.validate"
             )
-        normalized["velocity_damping"] = velocity_damping
+        normalized_gains["velocity_damping"] = velocity_damping
         object.__setattr__(self, "environment_spacing_m", spacing)
         if self.max_render_hz is not None:
             if isinstance(self.max_render_hz, bool):
@@ -200,7 +206,7 @@ class IsaacLabAdapterConfig:
                     operation="isaaclab.config.validate",
                 )
             object.__setattr__(self, "max_render_hz", max_render_hz)
-        for name, value in normalized.items():
+        for name, value in normalized_gains.items():
             object.__setattr__(self, name, value)
         if (
             not isinstance(self.max_cached_scene_commands, int)

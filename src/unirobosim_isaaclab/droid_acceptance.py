@@ -805,6 +805,7 @@ def _compose(
 ) -> tuple[object, Any]:
     control = import_module("fastsim.control")
     runtime = import_module("fastsim.runtime")
+    checkpoint_module = import_module("fastsim.integrations.unirobosim._checkpoint")
     adapter_module = import_module("fastsim.integrations.unirobosim.adapter")
     composition = import_module("fastsim.integrations.unirobosim.composition")
     fluid_emitter_module = import_module("fastsim.integrations.unirobosim._fluid_emitter")
@@ -858,6 +859,13 @@ def _compose(
         "droid-equivalence-isaaclab",
         native_overlay_available=projection.launch_profile != "headless-physics",
     )
+    checkpoint_root = checkpoint_module._CheckpointRoot(
+        run_id="droid-equivalence-isaaclab",
+        plan_digest=projection.plan_digest,
+        adapter=adapter,
+        executor=executor,
+        mark_planning_dirty=planning_raw._mark_scene_mutated,
+    )
     kernel = runtime.RuntimeKernel(
         plan,
         adapter,
@@ -883,6 +891,11 @@ def _compose(
     simulation_root._bind_authority_reads(kernel.submit_authority_read, lambda: kernel.snapshot)
     scene_command_root._bind_authority(kernel.submit_authority, lambda: kernel.snapshot)
     visualization_root._bind_authority(kernel.submit_authority, lambda: kernel.snapshot)
+    checkpoint_root._bind_authority(
+        kernel.submit_authority,
+        lambda: kernel.snapshot,
+        runtime.RuntimeService(kernel)._publish_application_event,
+    )
     executor.bind_authority_submitter(kernel.submit_authority)
     for observation_provider in projection_module.observation_providers(projection):
         kernel.observations.register(observation_provider)
@@ -892,6 +905,7 @@ def _compose(
         projection=projection,
         adapter=adapter,
         executor=executor,
+        checkpoint_root=checkpoint_root,
         planning_raw=planning_raw,
         simulation_root=simulation_root,
         recording_capture=None,
