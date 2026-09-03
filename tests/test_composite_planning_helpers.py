@@ -42,6 +42,40 @@ def _planning_requirement() -> CapabilityRequirement:
     return CapabilityRequirement(CapabilityId("planning.scene@2"))
 
 
+def test_isaac_sim_6_sphere_fill_collision_schema_is_admitted_but_unknown_schemas_fail_closed() -> None:
+    class _Attribute:
+        @staticmethod
+        def Get() -> bool:
+            return True
+
+    class _CollisionAPI:
+        @staticmethod
+        def GetCollisionEnabledAttr() -> _Attribute:
+            return _Attribute()
+
+    modules = SimpleNamespace(
+        UsdPhysics=SimpleNamespace(
+            CollisionAPI=lambda _prim: _CollisionAPI(),
+            FilteredPairsAPI=lambda _prim: None,
+        ),
+        PhysxSchema=SimpleNamespace(PhysxCollisionAPI=lambda _prim: None),
+    )
+    admission = object.__new__(_PlanningAdmission)
+    admission._m = modules
+    admission._accounted_filtered_pair_sources = set()
+
+    admitted = SimpleNamespace(
+        GetAppliedSchemas=lambda: ("PhysicsCollisionAPI", "PhysxSphereFillCollisionAPI"),
+    )
+    admission._validate_collision_common(admitted)
+
+    rejected = SimpleNamespace(
+        GetAppliedSchemas=lambda: ("PhysicsCollisionAPI", "PhysxUnknownCollisionAPI"),
+    )
+    with pytest.raises(NativePlanningError, match="collision_geometry_unsupported"):
+        admission._validate_collision_common(rejected)
+
+
 def test_planning_preflight_admits_composite_but_keeps_static_scene_fail_closed(tmp_path: Path) -> None:
     asset = tmp_path / "room.usda"
     asset.write_text("#usda 1.0\n", encoding="utf-8")

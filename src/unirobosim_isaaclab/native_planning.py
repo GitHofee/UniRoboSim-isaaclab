@@ -86,6 +86,7 @@ _SUPPORTED_COLLISION_SCHEMAS = frozenset(
         "PhysxConvexDecompositionCollisionAPI",
         "PhysxConvexHullCollisionAPI",
         "PhysxSDFMeshCollisionAPI",
+        "PhysxSphereFillCollisionAPI",
         "PhysxTriangleMeshCollisionAPI",
         "PhysxTriangleMeshSimplificationCollisionAPI",
     }
