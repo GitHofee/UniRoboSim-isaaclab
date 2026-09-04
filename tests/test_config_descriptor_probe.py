@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from unirobosim import CapabilityId, FrozenMap, ProbeReport, Provider, ValidationError
+from unirobosim import CapabilityId, EntityKind, FrozenMap, ProbeReport, Provider, ValidationError
 
 import unirobosim_isaaclab
 from unirobosim_isaaclab import CAPABILITIES, DESCRIPTOR, IsaacLabAdapterConfig, IsaacLabProvider
@@ -22,6 +22,7 @@ from unirobosim_isaaclab.native import (
     _native_name,
     _render_interval_steps,
     _render_step_enabled,
+    _resolved_gpu_max_num_partitions,
     _rotate_xyzw,
     _surface_from_tetrahedra,
 )
@@ -135,6 +136,47 @@ def test_default_position_gains_preserve_authored_asset_values() -> None:
     config = IsaacLabAdapterConfig()
     assert config.position_stiffness is None
     assert config.position_damping is None
+
+
+def test_gpu_partition_override_is_bounded_to_physx_supported_powers_of_two() -> None:
+    assert IsaacLabAdapterConfig().gpu_max_num_partitions is None
+    for value in (1, 2, 4, 8, 16, 32):
+        assert IsaacLabAdapterConfig(gpu_max_num_partitions=value).gpu_max_num_partitions == value
+    for invalid in (0, 3, 33, True, 1.0, "8"):
+        with pytest.raises(ValidationError, match="gpu_max_num_partitions"):
+            IsaacLabAdapterConfig(gpu_max_num_partitions=invalid)  # type: ignore[arg-type]
+
+
+def test_gpu_partition_auto_selection_avoids_small_world_partition_overhead() -> None:
+    small = SimpleNamespace(
+        environments=SimpleNamespace(count=1),
+        entities=(SimpleNamespace(kind=EntityKind.ARTICULATION, joint_names=tuple(range(16))),),
+    )
+    large = SimpleNamespace(
+        environments=SimpleNamespace(count=1),
+        entities=(SimpleNamespace(kind=EntityKind.ARTICULATION, joint_names=tuple(range(17))),),
+    )
+    replicated = SimpleNamespace(environments=SimpleNamespace(count=2), entities=())
+    many_rigids = SimpleNamespace(
+        environments=SimpleNamespace(count=1),
+        entities=tuple(
+            SimpleNamespace(kind=EntityKind.RIGID_BODY, joint_names=()) for _ in range(17)
+        ),
+    )
+    fluid = SimpleNamespace(
+        environments=SimpleNamespace(count=1),
+        entities=(SimpleNamespace(kind=EntityKind.PARTICLE_FLUID, joint_names=()),),
+    )
+
+    assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), small) == 1
+    assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), large) == 8
+    assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), replicated) == 8
+    assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), many_rigids) == 8
+    assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), fluid) == 8
+    assert (
+        _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(gpu_max_num_partitions=4), small)
+        == 4
+    )
 
 
 def test_default_worker_startup_budget_covers_cold_kit_without_unbounded_wait() -> None:

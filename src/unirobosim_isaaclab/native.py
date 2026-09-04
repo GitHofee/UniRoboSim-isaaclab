@@ -69,6 +69,51 @@ _POSITION_STIFFNESS_FALLBACK = 1000.0
 _POSITION_DAMPING_FALLBACK = 100.0
 _DEFAULT_CAMERA_RENDERER = "RaytracedLighting"
 _ISOSURFACE_CAMERA_RENDERER = "RealTimePathTracing"
+_DEFAULT_GPU_MAX_NUM_PARTITIONS = 8
+_SMALL_WORLD_GPU_MAX_NUM_PARTITIONS = 1
+_SMALL_WORLD_MAX_ARTICULATION_DOFS = 16
+_SMALL_WORLD_MAX_DYNAMIC_ENTITIES = 16
+
+
+def _resolved_gpu_max_num_partitions(config: IsaacLabAdapterConfig, spec: WorldSpec) -> int:
+    """Select GPU pipeline partitions without changing solver/contact fidelity.
+
+    A single small rigid/articulation world pays more kernel-partition overhead
+    than it gains from parallel partitioning.  Multi-environment worlds,
+    particle/deformable worlds, and larger articulations retain Isaac Lab's
+    default because they provide enough parallel work to benefit from it.
+    """
+
+    explicit = config.gpu_max_num_partitions
+    if explicit is not None:
+        return explicit
+    if spec.environments.count != 1:
+        return _DEFAULT_GPU_MAX_NUM_PARTITIONS
+    if any(
+        entity.kind
+        in {
+            EntityKind.PARTICLE_FLUID,
+            EntityKind.SURFACE_DEFORMABLE,
+            EntityKind.VOLUME_DEFORMABLE,
+        }
+        for entity in spec.entities
+    ):
+        return _DEFAULT_GPU_MAX_NUM_PARTITIONS
+    articulation_dofs = sum(
+        len(entity.joint_names)
+        for entity in spec.entities
+        if entity.kind is EntityKind.ARTICULATION
+    )
+    dynamic_entities = sum(
+        entity.kind in {EntityKind.ARTICULATION, EntityKind.RIGID_BODY}
+        for entity in spec.entities
+    )
+    if (
+        articulation_dofs <= _SMALL_WORLD_MAX_ARTICULATION_DOFS
+        and dynamic_entities <= _SMALL_WORLD_MAX_DYNAMIC_ENTITIES
+    ):
+        return _SMALL_WORLD_GPU_MAX_NUM_PARTITIONS
+    return _DEFAULT_GPU_MAX_NUM_PARTITIONS
 
 
 def _normalized_quaternion_xyzw(rotation: Any) -> tuple[float, float, float, float]:
@@ -1328,11 +1373,14 @@ class IsaacLabNativeWorld:
                 "this Isaac Lab 3.0 profile cannot combine USD-readback particles with "
                 f"tensor-backed deformables in one native world: {unsupported_mixed}"
             )
+        physx_cfg = self._m.PhysxCfg(
+            gpu_max_num_partitions=_resolved_gpu_max_num_partitions(self._config, self._spec)
+        )
         sim_cfg = sim_utils.SimulationCfg(
             dt=self._native_dt,
             gravity=self._spec.physics.gravity_m_s2,
             device=self._config.device,
-            physics=self._m.PhysxCfg(),
+            physics=physx_cfg,
             # PhysX 6 exposes particle state through USD sync, not the removed particle tensor view.
             use_fabric=not has_fluid,
             render_interval=self._render_interval_steps,

@@ -44,6 +44,10 @@ class IsaacLabAdapterConfig:
     position_stiffness: float | None = None
     position_damping: float | None = None
     velocity_damping: float = 100.0
+    # ``None`` selects a conservative topology-aware value when the native
+    # world is built.  An explicit power-of-two value remains available for
+    # reproducible expert tuning.
+    gpu_max_num_partitions: int | None = None
     max_cached_scene_commands: int = 4096
     # Cold containers can spend tens of seconds compiling/loading Kit state.
     # These budgets remain finite and affect only a worker that has not become
@@ -208,6 +212,15 @@ class IsaacLabAdapterConfig:
             object.__setattr__(self, "max_render_hz", max_render_hz)
         for name, value in normalized_gains.items():
             object.__setattr__(self, name, value)
+        if self.gpu_max_num_partitions is not None and (
+            not isinstance(self.gpu_max_num_partitions, int)
+            or isinstance(self.gpu_max_num_partitions, bool)
+            or self.gpu_max_num_partitions not in {1, 2, 4, 8, 16, 32}
+        ):
+            raise ValidationError(
+                "gpu_max_num_partitions must be None or a power of two in [1, 32]",
+                operation="isaaclab.config.validate",
+            )
         if (
             not isinstance(self.max_cached_scene_commands, int)
             or isinstance(self.max_cached_scene_commands, bool)
