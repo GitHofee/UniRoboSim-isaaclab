@@ -1,3 +1,3 @@
 """Single source of truth for the Adapter distribution identity."""
 
-DISTRIBUTION_VERSION = "0.10.16"
+DISTRIBUTION_VERSION = "0.10.17"

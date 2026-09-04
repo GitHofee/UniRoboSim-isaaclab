@@ -53,6 +53,11 @@ from .native_protocols import (
     NativeSensorSample,
     PointBatch,
 )
+from .physics_activation import (
+    DynamicRigidBodyCandidate,
+    PhysicsActivationController,
+    build_physics_activation_controller,
+)
 
 Vector3 = tuple[float, float, float]
 Segment = tuple[Vector3, Vector3]
@@ -1146,6 +1151,8 @@ class IsaacLabNativeWorld:
         self._embedded_joint_paths: dict[EntityPath, tuple[tuple[str, ...], ...]] = {}
         self._composite_rigid_states: list[_CompositeRigidState] = []
         self._composite_articulation_states: list[_CompositeArticulationState] = []
+        self._physics_activation: PhysicsActivationController | None = None
+        self._physics_activation_live_state = False
         self._mounted_cameras: dict[EntityPath, _MountedCamera] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
@@ -1378,8 +1385,7 @@ class IsaacLabNativeWorld:
         if not any(
             entity.kind in {EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE} for entity in self._spec.entities
         ):
-            ground = sim_utils.GroundPlaneCfg(color=(0.2, 0.23, 0.28))
-            ground.func("/World/unirobosimGround", ground)
+            self._author_procedural_ground()
         # Containers must be composed before any embedded entity resolves exact
         # source Prim paths. This pass is deliberately independent of WorldSpec
         # ordering and authors each source asset exactly once per environment.
@@ -1405,6 +1411,7 @@ class IsaacLabNativeWorld:
         for entity in self._spec.entities:
             if entity.kind is EntityKind.CAMERA_SENSOR:
                 self._author_camera(entity)
+        self._initialize_physics_activation()
         self._sim.reset()
         self._initialize_usd_articulations()
         self._initialize_usd_rigids()
@@ -1413,6 +1420,8 @@ class IsaacLabNativeWorld:
         self._initialize_articulations()
         self._initialize_rigids()
         self._initialize_deformables()
+        self._initialize_dynamic_physics_activation()
+        self._physics_activation_live_state = True
         self.reset(tuple(range(self._spec.environments.count)))
         self._initial_entity_prim_poses = {
             path: tuple(state.pose for state in row)
@@ -1426,6 +1435,164 @@ class IsaacLabNativeWorld:
             self._ensure_camera_render()
             for camera in self._cameras.values():
                 camera.update(0.0, force_recompute=True)
+
+    def _initialize_physics_activation(self) -> None:
+        raw = self._spec.metadata.get("fastsim_physics_activation")
+        if raw is None:
+            return
+        anchor_paths = tuple(EntityPath(value) for value in raw["anchor_paths"])
+        protected_roots: list[str] = []
+        for entity in self._spec.entities:
+            binding = entity.embedded_binding
+            if binding is None:
+                continue
+            container_roots = self._composite_scene_roots.get(binding.container_path)
+            if container_roots is None:
+                raise RuntimeError("embedded physics-activation entity has no composite container")
+            for container_root in container_roots:
+                protected_roots.extend(
+                    f"{container_root}/{item.relative_prim_path}" for item in binding.link_prims
+                )
+        scene_roots = tuple(
+            root
+            for collection in (self._static_scene_roots, self._composite_scene_roots)
+            for roots in collection.values()
+            for root in roots
+        )
+        self._physics_activation = build_physics_activation_controller(
+            self._m,
+            self._spec,
+            scene_roots=scene_roots,
+            protected_roots=tuple(protected_roots),
+            anchor_points=lambda: self._physics_activation_anchor_points(anchor_paths),
+        )
+        if self._physics_activation is not None:
+            diagnostics = self._physics_activation.diagnostics
+            self._m.carb.log_info(
+                "UniRoboSim proximity physics activation: "
+                f"enabled={diagnostics.enabled_count} disabled={diagnostics.disabled_count} "
+                f"protected={diagnostics.protected_count}"
+            )
+
+    def _initialize_dynamic_physics_activation(self) -> None:
+        controller = self._physics_activation
+        if controller is None:
+            return
+        if self._config.render:
+            # PhysX 6.0's per-rigid-body eDISABLE_SIMULATION path can corrupt
+            # RTX/Cubric device state when a render product is active. Static
+            # collider activation remains safe, but dynamic-body suspension is
+            # therefore restricted to the true physics-only launch profile.
+            controller.configure_dynamic_candidates(())
+            return
+        raw = self._spec.metadata["fastsim_physics_activation"]
+        stage = self._m.sim_utils.get_current_stage()
+        candidates: list[DynamicRigidBodyCandidate] = []
+        for value in raw["managed_paths"]:
+            path = EntityPath(value)
+            entity = self._entity_specs.get(path)
+            if entity is None or entity.kind is not EntityKind.RIGID_BODY:
+                raise RuntimeError(f"physics activation managed entity is invalid: {value}")
+            body_paths: list[str] = []
+            binding = entity.embedded_binding
+            if binding is not None:
+                container_roots = self._composite_scene_roots.get(binding.container_path)
+                if container_roots is None:
+                    raise RuntimeError(f"physics activation container is unavailable: {value}")
+                for root in container_roots:
+                    for item in binding.link_prims:
+                        prim = stage.GetPrimAtPath(f"{root}/{item.relative_prim_path}")
+                        if not prim or not prim.IsValid() or not prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
+                            raise RuntimeError(
+                                f"physics activation link is not a rigid body: {root}/{item.relative_prim_path}"
+                            )
+                        body_paths.append(self._prim_path_string(prim))
+            else:
+                native_name = _native_name(path)
+                for environment in range(self._spec.environments.count):
+                    root_path = f"/World/env_{environment}/{native_name}"
+                    root = stage.GetPrimAtPath(root_path)
+                    if not root or not root.IsValid():
+                        raise RuntimeError(f"physics activation entity root is unavailable: {root_path}")
+                    body_paths.extend(
+                        self._prim_path_string(prim)
+                        for prim in self._m.Usd.PrimRange(root)
+                        if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                    )
+            requested = tuple(dict.fromkeys(body_paths))
+            if not requested:
+                raise RuntimeError(f"physics activation entity has no rigid bodies: {value}")
+            view = self._usd_simulation_view().create_rigid_body_view(list(requested))
+            actual = tuple(view.prim_paths)
+            if view.count != len(requested) or set(actual) != set(requested):
+                raise RuntimeError(
+                    "physics activation rigid-body view did not preserve the requested Prim set; "
+                    f"entity={value}, requested={len(requested)}, actual={view.count}"
+                )
+            candidates.append(DynamicRigidBodyCandidate(path=value, view=view))
+        controller.configure_dynamic_candidates(tuple(candidates))
+        diagnostics = controller.diagnostics
+        self._m.carb.log_info(
+            "UniRoboSim proximity dynamic activation: "
+            f"managed={diagnostics.dynamic_candidate_count} "
+            f"enabled={diagnostics.dynamic_enabled_count} disabled={diagnostics.dynamic_disabled_count}"
+        )
+
+    def _physics_activation_anchor_points(
+        self,
+        paths: tuple[EntityPath, ...],
+    ) -> Any:
+        points: list[Any] = []
+        for path in paths:
+            positions: Any | None = None
+            if not self._physics_activation_live_state:
+                entity = self._entity_specs.get(path)
+                if entity is None:
+                    raise RuntimeError(f"physics activation support entity is unavailable: {path.value}")
+                positions = self._m.torch.tensor(
+                    [
+                        tuple(entity.pose.position[axis] + origin[axis] for axis in range(3))
+                        for origin in self._origins_cpu
+                    ],
+                    device=self._sim.device,
+                    dtype=self._m.torch.float32,
+                )
+            elif path in self._articulations:
+                positions = self._articulations[path].data.body_pos_w.torch
+            elif path in self._usd_articulation_views:
+                positions = self._usd_articulation_views[path].get_link_transforms()[..., :3]
+            elif path in self._rigids:
+                positions = self._rigids[path].data.root_link_pose_w.torch[..., :3]
+            elif path in self._usd_rigid_views:
+                positions = self._usd_rigid_views[path].get_transforms()[..., :3]
+            if positions is None:
+                raise RuntimeError(f"physics activation support entity is not initialized: {path.value}")
+            points.append(positions.reshape(-1, 3))
+        if not points:
+            raise RuntimeError("physics activation has no initialized support entities")
+        return self._m.torch.cat(points, dim=0)
+
+    def _pin_physics_activation(self, path: EntityPath) -> None:
+        controller = getattr(self, "_physics_activation", None)
+        if controller is not None:
+            controller.pin(path.value)
+
+    def _author_procedural_ground(self) -> None:
+        """Author the implicit ground without loading Isaac's Nucleus USD asset."""
+
+        stage = self._m.sim_utils.get_current_stage()
+        root_path = "/World/unirobosimGround"
+        self._m.UsdGeom.Xform.Define(stage, root_path)
+        plane = self._m.UsdGeom.Plane.Define(stage, f"{root_path}/plane")
+        plane.CreateAxisAttr().Set("Z")
+        plane.CreateWidthAttr().Set(100.0)
+        plane.CreateLengthAttr().Set(100.0)
+        plane.CreateDoubleSidedAttr().Set(True)
+        plane.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.constant).Set(
+            self._m.Vt.Vec3fArray([self._m.Gf.Vec3f(0.2, 0.23, 0.28)])
+        )
+        collision = self._m.UsdPhysics.CollisionAPI.Apply(plane.GetPrim())
+        collision.CreateCollisionEnabledAttr().Set(True)
 
     def _configure_high_level_initial_root_pose(
         self,
@@ -2674,6 +2841,11 @@ class IsaacLabNativeWorld:
             self._initial_deformable[path] = (state, target)
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
+        physics_activation = getattr(self, "_physics_activation", None)
+        if physics_activation is not None:
+            # Restore managed bodies while enabled; the forced update at the
+            # end freezes only bodies that remain outside every robot radius.
+            physics_activation.reset_dynamic_state()
         if getattr(self, "_runtime_attachments", None):
             selected = frozenset(environment_indices)
             stage = self._m.sim_utils.get_current_stage()
@@ -2836,6 +3008,8 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         self._sim.forward()
         self._update_assets(0.0)
+        if physics_activation is not None:
+            physics_activation.update(self._step_index, force=True)
         self._sync_all_mounted_cameras()
         self._invalidate_render()
 
@@ -3297,6 +3471,7 @@ class IsaacLabNativeWorld:
         environment_indices: tuple[int, ...],
         degree_of_freedom_indices: tuple[int, ...],
     ) -> None:
+        self._pin_physics_activation(path)
         if path in self._usd_articulation_views:
             self._apply_usd_articulation(path, mode, targets, environment_indices, degree_of_freedom_indices)
             return
@@ -3580,6 +3755,7 @@ class IsaacLabNativeWorld:
         torques_n_m: Matrix,
         environment_indices: tuple[int, ...],
     ) -> None:
+        self._pin_physics_activation(path)
         if path in self._usd_rigid_views:
             forces, torques = self._usd_rigid_wrenches[path]
             for row_index, environment in enumerate(environment_indices):
@@ -4454,6 +4630,7 @@ class IsaacLabNativeWorld:
         Entity-level callers must use :meth:`set_entity_prim_pose`.
         """
 
+        self._pin_physics_activation(path)
         self._set_physical_rigid_body_pose(path, position_m, orientation_xyzw, environment_index)
         assert self._sim is not None
         self._sim.forward()
@@ -4508,6 +4685,7 @@ class IsaacLabNativeWorld:
         entity = self._entity_specs.get(path)
         if entity is None or entity.kind not in {EntityKind.RIGID_BODY, EntityKind.ARTICULATION}:
             raise ValueError("entity Prim pose can be set only for a rigid body or articulation")
+        self._pin_physics_activation(path)
         target = Pose(position_m, orientation_xyzw)
         old_entity = self.read_entity_prim_states((path,))[0][environment_index].pose
         old_physical_root = self._attachment_endpoint_pose(path, None, environment_index)
@@ -4633,6 +4811,8 @@ class IsaacLabNativeWorld:
         child_body_path = self._attachment_body_path(child_path, child_link_name, environment_index)
         if parent_body_path == child_body_path:
             raise ValueError("attachment endpoints resolve to the same physical body")
+        self._pin_physics_activation(parent_path)
+        self._pin_physics_activation(child_path)
         parent_endpoint_pose = self._attachment_endpoint_pose(
             parent_path, parent_link_name, environment_index
         )
@@ -5136,6 +5316,9 @@ class IsaacLabNativeWorld:
     def step(self, count: int) -> None:
         assert self._sim is not None
         for _ in range(count):
+            physics_activation = getattr(self, "_physics_activation", None)
+            if physics_activation is not None:
+                physics_activation.update(self._step_index)
             for substep_index in range(self._spec.physics.substeps):
                 for path, view in self._usd_rigid_views.items():
                     forces, torques = self._usd_rigid_wrenches[path]
@@ -5203,6 +5386,8 @@ class IsaacLabNativeWorld:
         self._embedded_joint_paths.clear()
         self._composite_rigid_states.clear()
         self._composite_articulation_states.clear()
+        self._physics_activation = None
+        self._physics_activation_live_state = False
         self._mounted_cameras.clear()
         self._usd_tensor_view = None
         self._contacts.clear()

@@ -63,6 +63,7 @@ from .native_protocols import (
     NativePlanningResource,
     NativePlanningState,
 )
+from .physics_activation import collision_enabled_for_planning
 
 _WORLD_FRAME_ID = "frame.world"
 _SYSTEM_FRAME_ID = "frame.system.simulator_effective"
@@ -996,7 +997,7 @@ class _PlanningAdmission:
             prim
             for prim in self._walk(root)
             if prim.HasAPI(self._m.UsdPhysics.CollisionAPI)
-            and self._m.UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False
+            and collision_enabled_for_planning(self._m.UsdPhysics, prim)
         )
         if len(candidates) != 1 or candidates[0].GetTypeName() != "Plane":
             raise NativePlanningError("collision_geometry_unsupported")
@@ -1119,8 +1120,7 @@ class _PlanningAdmission:
         for prim in self._walk(root):
             if not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
                 continue
-            collision = self._m.UsdPhysics.CollisionAPI(prim)
-            if collision.GetCollisionEnabledAttr().Get() is False:
+            if not collision_enabled_for_planning(self._m.UsdPhysics, prim):
                 continue
             owner_path = _nearest_body(str(prim.GetPath()), bodies)
             if owner_path is None:
@@ -1364,8 +1364,7 @@ class _PlanningAdmission:
                 self._accounted_constraints.add(str(prim.GetPath()))
             if not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
                 continue
-            collision = self._m.UsdPhysics.CollisionAPI(prim)
-            if collision.GetCollisionEnabledAttr().Get() is False:
+            if not collision_enabled_for_planning(self._m.UsdPhysics, prim):
                 continue
             path = str(prim.GetPath())
             if any(_path_is_at_or_under(path, moving) for moving in moving_absolute_roots):
@@ -1595,8 +1594,7 @@ class _PlanningAdmission:
         for prim in self._walk(self._stage.GetPrimAtPath(moving_root)):
             if not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
                 continue
-            collision = self._m.UsdPhysics.CollisionAPI(prim)
-            if collision.GetCollisionEnabledAttr().Get() is False:
+            if not collision_enabled_for_planning(self._m.UsdPhysics, prim):
                 continue
             owner_path = _nearest_body(str(prim.GetPath()), bodies)
             if owner_path is None:
@@ -1837,8 +1835,7 @@ class _PlanningAdmission:
         )
 
     def _validate_collision_common(self, prim: Any) -> None:
-        collision = self._m.UsdPhysics.CollisionAPI(prim)
-        if collision.GetCollisionEnabledAttr().Get() is False:
+        if not collision_enabled_for_planning(self._m.UsdPhysics, prim):
             raise NativePlanningError("catalog_invalid")
         applied = set(prim.GetAppliedSchemas())
         unexpected = {
@@ -2615,10 +2612,8 @@ class _PlanningAdmission:
                         self._accounted_filtered_pair_sources.add(str(clone.GetPath()))
                 for relative, reference in reference_colliders.items():
                     clone = clone_colliders[relative]
-                    reference_enabled = (
-                        self._m.UsdPhysics.CollisionAPI(reference).GetCollisionEnabledAttr().Get() is not False
-                    )
-                    clone_enabled = self._m.UsdPhysics.CollisionAPI(clone).GetCollisionEnabledAttr().Get() is not False
+                    reference_enabled = collision_enabled_for_planning(self._m.UsdPhysics, reference)
+                    clone_enabled = collision_enabled_for_planning(self._m.UsdPhysics, clone)
                     if reference_enabled != clone_enabled:
                         raise NativePlanningError("catalog_invalid")
                     if not reference_enabled:
@@ -2695,7 +2690,7 @@ class _PlanningAdmission:
             if prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
                 live_bodies.add(str(prim.GetPath()))
             if prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
-                if self._m.UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False:
+                if collision_enabled_for_planning(self._m.UsdPhysics, prim):
                     live_colliders.add(str(prim.GetPath()))
             if prim.IsA(self._m.UsdPhysics.Joint):
                 path = str(prim.GetPath())

@@ -94,7 +94,7 @@ def test_release_metadata_requires_the_matching_core_contract() -> None:
     project_root = Path(__file__).resolve().parents[1]
     with (project_root / "pyproject.toml").open("rb") as stream:
         project_file = tomllib.load(stream)
-    assert project_file["project"]["version"] == "0.10.16"
+    assert project_file["project"]["version"] == "0.10.17"
     assert project_file["project"]["dependencies"] == ["unirobosim>=0.10.5,<0.11"]
     assert project_file["project"]["optional-dependencies"]["dev"] == [
         "mypy==1.20.2",

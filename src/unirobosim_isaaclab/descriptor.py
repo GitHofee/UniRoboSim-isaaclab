@@ -123,6 +123,25 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(
+            CapabilityId("physics.activation.proximity@1"),
+            FrozenMap(
+                {
+                    "scope": "static-scene-colliders-and-public-rigid-bodies",
+                    "anchors": "fastsim-public-robots",
+                    "dynamic_body_suspension": "headless-physics-only",
+                    "distance_metric": "world-aabb",
+                    "planning_geometry": "preserved",
+                    "update": "bounded-cadence-with-hysteresis",
+                }
+            ),
+            limitations=(
+                "rendering profiles retain dynamic rigid bodies because PhysX 6 runtime disable is not RTX-safe",
+                "articulations retain PhysX native sleep behavior because articulation links "
+                "cannot be disabled independently",
+                "large colliders intersecting the activation radius remain active as one authored collider",
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("entity.embedded-binding@1"),
             FrozenMap(
                 {

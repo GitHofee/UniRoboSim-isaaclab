@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.17
+
+- Replace Isaac Lab's Nucleus-backed default ground USD with an entirely local,
+  procedurally authored USD plane and collision shape.
+- Add opt-in proximity physics activation for static scene colliders, plus safe
+  ordinary rigid-body suspension in the headless physics-only profile.
+
 ## 0.10.16
 
 - Express runtime USD FixedJoint local poses in the coordinate frames of the
