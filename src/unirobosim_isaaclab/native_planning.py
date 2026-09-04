@@ -12,6 +12,8 @@ import hashlib
 import json
 import math
 import struct
+import sys
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,8 @@ from unirobosim import (
 )
 
 from ._collision_mesh import single_exact_convex_mesh
+from ._planning_cache import PlanningMeshCache
+from ._planning_cache import cache_key as planning_cache_key
 from .native import IsaacLabNativeWorld, _native_name
 from .native_protocols import (
     NativePlanningCatalog,
@@ -69,7 +73,7 @@ _MAX_GEOMETRY_RESOURCE_BYTES = 64 * 1024 * 1024
 _MAX_FILTERED_COLLISION_BODIES = 128
 _MAX_FILTER_CLIQUE_SEARCH_STATES = 1_000_000
 _COLLISION_FILTER_PROFILE = "usd-effective-owner-pairs-to-bilateral-bitmask-v1"
-_PROVENANCE_PROFILE = "isaaclab-3.0-complete-collision-forest-v3"
+_PROVENANCE_PROFILE = "isaaclab-3.0-complete-collision-forest-v5"
 _MESH_CANONICALIZATION = "float32-le-vertices-then-uint32-le-triangles-v1"
 _COMPOSITE_ENTITY_POSE = "__container_entity_pose__"
 _SUPPORTED_COLLISION_SCHEMAS = frozenset(
@@ -180,6 +184,36 @@ def _file_sha256(path: Path) -> str:
 def _json_sha256(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _mesh_source_sha256(
+    vertices: tuple[tuple[float, float, float], ...],
+    face_counts: tuple[int, ...],
+    face_indices: tuple[int, ...],
+    hole_faces: tuple[int, ...],
+    subdivision: str,
+    orientation: str,
+) -> str:
+    """Hash canonical numeric mesh input without materializing a huge JSON document."""
+
+    digest = hashlib.sha256(b"unirobosim-planning-mesh-input-v1\0")
+
+    def update_numeric(typecode: str, values: Any) -> None:
+        packed = array(typecode, values)
+        if sys.byteorder != "little":
+            packed.byteswap()
+        digest.update(len(packed).to_bytes(8, "little"))
+        digest.update(memoryview(packed).cast("B"))
+
+    update_numeric("f", (component for vertex in vertices for component in vertex))
+    update_numeric("I", face_counts)
+    update_numeric("I", face_indices)
+    update_numeric("I", hole_faces)
+    for text in (subdivision, orientation):
+        encoded = text.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _float_tuple(value: Any, size: int) -> tuple[float, ...]:
@@ -724,7 +758,13 @@ class _PlanningAdmission:
         self._accounted_constraints: set[str] = set()
         self._accounted_filtered_pair_sources: set[str] = set()
         self._next_collision_filter_bit = 1
-        self._catalog = self._build_catalog()
+        self._walk_cache: dict[str, tuple[Any, ...]] = {}
+        self._xform_cache = self._m.UsdGeom.XformCache()
+        self._persistent_mesh_cache = PlanningMeshCache()
+        try:
+            self._catalog = self._build_catalog()
+        finally:
+            self._persistent_mesh_cache.close()
 
     @property
     def catalog(self) -> NativePlanningCatalog:
@@ -737,7 +777,12 @@ class _PlanningAdmission:
             raise NativePlanningError("resource_missing") from None
 
     def _walk(self, root: Any) -> tuple[Any, ...]:
-        return tuple(self._m.Usd.PrimRange(root, self._m.Usd.TraverseInstanceProxies()))
+        key = str(root.GetPath())
+        cached = self._walk_cache.get(key)
+        if cached is None:
+            cached = tuple(self._m.Usd.PrimRange(root, self._m.Usd.TraverseInstanceProxies()))
+            self._walk_cache[key] = cached
+        return cached
 
     def _entity_root(self, spec: Any, environment_index: int) -> Any:
         root = self._stage.GetPrimAtPath(f"/World/env_{environment_index}/{_native_name(spec.path)}")
@@ -962,7 +1007,7 @@ class _PlanningAdmission:
         self._validate_collision_common(plane)
         pose, scale = _matrix_local_pose(
             self._m,
-            self._m.UsdGeom.XformCache().GetLocalToWorldTransform(plane),
+            self._xform_cache.GetLocalToWorldTransform(plane),
         )
         if max(scale) - min(scale) > 1.0e-10:
             raise NativePlanningError("collision_geometry_unsupported")
@@ -1389,7 +1434,7 @@ class _PlanningAdmission:
         reference_names = tuple(sorted(body_name_by_path.values()))
         tensor_rows: list[dict[str, str]] = []
         static_poses: list[dict[str, PlanningPose]] = []
-        cache = self._m.UsdGeom.XformCache()
+        cache = self._xform_cache
         for environment_index in range(self._world._spec.environments.count):
             environment_root = self._entity_root(spec, environment_index)
             environment_root_path = str(environment_root.GetPath())
@@ -1838,7 +1883,7 @@ class _PlanningAdmission:
         enabled_self_collisions: bool = True,
     ) -> tuple[PlanningGeometryDescriptor, ...]:
         self._validate_collision_common(prim)
-        cache = self._m.UsdGeom.XformCache()
+        cache = self._xform_cache
         matrix = _effective_collision_relative_transform(cache, prim, owner_body)
         mesh_capable = not any(
             prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
@@ -1960,10 +2005,26 @@ class _PlanningAdmission:
             "none",
         }:
             raise NativePlanningError("collision_geometry_unsupported")
-        mesh_input = _reflect_mesh_input(self._mesh_input(prim), reflection)
-        if baked_linear is not None:
-            mesh_input = _bake_mesh_linear_transform(mesh_input, baked_linear)
+        resolved_key = planning_cache_key(
+            _PROVENANCE_PROFILE,
+            _MESH_CANONICALIZATION,
+            str(self._world._spec.build_resource_manifest_sha256),
+            json.dumps(common, sort_keys=True, separators=(",", ":")),
+            approximation,
+        )
+        mesh_source_sha = planning_cache_key("effective-mesh-v1", resolved_key)
+        resolved_components = (
+            None
+            if approximation == "boundingCube"
+            else self._persistent_mesh_cache.get(planning_cache_key("resolved-components-v1", resolved_key))
+        )
+        mesh_input: _MeshInput | None = None
+        if resolved_components is None:
+            mesh_input = _reflect_mesh_input(self._mesh_input(prim), reflection)
+            if baked_linear is not None:
+                mesh_input = _bake_mesh_linear_transform(mesh_input, baked_linear)
         if approximation == "boundingCube":
+            assert mesh_input is not None
             lower = tuple(min(vertex[axis] for vertex in mesh_input.vertices) for axis in range(3))
             upper = tuple(max(vertex[axis] for vertex in mesh_input.vertices) for axis in range(3))
             dimensions = (upper[0] - lower[0], upper[1] - lower[1], upper[2] - lower[2])
@@ -1994,7 +2055,7 @@ class _PlanningAdmission:
                             **common,
                             "representation": "box",
                             "approximation": approximation,
-                            "mesh_source_sha256": mesh_input.source_sha256,
+                            "mesh_source_sha256": mesh_source_sha,
                             "bounds": [lower, upper],
                             "center": center,
                         }
@@ -2004,13 +2065,23 @@ class _PlanningAdmission:
             )
 
         if approximation in {"convexHull", "convexDecomposition"}:
-            components = self._cook_convex_components(mesh_input, approximation)
+            components = (
+                resolved_components
+                if resolved_components is not None
+                else self._cook_convex_components(mesh_input, approximation)  # type: ignore[arg-type]
+            )
             if approximation == "convexHull" and len(components) != 1:
                 raise NativePlanningError("collision_cooking_failed")
             representation = PlanningGeometryRepresentation.CONVEX_MESH
         else:
-            components = (self._canonical_triangle_mesh(mesh_input),)
+            components = (
+                resolved_components
+                if resolved_components is not None
+                else (self._canonical_triangle_mesh(mesh_input),)  # type: ignore[arg-type]
+            )
             representation = PlanningGeometryRepresentation.TRIANGLE_MESH
+        if resolved_components is None:
+            self._persistent_mesh_cache.put(planning_cache_key("resolved-components-v1", resolved_key), components)
 
         descriptors: list[PlanningGeometryDescriptor] = []
         for component_index, (content, vertex_count, triangle_count) in enumerate(components):
@@ -2035,7 +2106,7 @@ class _PlanningAdmission:
                     **common,
                     "representation": representation.value,
                     "approximation": approximation,
-                    "mesh_source_sha256": mesh_input.source_sha256,
+                    "mesh_source_sha256": mesh_source_sha,
                     "component_index": component_index,
                     "component_count": len(components),
                     "content_sha256": digest,
@@ -2077,7 +2148,7 @@ class _PlanningAdmission:
         indices = tuple(int(value) for value in (mesh.GetFaceVertexIndicesAttr().Get() or ()))
         if not points:
             raise NativePlanningError("collision_cooking_failed")
-        matrix, resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(mesh_prim, carrier)
+        matrix, resets = self._xform_cache.ComputeRelativeTransform(mesh_prim, carrier)
         if resets:
             raise NativePlanningError("collision_cooking_failed")
         transformed = tuple(matrix.Transform(point) for point in points)
@@ -2094,15 +2165,14 @@ class _PlanningAdmission:
             orientation=orientation,
             hole_faces=frozenset(hole_faces),
         )
-        input_sha = _json_sha256(
-            {
-                "vertices": vertices,
-                "face_counts": counts,
-                "face_indices": indices,
-                "hole_faces": hole_faces,
-                "subdivision": str(mesh.GetSubdivisionSchemeAttr().Get() or "none"),
-                "orientation": orientation,
-            }
+        subdivision = str(mesh.GetSubdivisionSchemeAttr().Get() or "none")
+        input_sha = _mesh_source_sha256(
+            vertices,
+            counts,
+            indices,
+            hole_faces,
+            subdivision,
+            orientation,
         )
         return _MeshInput(
             vertices,
@@ -2110,7 +2180,7 @@ class _PlanningAdmission:
             indices,
             triangles,
             hole_faces,
-            str(mesh.GetSubdivisionSchemeAttr().Get() or "none"),
+            subdivision,
             orientation,
             input_sha,
         )
@@ -2119,10 +2189,18 @@ class _PlanningAdmission:
         cached = self._triangle_cache.get(mesh_input.source_sha256)
         if cached is not None:
             return cached
+        persistent_key = planning_cache_key(
+            _PROVENANCE_PROFILE, _MESH_CANONICALIZATION, "triangle", mesh_input.source_sha256
+        )
+        persistent = self._persistent_mesh_cache.get(persistent_key)
+        if persistent is not None and len(persistent) == 1:
+            self._triangle_cache[mesh_input.source_sha256] = persistent[0]
+            return persistent[0]
         vertex_bytes = b"".join(struct.pack("<fff", *vertex) for vertex in mesh_input.vertices)
         index_bytes = b"".join(struct.pack("<III", *triangle) for triangle in mesh_input.triangles)
         result = (vertex_bytes + index_bytes, len(mesh_input.vertices), len(mesh_input.triangles))
         self._triangle_cache[mesh_input.source_sha256] = result
+        self._persistent_mesh_cache.put(persistent_key, (result,))
         return result
 
     def _cook_convex_components(
@@ -2134,6 +2212,18 @@ class _PlanningAdmission:
         cached = self._convex_cache.get(cache_key)
         if cached is not None:
             return cached
+
+        persistent_key = planning_cache_key(
+            _PROVENANCE_PROFILE,
+            _MESH_CANONICALIZATION,
+            "physx-convex-v1",
+            approximation,
+            mesh_input.source_sha256,
+        )
+        persistent = self._persistent_mesh_cache.get(persistent_key)
+        if persistent is not None:
+            self._convex_cache[cache_key] = persistent
+            return persistent
 
         import omni.physx  # type: ignore[import-not-found]
         from pxr import PhysicsSchemaTools, Usd, UsdGeom, UsdPhysics, UsdUtils, Vt  # type: ignore[import-not-found]
@@ -2195,6 +2285,7 @@ class _PlanningAdmission:
             components.append((vertex_bytes + index_bytes, len(cooked_vertices), len(triangles)))
         result = tuple(sorted(components, key=lambda item: (hashlib.sha256(item[0]).digest(), item[0])))
         self._convex_cache[cache_key] = result
+        self._persistent_mesh_cache.put(persistent_key, result)
         return result
 
     def _declared_frames(
@@ -2259,7 +2350,7 @@ class _PlanningAdmission:
                         for prim in self._walk(root)
                         if prim.GetName() == native_owner_name and prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
                     )
-                matrix, resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(matches[0], owner_prim)
+                matrix, resets = self._xform_cache.ComputeRelativeTransform(matches[0], owner_prim)
                 if resets:
                     raise NativePlanningError("frame_ambiguous")
                 local_pose, scale = _matrix_local_pose(self._m, matrix)
@@ -2361,7 +2452,7 @@ class _PlanningAdmission:
     ) -> tuple[object, ...]:
         self._validate_collision_common(prim)
         matrix = _effective_collision_relative_transform(
-            self._m.UsdGeom.XformCache(),
+            self._xform_cache,
             prim,
             owner_body,
         )
@@ -2454,10 +2545,10 @@ class _PlanningAdmission:
                     raise NativePlanningError("frame_missing")
                 reference_owner = reference_owners[0]
                 clone_owner = clone_owners[0]
-            reference_matrix, reference_resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(
+            reference_matrix, reference_resets = self._xform_cache.ComputeRelativeTransform(
                 reference_matches[0], reference_owner
             )
-            clone_matrix, clone_resets = self._m.UsdGeom.XformCache().ComputeRelativeTransform(
+            clone_matrix, clone_resets = self._xform_cache.ComputeRelativeTransform(
                 clone_matches[0], clone_owner
             )
             if reference_resets or clone_resets:
@@ -2470,6 +2561,8 @@ class _PlanningAdmission:
                 raise NativePlanningError("frame_ambiguous")
 
     def _verify_cloned_environments(self) -> None:
+        if self._world._spec.environments.count == 1:
+            return
         for spec in self._world._spec.entities:
             if spec.kind is EntityKind.CAMERA_SENSOR or spec.embedded_binding is not None:
                 continue
@@ -2893,6 +2986,5 @@ class IsaacLabNativePlanningWorld(IsaacLabNativeWorld):
         if type(geometry_id) is not str or not geometry_id:
             raise NativePlanningError("resource_missing")
         return self._planning().resource(geometry_id)
-
 
 __all__ = ["IsaacLabNativePlanningWorld"]
