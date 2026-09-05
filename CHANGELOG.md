@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.18
+
+- Honor the optional FastSim runtime physics profile after USD composition and
+  before the first simulation reset.
+- Map `balanced` to `16/1` upper bounds for PhysX articulation position/velocity
+  solver iterations while preserving already-cheaper authored values.
+- Map `accurate` and standalone UniRoboSim worlds with no profile metadata to no
+  override; no source USD or derived asset is rewritten.
+
 ## 0.10.17
 
 - Replace Isaac Lab's Nucleus-backed default ground USD with an entirely local,

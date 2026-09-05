@@ -73,6 +73,20 @@ _DEFAULT_GPU_MAX_NUM_PARTITIONS = 8
 _SMALL_WORLD_GPU_MAX_NUM_PARTITIONS = 1
 _SMALL_WORLD_MAX_ARTICULATION_DOFS = 16
 _SMALL_WORLD_MAX_DYNAMIC_ENTITIES = 16
+_FASTSIM_PHYSICS_PROFILE_METADATA_KEY = "fastsim_physics_profile"
+_FASTSIM_PHYSICS_PROFILES = frozenset({"accurate", "balanced"})
+_BALANCED_POSITION_ITERATION_CAP = 16
+_BALANCED_VELOCITY_ITERATION_CAP = 1
+
+
+def _clamp_iteration_attribute(attribute: Any, ceiling: int) -> None:
+    """Lower an authored positive solver count without increasing cheaper values."""
+
+    current = attribute.Get()
+    if isinstance(current, bool) or not isinstance(current, int) or current <= ceiling:
+        return
+    if attribute.Set(ceiling) is False or attribute.Get() != ceiling:
+        raise RuntimeError(f"failed to apply articulation solver iteration ceiling {ceiling}")
 
 
 def _resolved_gpu_max_num_partitions(config: IsaacLabAdapterConfig, spec: WorldSpec) -> int:
@@ -1459,6 +1473,7 @@ class IsaacLabNativeWorld:
         for entity in self._spec.entities:
             if entity.kind is EntityKind.CAMERA_SENSOR:
                 self._author_camera(entity)
+        self._apply_runtime_physics_profile()
         self._initialize_physics_activation()
         self._sim.reset()
         self._initialize_usd_articulations()
@@ -1483,6 +1498,41 @@ class IsaacLabNativeWorld:
             self._ensure_camera_render()
             for camera in self._cameras.values():
                 camera.update(0.0, force_recompute=True)
+
+    def _apply_runtime_physics_profile(self) -> None:
+        """Apply FastSim solver intent after USD composition and before first reset.
+
+        Standalone UniRoboSim callers do not carry this optional metadata and keep
+        authored/provider-native settings.  FastSim's balanced profile is an upper
+        bound: already-cheaper articulation settings are never raised.
+        """
+
+        profile = self._spec.metadata.get(_FASTSIM_PHYSICS_PROFILE_METADATA_KEY)
+        if profile is None or profile == "accurate":
+            return
+        if profile not in _FASTSIM_PHYSICS_PROFILES:
+            raise RuntimeError(f"unsupported FastSim physics profile: {profile!r}")
+        prims = self._m.sim_utils.get_all_matching_child_prims(
+            "/World",
+            lambda prim: (
+                prim.HasAPI(self._m.UsdPhysics.ArticulationRootAPI)
+                or prim.HasAPI(self._m.PhysxSchema.PhysxArticulationAPI)
+            ),
+        )
+        for prim in prims:
+            articulation = (
+                self._m.PhysxSchema.PhysxArticulationAPI(prim)
+                if prim.HasAPI(self._m.PhysxSchema.PhysxArticulationAPI)
+                else self._m.PhysxSchema.PhysxArticulationAPI.Apply(prim)
+            )
+            _clamp_iteration_attribute(
+                articulation.GetSolverPositionIterationCountAttr(),
+                _BALANCED_POSITION_ITERATION_CAP,
+            )
+            _clamp_iteration_attribute(
+                articulation.GetSolverVelocityIterationCountAttr(),
+                _BALANCED_VELOCITY_ITERATION_CAP,
+            )
 
     def _initialize_physics_activation(self) -> None:
         raw = self._spec.metadata.get("fastsim_physics_activation")
