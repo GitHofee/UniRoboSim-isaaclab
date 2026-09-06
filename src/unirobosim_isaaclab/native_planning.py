@@ -681,7 +681,21 @@ def _collision_pose_scale_bake(
     )
 
 
-def _effective_collision_relative_transform(cache: Any, prim: Any, owner_body: Any) -> Any:
+def _compute_relative_transform(modules: Any, cache: Any, prim: Any, ancestor: Any) -> tuple[Any, bool]:
+    """Avoid USD's uninitialized reset output on the zero-length ancestor walk.
+
+    OpenUSD 25.11 only writes the reset output while visiting prims below the
+    ancestor, and its Python wrapper does not initialize that output. Equal USD
+    Prim handles therefore must not enter the wrapper, even with a fresh cache.
+    The ancestor's own transform/reset is excluded from a relative query.
+    """
+    if prim == ancestor:
+        return modules.Gf.Matrix4d(1.0), False
+    matrix, resets = cache.ComputeRelativeTransform(prim, ancestor)
+    return matrix, resets
+
+
+def _effective_collision_relative_transform(modules: Any, prim: Any, owner_body: Any) -> Any:
     """Keep ancestor scale while expressing collision geometry in the rigid pose frame.
 
     ``ComputeRelativeTransform(prim, owner_body)`` cancels every transform shared by
@@ -692,7 +706,10 @@ def _effective_collision_relative_transform(cache: Any, prim: Any, owner_body: A
     must instead be relative to the owner's pose-only world transform.
     """
 
-    _relative, resets = cache.ComputeRelativeTransform(prim, owner_body)
+    # Retain query-local cache scope. Cache isolation alone does not fix USD's
+    # uninitialized same-Prim reset output; all relative queries use the guard.
+    cache = modules.UsdGeom.XformCache()
+    _relative, resets = _compute_relative_transform(modules, cache, prim, owner_body)
     if resets:
         raise NativePlanningError("collision_geometry_unsupported")
     collision_world = cache.GetLocalToWorldTransform(prim)
@@ -1880,8 +1897,7 @@ class _PlanningAdmission:
         enabled_self_collisions: bool = True,
     ) -> tuple[PlanningGeometryDescriptor, ...]:
         self._validate_collision_common(prim)
-        cache = self._xform_cache
-        matrix = _effective_collision_relative_transform(cache, prim, owner_body)
+        matrix = _effective_collision_relative_transform(self._m, prim, owner_body)
         mesh_capable = not any(
             prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
         )
@@ -2145,7 +2161,7 @@ class _PlanningAdmission:
         indices = tuple(int(value) for value in (mesh.GetFaceVertexIndicesAttr().Get() or ()))
         if not points:
             raise NativePlanningError("collision_cooking_failed")
-        matrix, resets = self._xform_cache.ComputeRelativeTransform(mesh_prim, carrier)
+        matrix, resets = _compute_relative_transform(self._m, self._m.UsdGeom.XformCache(), mesh_prim, carrier)
         if resets:
             raise NativePlanningError("collision_cooking_failed")
         transformed = tuple(matrix.Transform(point) for point in points)
@@ -2347,7 +2363,7 @@ class _PlanningAdmission:
                         for prim in self._walk(root)
                         if prim.GetName() == native_owner_name and prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
                     )
-                matrix, resets = self._xform_cache.ComputeRelativeTransform(matches[0], owner_prim)
+                matrix, resets = _compute_relative_transform(self._m, self._xform_cache, matches[0], owner_prim)
                 if resets:
                     raise NativePlanningError("frame_ambiguous")
                 local_pose, scale = _matrix_local_pose(self._m, matrix)
@@ -2449,7 +2465,7 @@ class _PlanningAdmission:
     ) -> tuple[object, ...]:
         self._validate_collision_common(prim)
         matrix = _effective_collision_relative_transform(
-            self._xform_cache,
+            self._m,
             prim,
             owner_body,
         )
@@ -2542,11 +2558,11 @@ class _PlanningAdmission:
                     raise NativePlanningError("frame_missing")
                 reference_owner = reference_owners[0]
                 clone_owner = clone_owners[0]
-            reference_matrix, reference_resets = self._xform_cache.ComputeRelativeTransform(
-                reference_matches[0], reference_owner
+            reference_matrix, reference_resets = _compute_relative_transform(
+                self._m, self._xform_cache, reference_matches[0], reference_owner
             )
-            clone_matrix, clone_resets = self._xform_cache.ComputeRelativeTransform(
-                clone_matches[0], clone_owner
+            clone_matrix, clone_resets = _compute_relative_transform(
+                self._m, self._xform_cache, clone_matches[0], clone_owner
             )
             if reference_resets or clone_resets:
                 raise NativePlanningError("frame_ambiguous")
