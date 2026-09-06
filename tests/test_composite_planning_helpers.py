@@ -135,8 +135,12 @@ def test_effective_collision_transform_keeps_shared_ancestor_scale_and_isolates_
     caches: list[_Cache] = []
 
     class _Matrix:
-        def __init__(self, name: str) -> None:
-            self.name = name
+        def __init__(self, name: str | _Matrix) -> None:
+            self.name = name.name if isinstance(name, _Matrix) else name
+
+        def SetTranslateOnly(self, value: object) -> None:
+            assert value == (0.0, 0.0, 0.0)
+            calls.append(("zero_translation", self.name))
 
         def RemoveScaleShear(self) -> _Matrix:
             calls.append(("remove_scale_shear", self.name))
@@ -165,17 +169,23 @@ def test_effective_collision_transform_keeps_shared_ancestor_scale_and_isolates_
         def GetLocalToWorldTransform(self, value: object) -> _Matrix:
             assert self.relative_called
             calls.append(("world", value))
-            return _Matrix("collision-world" if value == "collision" else "owner-world-with-scale")
+            assert value == "owner", "the collision world translation must not be subtracted"
+            return _Matrix("owner-world-with-scale")
 
-    modules = SimpleNamespace(UsdGeom=SimpleNamespace(XformCache=_Cache))
+    modules = SimpleNamespace(
+        UsdGeom=SimpleNamespace(XformCache=_Cache),
+        Gf=SimpleNamespace(Matrix4d=_Matrix, Vec3d=lambda value: (value, value, value)),
+    )
     result = _effective_collision_relative_transform(modules, "collision", "owner")
     repeated = _effective_collision_relative_transform(modules, "collision", "owner")
 
-    assert result.name == "collision-world*inverse(pose(owner-world-with-scale))"
+    assert result.name == "scale-cancelling-relative*owner-world-with-scale*inverse(pose(owner-world-with-scale))"
     assert repeated.name == result.name
     assert len(caches) == 2
     assert caches[0] is not caches[1]
-    assert ("multiply", "collision-world", "inverse(pose(owner-world-with-scale))") in calls
+    assert ("multiply", "owner-world-with-scale", "inverse(pose(owner-world-with-scale))") in calls
+    assert calls.count(("zero_translation", "owner-world-with-scale")) == 2
+    assert calls.count(("zero_translation", "pose(owner-world-with-scale)")) == 2
 
 
 def test_effective_collision_transform_rejects_reset_stack() -> None:

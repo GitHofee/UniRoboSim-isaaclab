@@ -709,13 +709,19 @@ def _effective_collision_relative_transform(modules: Any, prim: Any, owner_body:
     # Retain query-local cache scope. Cache isolation alone does not fix USD's
     # uninitialized same-Prim reset output; all relative queries use the guard.
     cache = modules.UsdGeom.XformCache()
-    _relative, resets = _compute_relative_transform(modules, cache, prim, owner_body)
+    relative, resets = _compute_relative_transform(modules, cache, prim, owner_body)
     if resets:
         raise NativePlanningError("collision_geometry_unsupported")
-    collision_world = cache.GetLocalToWorldTransform(prim)
-    owner_world = cache.GetLocalToWorldTransform(owner_body)
-    owner_pose_world = owner_world.RemoveScaleShear()
-    return collision_world * owner_pose_world.GetInverse()
+    owner_linear = modules.Gf.Matrix4d(cache.GetLocalToWorldTransform(owner_body))
+    owner_pose_linear = owner_linear.RemoveScaleShear()
+    # USD uses row vectors: collision_world = relative * owner_world. The
+    # owner's affine and pose-only transforms share their translation, which
+    # cancels exactly in mathematics but leaves clone-dependent roundoff when
+    # multiplied in world space. Remove it from these copies before composing
+    # the full scale/shear residual; never mutate a cached matrix or the stage.
+    owner_linear.SetTranslateOnly(modules.Gf.Vec3d(0.0))
+    owner_pose_linear.SetTranslateOnly(modules.Gf.Vec3d(0.0))
+    return relative * (owner_linear * owner_pose_linear.GetInverse())
 
 
 def _matrix_local_pose(modules: Any, matrix: Any) -> tuple[PlanningGeometryLocalPose, tuple[float, float, float]]:
