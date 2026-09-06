@@ -197,9 +197,20 @@ def run(world, result):
             result["reset"]["actual"]["root_com_vel_w"][1], result["before_reset"]["actual"]["root_com_vel_w"][1]
         ),
     }
+    world.step()
+    result["nonzero_default_next"] = sample(asset)
+    result["default_controls"]["nonzero_default_survives_physical_step"] = (
+        sum(value * value for value in result["nonzero_default_next"]["actual"]["root_com_vel_w"][0]) > 0.1
+    )
+    world.reset((1, 0))
+    result["reset_reversed"] = sample(asset)
+    result["default_controls"]["reversed_all_environment_defaults"] = all(
+        vectors_close(actual, expected)
+        for actual, expected in zip(result["reset_reversed"]["actual"]["root_com_vel_w"], defaults, strict=True)
+    )
     result["checks"] = {
         f"{stage}.{name}": value
-        for stage in ("initial", "render", "set_pose", "reset")
+        for stage in ("initial", "render", "set_pose", "reset", "reset_reversed")
         for name, value in result[stage]["checks"].items()
     }
     result["checks"]["same_tick_no_fake_time"] = (

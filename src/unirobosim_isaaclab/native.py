@@ -3012,6 +3012,9 @@ class IsaacLabNativeWorld:
         for path, asset in self._articulations.items():
             root_pose, positions, velocities = self._initial_articulation[path]
             asset.write_root_pose_to_sim_index(root_pose=root_pose[env_ids], env_ids=env_ids)
+            asset.write_root_velocity_to_sim_index(
+                root_velocity=asset.data.default_root_vel.torch[env_ids], env_ids=env_ids,
+            )
             asset.write_joint_position_to_sim_index(position=positions[env_ids], env_ids=env_ids)
             asset.write_joint_velocity_to_sim_index(velocity=velocities[env_ids], env_ids=env_ids)
             asset.set_joint_position_target_index(target=positions[env_ids], env_ids=env_ids)
