@@ -54,6 +54,7 @@ from .native_protocols import (
     PointBatch,
 )
 from .native_state import ArticulationStateCache
+from .native_velocity import root_com_velocity_from_link
 from .physics_activation import (
     DynamicRigidBodyCandidate,
     PhysicsActivationController,
@@ -4103,6 +4104,26 @@ class IsaacLabNativeWorld:
                 for name, reference in references.items()
             }
             if high_level:
+                # Checkpoint velocity is link-origin/world-frame. The verified
+                # SDK link writer passes that buffer to a COM-velocity native API;
+                # stage the explicit conversion before applying any state.
+                if not callable(getattr(asset_or_view, "write_root_com_velocity_to_sim_index", None)):
+                    raise RuntimeError("checkpoint restore requires the articulation COM velocity writer")
+                native_com_pose: Any = getattr(getattr(asset_or_view.data, "body_com_pose_b", None), "torch", None)
+                if (
+                    not self._m.torch.is_tensor(native_com_pose)
+                    or len(native_com_pose.shape) != 3
+                    or native_com_pose.shape[0] != staged_record["root_pose"].shape[0]
+                    or native_com_pose.shape[1] < 1
+                    or native_com_pose.shape[2] != 7
+                ):
+                    raise RuntimeError("checkpoint restore requires native [environment,body,7] local COM poses")
+                staged_record["root_com_velocity"] = root_com_velocity_from_link(
+                    self._m.torch,
+                    staged_record["root_pose"],
+                    staged_record["root_velocity"],
+                    native_com_pose[:, 0, :3],
+                )
                 raw_modes = record["control_modes"]
                 expected_modes = self._articulation_control_modes[path]
                 if (
@@ -4339,7 +4360,7 @@ class IsaacLabNativeWorld:
             record = articulations[path]
             asset.reset(env_ids=env_ids)
             asset.write_root_pose_to_sim_index(root_pose=record["root_pose"], env_ids=env_ids)
-            asset.write_root_link_velocity_to_sim_index(root_velocity=record["root_velocity"], env_ids=env_ids)
+            asset.write_root_com_velocity_to_sim_index(root_velocity=record["root_com_velocity"], env_ids=env_ids)
             asset.write_joint_position_to_sim_index(position=record["joint_position"], env_ids=env_ids)
             asset.write_joint_velocity_to_sim_index(velocity=record["joint_velocity"], env_ids=env_ids)
             asset.set_joint_position_target_index(target=record["position_target"], env_ids=env_ids)
