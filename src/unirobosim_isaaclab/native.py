@@ -53,6 +53,7 @@ from .native_protocols import (
     NativeSensorSample,
     PointBatch,
 )
+from .native_state import ArticulationStateCache
 from .physics_activation import (
     DynamicRigidBodyCandidate,
     PhysicsActivationController,
@@ -1189,6 +1190,7 @@ class IsaacLabNativeWorld:
         self._closed = False
         self._sim: Any | None = None
         self._articulations: dict[EntityPath, Any] = {}
+        self._articulation_state_caches: dict[EntityPath, ArticulationStateCache] = {}
         self._usd_articulations: dict[EntityPath, tuple[_UsdArticulation, ...]] = {}
         self._usd_articulation_views: dict[EntityPath, Any] = {}
         self._selected_link_views: dict[tuple[EntityPath, str], Any] = {}
@@ -2650,6 +2652,10 @@ class IsaacLabNativeWorld:
     def _initialize_articulations(self) -> None:
         torch = self._m.torch
         assert self._sim is not None
+        # Validate every high-level asset before initial or public state writes.
+        self._articulation_state_caches = {
+            path: ArticulationStateCache(asset.data) for path, asset in self._articulations.items()
+        }
         for path, asset in self._articulations.items():
             entity = next(item for item in self._spec.entities if item.path == path)
             native_names = tuple(asset.joint_names)
@@ -5451,7 +5457,9 @@ class IsaacLabNativeWorld:
                 self._remove_debug_keys(expired)
 
     def _update_assets(self, dt: float) -> None:
-        for asset in self._articulations.values():
+        for path, asset in self._articulations.items():
+            if dt == 0.0:
+                self._articulation_state_caches[path].invalidate()
             asset.update(dt)
         for asset in self._rigids.values():
             asset.update(dt)
@@ -5467,6 +5475,7 @@ class IsaacLabNativeWorld:
         sim = self._sim
         self._sim = None
         self._articulations.clear()
+        self._articulation_state_caches.clear()
         self._usd_articulations.clear()
         self._usd_articulation_views.clear()
         self._selected_link_views.clear()
