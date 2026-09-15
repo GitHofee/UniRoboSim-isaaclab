@@ -232,3 +232,13 @@ startup.
 ## Repository relationship
 
 This package contains only the Isaac Lab adapter. Portable contracts and EasyAPI live in [UniRoboSim Core](https://github.com/GitHofee/UniRoboSim.git); browser and MCP interfaces remain separate packages.
+
+## Compliant contact (0.10.19)
+
+Requires UniRoboSim `>=0.10.6,<0.11`. Capability `physics.contact.compliant@1` maps `ContactComplianceSpec` on standalone USD rigid bodies and procedural boxes to PhysX stiffness/damping, with acceleration-spring disabled. Stiffness combines via `restitutionCombineMode`; damping uses `dampingCombineMode`. SI N/m and N s/m values are converted for stage mass units and must remain representable as float32.
+
+Before physics initialization, private materials reference the existing resolved physics material and bind only to the requested object's collision shapes in each environment. Original material attributes, friction and visual bindings are preserved. Default-off does no USD work; step/reset have no added Python material updates. Native contact solving still has a cost.
+
+The first increment rejects colliders without a resolved physics material, instance/proxy colliders, material subsets, effective collection material bindings, stronger ancestor bindings, missing colliders and reserved override-scope collisions. These errors are explicit rather than silently changing contact behavior. Source assets and other objects are not edited.
+
+Fixed-60-Hz GPU acceptance compared rigid contacts and two stiffnesses at two loads, on both procedural and USD boxes across two environments and repeated resets. It verifies force response and indentation order, not a guarantee of fewer dropped objects. No visual deformation, plasticity or hardware calibration is implied. Use the normal isolated provider worker for Isaac Sim 6 shutdown; embedded native-process teardown remains subject to existing SDK shutdown limitations.

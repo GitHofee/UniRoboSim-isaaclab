@@ -36,6 +36,7 @@ from unirobosim import (
 )
 
 from .config import _ANTI_ALIASING_MODES, IsaacLabAdapterConfig
+from .contact_compliance import author_contact_compliance
 from .native_debug import NativeDebugOverlay, NativeDebugPayload
 from .native_protocols import (
     Matrix,
@@ -1465,6 +1466,16 @@ class IsaacLabNativeWorld:
                 self._author_articulation(entity)
             elif entity.kind is EntityKind.RIGID_BODY:
                 self._author_rigid(entity)
+                if entity.contact_compliance is not None:
+                    author_contact_compliance(
+                        self._m,
+                        self._m.sim_utils.get_current_stage(),
+                        tuple(
+                            f"/World/env_{index}/{_native_name(entity.path)}"
+                            for index in range(self._spec.environments.count)
+                        ),
+                        entity.contact_compliance,
+                    )
             elif entity.kind is EntityKind.STATIC_SCENE:
                 self._author_static_scene(entity)
             elif entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:

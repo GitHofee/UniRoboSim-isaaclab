@@ -123,6 +123,24 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(
+            CapabilityId("physics.contact.compliant@1"),
+            FrozenMap(
+                {
+                    "entity_kinds": ["rigid_body"],
+                    "contact_law": "implicit-force-spring-damper",
+                    "authoring": "object-scoped-physics-material-before-first-reset",
+                    "default": "disabled",
+                    "mesh_deformation": False,
+                }
+            ),
+            limitations=(
+                "standalone USD and procedural rigid bodies only",
+                "enabled colliders require a bound rigid physics material to preserve friction and restitution",
+                "instance colliders, material subsets, collection bindings and stronger ancestor bindings are rejected",
+                "material properties persist through state reset; no runtime material mutation API",
+            ),
+        ),
+        CapabilityDeclaration(
             CapabilityId("physics.activation.proximity@1"),
             FrozenMap(
                 {
