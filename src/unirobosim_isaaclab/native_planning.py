@@ -47,6 +47,7 @@ from unirobosim import (
     PlanningJointType,
     PlanningLinkDescriptor,
     PlanningLinkState,
+    PlanningPointClosureDescriptor,
     PlanningPose,
     PlanningPrimitiveGeometry,
     PlanningTwist,
@@ -94,6 +95,11 @@ _SUPPORTED_COLLISION_SCHEMAS = frozenset(
         "PhysxSphereFillCollisionAPI",
         "PhysxTriangleMeshCollisionAPI",
         "PhysxTriangleMeshSimplificationCollisionAPI",
+        # These backend-specific markers do not affect a PhysX simulation.
+        # USD Physics approximation and the effective PhysX schemas remain
+        # authoritative; other unknown collision schemas still fail closed.
+        "NewtonCollisionAPI",
+        "NewtonMeshCollisionAPI",
     }
 )
 _IDENTITY_POSE = PlanningPose(_WORLD_FRAME_ID, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -870,6 +876,10 @@ class _PlanningAdmission:
 
         owner_paths = tuple(sorted(set(collision_owner_paths)))
         owner_set = frozenset(owner_paths)
+        authored_pairs.update(
+            pair for pair in getattr(self, "_point_closure_filtered_pairs", ())
+            if pair[0] in bodies and pair[1] in bodies
+        )
         if enabled_self_collisions:
             effective_pairs = frozenset(
                 pair for pair in authored_pairs if pair[0] in owner_set and pair[1] in owner_set
@@ -905,6 +915,8 @@ class _PlanningAdmission:
         )
 
     def _build_catalog(self) -> NativePlanningCatalog:
+        self._point_closures: list[PlanningPointClosureDescriptor] = []
+        self._point_closure_filtered_pairs: set[tuple[str, str]] = set()
         frames: list[PlanningFrameDescriptor] = [
             PlanningFrameDescriptor(_WORLD_FRAME_ID, PlanningFrameKind.WORLD, None, None, None)
         ]
@@ -989,6 +1001,7 @@ class _PlanningAdmission:
             tuple(sorted(joints, key=lambda item: item.joint_id)),
             tuple(sorted(frames, key=lambda item: item.frame_id)),
             tuple(sorted(geometries, key=lambda item: item.geometry_id)),
+            tuple(sorted(self._point_closures, key=lambda item: item.closure_id)),
         )
 
     def _verify_nonphysical_entity(self, spec: Any) -> None:
@@ -1093,7 +1106,18 @@ class _PlanningAdmission:
 
         joint_models: list[tuple[Any, str, str, str | None, PlanningJointType]] = []
         child_names: set[str] = set()
+        root_anchors: list[str] = []
+        closure_models: list[tuple[Any, str, str]] = []
         for prim in self._walk(root):
+            if prim.IsA(self._m.UsdPhysics.Joint):
+                joint = self._m.UsdPhysics.Joint(prim)
+                if joint.GetExcludeFromArticulationAttr().Get() is True:
+                    body_a, body_b = self._point_closure_endpoints(prim, bodies)
+                    closure_models.append((prim, body_a, body_b))
+                    self._accounted_constraints.add(str(prim.GetPath()))
+                    if joint.GetCollisionEnabledAttr().Get() is False:
+                        self._point_closure_filtered_pairs.add(_canonical_body_pair(body_a, body_b))
+                    continue
             joint_type = self._joint_type(prim)
             if joint_type is None:
                 continue
@@ -1103,13 +1127,13 @@ class _PlanningAdmission:
             body0 = _nearest_body(body0_target, bodies)
             body1 = _nearest_body(body1_target, bodies)
             path = str(prim.GetPath())
-            if (body0_target is not None and body0 is None) or (body1_target is not None and body1 is None):
-                raise NativePlanningError("constraint_unsupported")
-            if body0 is None and body1 is not None:
-                if joint_type is not PlanningJointType.FIXED:
-                    raise NativePlanningError("constraint_unsupported")
+            anchor_body = self._fixed_root_anchor(prim, root, bodies)
+            if anchor_body is not None:
+                root_anchors.append(body_name_by_path[anchor_body])
                 self._accounted_constraints.add(path)
                 continue
+            if (body0_target is not None and body0 is None) or (body1_target is not None and body1 is None):
+                raise NativePlanningError("constraint_unsupported")
             if body0 is None or body1 is None or body0 == body1:
                 raise NativePlanningError("constraint_unsupported")
             parent_name = body_name_by_path[body0]
@@ -1124,6 +1148,8 @@ class _PlanningAdmission:
         if len(roots) != 1:
             raise NativePlanningError("topology_unsupported")
         root_name = roots[0]
+        if len(root_anchors) > 1 or (root_anchors and root_anchors[0] != root_name):
+            raise NativePlanningError("constraint_unsupported")
 
         ordered_joint_models = self._order_joints(root_name, joint_models)
         if len(ordered_joint_models) != len(body_prims) - 1:
@@ -1240,6 +1266,11 @@ class _PlanningAdmission:
                 prim.GetName(),
                 local_pose,
             )
+
+        for prim, body_a, body_b in closure_models:
+            self._point_closures.append(self._point_closure_descriptor(
+                prim, spec, root, bodies, body_name_by_path, link_id_by_name, tuple(joint_descriptors), body_a, body_b
+            ))
 
         link_descriptors: list[PlanningLinkDescriptor] = []
         for name in sorted(link_id_by_name):
@@ -1761,6 +1792,11 @@ class _PlanningAdmission:
         return PlanningEntityKind.RIGID_OBJECT
 
     def _joint_type(self, prim: Any) -> PlanningJointType | None:
+        if prim.IsA(self._m.UsdPhysics.Joint):
+            if self._m.UsdPhysics.Joint(prim).GetExcludeFromArticulationAttr().Get() is True:
+                # Only _entity_catalog's explicit point-closure branch can
+                # account for an excluded joint. Never put one in the tree.
+                raise NativePlanningError("constraint_unsupported")
         if prim.IsA(self._m.UsdPhysics.FixedJoint):
             return PlanningJointType.FIXED
         if prim.IsA(self._m.UsdPhysics.RevoluteJoint):
@@ -1770,6 +1806,114 @@ class _PlanningAdmission:
         if prim.IsA(self._m.UsdPhysics.Joint):
             raise NativePlanningError("constraint_unsupported")
         return None
+
+    def _fixed_root_anchor(self, prim: Any, root: Any, bodies: dict[str, Any]) -> str | None:
+        """Recognize only world/outer-frame fixed anchors; validate root later."""
+        if not prim.IsA(self._m.UsdPhysics.FixedJoint):
+            return None
+        joint = self._m.UsdPhysics.Joint(prim)
+        targets = (_relationship_target(joint.GetBody0Rel()), _relationship_target(joint.GetBody1Rel()))
+        root_path = str(root.GetPath())
+        anchors: set[str | None] = {None}
+        if root_path not in bodies:
+            anchors.add(root_path)
+        for anchor, body in (targets, targets[::-1]):
+            if anchor in anchors and body in bodies:
+                if joint.GetJointEnabledAttr().Get() is not True:
+                    raise NativePlanningError("constraint_unsupported")
+                return body
+        return None
+
+    def _point_closure_endpoints(self, prim: Any, bodies: dict[str, Any]) -> tuple[str, str]:
+        """Admit only a static, unbreakable, unconstrained-angle spherical joint."""
+        if not prim.IsA(self._m.UsdPhysics.SphericalJoint):
+            raise NativePlanningError("constraint_unsupported")
+        joint = self._m.UsdPhysics.Joint(prim)
+        if joint.GetJointEnabledAttr().Get() is not True or joint.GetExcludeFromArticulationAttr().Get() is not True:
+            raise NativePlanningError("constraint_unsupported")
+        spherical = self._m.UsdPhysics.SphericalJoint(prim)
+        for attr in (spherical.GetConeAngle0LimitAttr(), spherical.GetConeAngle1LimitAttr()):
+            value = attr.Get()
+            if value is None or not math.isfinite(float(value)) or float(value) >= 0.0:
+                raise NativePlanningError("constraint_unsupported")
+        for attr in (joint.GetBreakForceAttr(), joint.GetBreakTorqueAttr()):
+            if attr.Get() != math.inf:
+                raise NativePlanningError("constraint_unsupported")
+        schema_text = repr(prim.GetMetadata("apiSchemas")).lower() + repr(prim.GetAppliedSchemas()).lower()
+        if "drive" in schema_text or "mimic" in schema_text:
+            raise NativePlanningError("constraint_unsupported")
+        for attr in prim.GetAttributes():
+            name = attr.GetName().lower()
+            if attr.GetTimeSamples() or "drive" in name or "mimic" in name:
+                raise NativePlanningError("constraint_unsupported")
+        a = _relationship_target(joint.GetBody0Rel())
+        b = _relationship_target(joint.GetBody1Rel())
+        if a not in bodies or b not in bodies or a == b:
+            raise NativePlanningError("constraint_unsupported")
+        assert a is not None and b is not None
+        return a, b
+
+    def _point_closure_descriptor(
+        self,
+        prim: Any,
+        spec: Any,
+        root: Any,
+        bodies: dict[str, Any],
+        body_names: dict[str, str],
+        link_ids: dict[str, str],
+        joints: tuple[PlanningJointDescriptor, ...],
+        body_a: str,
+        body_b: str,
+    ) -> PlanningPointClosureDescriptor:
+        anchors = self._point_closure_anchors(prim, bodies[body_a], bodies[body_b])
+        a, b = link_ids[body_names[body_a]], link_ids[body_names[body_b]]
+        adjacency: dict[str, list[tuple[str, PlanningJointDescriptor]]] = {}
+        for item in joints:
+            adjacency.setdefault(item.parent_link_id, []).append((item.child_link_id, item))
+            adjacency.setdefault(item.child_link_id, []).append((item.parent_link_id, item))
+        pending: list[tuple[str, tuple[PlanningJointDescriptor, ...]]] = [(a, ())]
+        visited = set()
+        coupled = None
+        while pending:
+            link, path = pending.pop()
+            if link == b:
+                coupled = tuple(sorted(
+                    item.joint_id for item in path if item.joint_type is not PlanningJointType.FIXED
+                ))
+                break
+            if link in visited:
+                continue
+            visited.add(link)
+            for neighbor, item in adjacency.get(link, ()):
+                if neighbor not in visited:
+                    pending.append((neighbor, (*path, item)))
+        if coupled is None:
+            raise NativePlanningError("topology_unsupported")
+        root_path = str(root.GetPath())
+        return PlanningPointClosureDescriptor(
+            _stable_id("point_closure", spec.path.value, str(prim.GetPath()).removeprefix(root_path)),
+            _stable_id("entity", spec.path.value),
+            prim.GetName(),
+            a, b,
+            anchors[0], anchors[1],
+            _json_sha256(self._prim_signature(prim, root_path)),
+            coupled,
+        )
+
+    def _point_closure_anchors(self, prim: Any, body_a: Any, body_b: Any) -> tuple[tuple[float, ...], ...]:
+        joint = self._m.UsdPhysics.Joint(prim)
+        anchors = []
+        meters_per_unit = self._m.UsdGeom.GetStageMetersPerUnit(self._stage)
+        if not math.isfinite(meters_per_unit) or meters_per_unit <= 0.0:
+            raise NativePlanningError("constraint_unsupported")
+        for body, attribute in ((body_a, joint.GetLocalPos0Attr()), (body_b, joint.GetLocalPos1Attr())):
+            local = _float_tuple(attribute.Get(), 3)
+            # Pose-only public link frames omit authored scale. Apply the same
+            # effective scale residual used for collision geometry to anchors.
+            residual = _effective_collision_relative_transform(self._m, body, body)
+            point = residual.Transform(self._m.Gf.Vec3d(*local))
+            anchors.append(tuple(float(value) * meters_per_unit for value in point))
+        return tuple(anchors)
 
     @staticmethod
     def _order_joints(
@@ -1858,10 +2002,16 @@ class _PlanningAdmission:
         if not collision_enabled_for_planning(self._m.UsdPhysics, prim):
             raise NativePlanningError("catalog_invalid")
         applied = set(prim.GetAppliedSchemas())
+        metadata_reader = getattr(prim, "GetMetadata", None)
+        if callable(metadata_reader):
+            authored_schemas = metadata_reader("apiSchemas")
+            if authored_schemas is not None:
+                applied.update(authored_schemas.GetAppliedItems())
         unexpected = {
             schema
             for schema in applied
-            if ("Collision" in schema or "FilteredPairs" in schema) and schema not in _SUPPORTED_COLLISION_SCHEMAS
+            if ("Collision" in schema or "FilteredPairs" in schema or schema.startswith("Newton"))
+            and schema not in _SUPPORTED_COLLISION_SCHEMAS
         }
         if unexpected:
             raise NativePlanningError("collision_geometry_unsupported")
@@ -2672,15 +2822,25 @@ class _PlanningAdmission:
                     self._accounted_colliders.add(str(clone.GetPath()))
                 for relative, reference in reference_joints.items():
                     clone = clone_joints[relative]
-                    type_matches = (
-                        reference.GetTypeName() == clone.GetTypeName()
-                        if spec.kind is EntityKind.COMPOSITE_SCENE
-                        else self._joint_type(reference) is self._joint_type(clone)
-                    )
+                    # Admission already classified the reference constraint.
+                    # Comparing actual USD type also preserves excluded spheres
+                    # without treating their endpoints as new tree edges.
+                    type_matches = reference.GetTypeName() == clone.GetTypeName()
                     if not type_matches or self._prim_signature(
                         reference, str(reference_root.GetPath())
                     ) != self._prim_signature(clone, str(clone_root.GetPath())):
                         raise NativePlanningError("constraint_unsupported")
+                    if self._m.UsdPhysics.Joint(reference).GetExcludeFromArticulationAttr().Get() is True:
+                        reference_endpoints = self._point_closure_endpoints(reference, reference_body_paths)
+                        clone_endpoints = self._point_closure_endpoints(clone, clone_body_paths)
+                        reference_anchors = self._point_closure_anchors(
+                            reference, *(self._stage.GetPrimAtPath(path) for path in reference_endpoints)
+                        )
+                        clone_anchors = self._point_closure_anchors(
+                            clone, *(self._stage.GetPrimAtPath(path) for path in clone_endpoints)
+                        )
+                        if reference_anchors != clone_anchors:
+                            raise NativePlanningError("constraint_unsupported")
                     self._accounted_constraints.add(str(clone.GetPath()))
                 self._verify_declared_clone_frames(spec, reference_root, clone_root)
 

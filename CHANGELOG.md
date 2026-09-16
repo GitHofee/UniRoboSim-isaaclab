@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.10.20
+
+- Admit fixed-root outer-frame anchors and supported excluded spherical constraints; publish closures separately with SI anchors and coupled tree joints.
+- Validate closure properties, effective anchors and clone consistency; retain supported PhysX geometry when inert Newton collision markers coexist.
+- Advertise `scene.point_closures.read@1`; require UniRoboSim 0.10.7. This adds scene reading, not closed-loop solving.
 
 - Compute affine basis vectors with `TransformDir` so translation cannot introduce false scale or erase axis precision.
 - Admit native named frames with unit-scale roundoff within an absolute 1e-12 bound; retain rejection of actual scale, shear and reflections.

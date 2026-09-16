@@ -24,6 +24,7 @@ from unirobosim import (
     PlanningJointDescriptor,
     PlanningLinkDescriptor,
     PlanningLinkState,
+    PlanningPointClosureDescriptor,
     PointCommandMode,
     Pose,
     WorldSpec,
@@ -150,6 +151,7 @@ class NativePlanningCatalog:
     joints: tuple[PlanningJointDescriptor, ...]
     frames: tuple[PlanningFrameDescriptor, ...]
     geometries: tuple[PlanningGeometryDescriptor, ...]
+    point_closures: tuple[PlanningPointClosureDescriptor, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

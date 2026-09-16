@@ -344,6 +344,7 @@ class IsaacLabPlanningWorld(IsaacLabWorld):
             native.joints,
             native.frames,
             native.geometries,
+            point_closures=native.point_closures,
         )
         if any(
             geometry.resource_layout is not None

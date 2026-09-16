@@ -367,6 +367,15 @@ CAPABILITIES = CapabilitySet(
                 "camera entities may coexist with planning but are not physical planning-scene entities",
             ),
         ),
+        CapabilityDeclaration(
+            CapabilityId("scene.point_closures.read@1"),
+            FrozenMap({"type": "excluded-spherical", "anchors": "link-local-SI", "motion_solving": False}),
+            limitations=(
+                "enabled same-entity point closures without angular limits, finite break thresholds, drives or mimic",
+                "animated constraint properties and unsupported excluded joints fail admission",
+                "nonempty closure catalogs require planning-scene v3 consumers",
+            ),
+        ),
     )
 )
 
