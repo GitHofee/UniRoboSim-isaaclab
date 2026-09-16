@@ -792,6 +792,22 @@ class _PlanningAdmission:
             self._catalog = self._build_catalog()
         finally:
             self._persistent_mesh_cache.close()
+        self._prepare_state_reads()
+
+    def _prepare_state_reads(self) -> None:
+        """Resolve immutable admission metadata, never live physical values."""
+        self._joint_frame_bindings: dict[str, _JointBinding] = {}
+        for frame_id, frame in self._frames.items():
+            if frame.source not in {"joint", "joint_id"}:
+                continue
+            assert frame.entity_path is not None
+            joints = self._entities[frame.entity_path].joint_bindings
+            # Keep the original first-match semantics for authored names.
+            attribute = "authored_name" if frame.source == "joint" else "joint_id"
+            self._joint_frame_bindings[frame_id] = next(
+                joint for joint in joints if getattr(joint.descriptor, attribute) == frame.source_name
+            )
+        self._ordered_geometry_bindings = tuple(sorted(self._geometries.items()))
 
     @property
     def catalog(self) -> NativePlanningCatalog:
@@ -3022,14 +3038,8 @@ class _PlanningAdmission:
             elif frame.source in {"link", "static_entity"}:
                 assert frame.source_name is not None
                 frame_poses[frame_id] = poses[frame.entity_path, frame.source_name]
-            elif frame.source == "joint":
-                joint = next(
-                    item for item in binding.joint_bindings if item.descriptor.authored_name == frame.source_name
-                )
-                parent_pose = poses[frame.entity_path, joint.parent_name]
-                frame_poses[frame_id] = _compose_pose(parent_pose, joint.local_pose)
-            elif frame.source == "joint_id":
-                joint = next(item for item in binding.joint_bindings if item.descriptor.joint_id == frame.source_name)
+            elif frame.source in {"joint", "joint_id"}:
+                joint = self._joint_frame_bindings[frame_id]
                 parent_pose = poses[frame.entity_path, joint.parent_name]
                 frame_poses[frame_id] = _compose_pose(parent_pose, joint.local_pose)
             elif frame.source == "native":
@@ -3042,7 +3052,7 @@ class _PlanningAdmission:
                 frame_poses[frame_id] = _compose_pose(parent_pose, frame.local_pose)
         frame_states = tuple(PlanningFrameState(frame_id, frame_poses[frame_id]) for frame_id in sorted(frame_poses))
         geometry_transforms = []
-        for geometry_id, geometry_binding in sorted(self._geometries.items()):
+        for geometry_id, geometry_binding in self._ordered_geometry_bindings:
             if geometry_binding.entity_path is None:
                 parent_pose = _IDENTITY_POSE
             elif geometry_binding.owner_link_name is None:
