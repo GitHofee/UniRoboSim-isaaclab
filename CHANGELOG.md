@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Compute affine basis vectors with `TransformDir` so translation cannot introduce false scale or erase axis precision.
+- Admit native named frames with unit-scale roundoff within an absolute 1e-12 bound; retain rejection of actual scale, shear and reflections.
+- Add real OpenUSD regressions for translated TCP frames, general rotations and affine rejection boundaries.
+
 ## 0.10.18
 
 - Honor the optional FastSim runtime physics profile after USD composition and

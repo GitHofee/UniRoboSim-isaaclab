@@ -301,3 +301,72 @@ def test_native_named_frames_and_clones_handle_self_but_reject_intermediate_rese
         assert binding.local_pose.position_m == (0.0, 0.0, 0.0)
         assert binding.local_pose.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
         admission._verify_declared_clone_frames(spec, reference, clone)
+
+
+def _roundoff_matrix(kind: str) -> object:
+    if kind == "axis_permutation":
+        return Gf.Matrix4d(0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.15, 1)
+    matrix = Gf.Matrix4d(1).SetRotate(Gf.Rotation(Gf.Vec3d(1, 2, 3), 13))
+    matrix.SetTranslateOnly(Gf.Vec3d(0.15, -0.23, 0.37))
+    return matrix
+
+
+@pytest.mark.parametrize("translation", (0.15, -0.15, 1.0e16))
+def test_direction_basis_does_not_lose_precision_to_translation(translation: float) -> None:
+    matrix = _roundoff_matrix("axis_permutation")
+    matrix.SetTranslateOnly(Gf.Vec3d(translation))
+    origin, basis = native_planning._matrix_origin_basis(MODULES, matrix)
+    assert origin == (translation,) * 3
+    assert basis == ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+
+
+@pytest.mark.parametrize("explicit_owner", (False, True))
+@pytest.mark.parametrize("kind", ("axis_permutation", "general_rotation", "scaled", "tiny_scale", "shear", "mirror"))
+def test_native_tcp_roundoff_admission_keeps_affine_rejections(kind: str, explicit_owner: bool) -> None:
+    stage = Usd.Stage.CreateInMemory()
+    root = UsdGeom.Xform.Define(stage, "/Robot")
+    owner = UsdGeom.Xform.Define(stage, "/Robot/Body")
+    UsdPhysics.RigidBodyAPI.Apply(owner.GetPrim())
+    tcp = UsdGeom.Xform.Define(stage, "/Robot/Body/TCP")
+    matrix = _roundoff_matrix(kind)
+    if kind in {"scaled", "tiny_scale", "mirror"}:
+        amount = {"scaled": 1.01, "tiny_scale": 1.0 + 1.0e-9, "mirror": -1.0}[kind]
+        matrix = Gf.Matrix4d(1).SetScale(Gf.Vec3d(amount, 1, 1)) * matrix
+    elif kind == "shear":
+        matrix = Gf.Matrix4d(1, 0.01, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) * matrix
+    tcp.AddTransformOp().Set(matrix)
+    spec = SimpleNamespace(
+        path=EntityPath("/asset"),
+        metadata=FrozenMap({"planning_frame_declarations": {
+            "schema": PLANNING_FRAME_DECLARATIONS_SCHEMA_VERSION,
+            "component_sha256": "a" * 64,
+            "entries": ({"name": "tcp", "owner_link": "Body" if explicit_owner else None,
+                         "source": {"kind": "native_named", "name": "TCP"}},),
+        }}),
+    )
+    admission = object.__new__(_PlanningAdmission)
+    admission._m = MODULES
+    admission._xform_cache = UsdGeom.XformCache()
+    admission._walk = lambda prim: tuple(Usd.PrimRange(prim))
+    admission._source_sha256 = lambda spec: "a" * 64
+    admission._frames = {}
+    descriptors = []
+
+    def declare() -> None:
+        admission._declared_frames(spec, root.GetPrim(), "entity.asset", "frame.asset",
+                                   {"Body": "link.body"}, {"Body": "frame.body"}, [], descriptors, "Body")
+
+    if kind in {"scaled", "tiny_scale", "shear", "mirror"}:
+        error = "frame_ambiguous" if kind in {"scaled", "tiny_scale"} else "collision_geometry_unsupported"
+        with pytest.raises(NativePlanningError, match=error):
+            declare()
+        assert not descriptors
+    else:
+        declare()
+        assert len(descriptors) == 1
+        (binding,) = admission._frames.values()
+        assert binding.local_pose.position_m == tuple(matrix.ExtractTranslation())
+        for axis in ((1, 0, 0), (0, 1, 0), (0, 0, 1)):
+            assert native_planning._rotate(axis, binding.local_pose.orientation_xyzw) == pytest.approx(
+                tuple(matrix.TransformDir(Gf.Vec3d(*axis))), abs=1.0e-14
+            )

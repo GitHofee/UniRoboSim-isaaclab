@@ -578,21 +578,18 @@ def _matrix_origin_basis(
     ):
         raise NativePlanningError("collision_geometry_unsupported")
     origin = _float_tuple(matrix.Transform(modules.Gf.Vec3d(0.0, 0.0, 0.0)), 3)
+    # Directions use only the linear part: subtracting transformed points loses
+    # precision to translation and can make an unscaled TCP appear scaled.
     basis = tuple(
-        tuple(
-            value - origin[index]
-            for index, value in enumerate(
-                _float_tuple(
-                    matrix.Transform(
-                        modules.Gf.Vec3d(
-                            1.0 if axis == 0 else 0.0,
-                            1.0 if axis == 1 else 0.0,
-                            1.0 if axis == 2 else 0.0,
-                        )
-                    ),
-                    3,
+        _float_tuple(
+            matrix.TransformDir(
+                modules.Gf.Vec3d(
+                    1.0 if axis == 0 else 0.0,
+                    1.0 if axis == 1 else 0.0,
+                    1.0 if axis == 2 else 0.0,
                 )
-            )
+            ),
+            3,
         )
         for axis in range(3)
     )
@@ -2373,7 +2370,10 @@ class _PlanningAdmission:
                 if resets:
                     raise NativePlanningError("frame_ambiguous")
                 local_pose, scale = _matrix_local_pose(self._m, matrix)
-                if scale != (1.0, 1.0, 1.0):
+                # Rotation/composition can leave double-precision norm noise.
+                # This dimensionless numerical tolerance is not a motion limit;
+                # preserve the actual scale for collision geometry elsewhere.
+                if any(not math.isclose(axis, 1.0, rel_tol=0.0, abs_tol=1.0e-12) for axis in scale):
                     raise NativePlanningError("frame_ambiguous")
                 descriptors.append(
                     PlanningFrameDescriptor(
