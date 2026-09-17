@@ -15,7 +15,7 @@ configuration, protocol, and package-fingerprint failures remain fail-fast.
 
 ## Compatibility
 
-Python `>=3.12,<3.13`, UniRoboSim `>=0.10.7,<0.11`, and runtime contract
+Python `>=3.12,<3.13`, UniRoboSim `>=0.10.8,<0.11`, and runtime contract
 `v0alpha6` are common to both admitted profiles:
 
 | Profile | Isaac Lab | Isaac Sim | Torch stack |
@@ -204,7 +204,7 @@ the target dimensions when non-uniform scaling of a mechanism is required.
 
 ## Planning-scene compatibility
 
-Adapter 0.10.20 requires UniRoboSim Core `>=0.10.7,<0.11`, authors its implicit ground plane locally without Isaac Nucleus access, adds physical checkpoints, and defines entity pose as the imported asset-root USD Prim pose. Physical root-link and child-link poses remain explicit planning link states. Initial spawn captures the authored entity-to-physical-root transform and converts the public entity pose into Isaac Lab's physical-root `init_state`; runtime `set_pose` uses the same retargeting rule, and reset restores both frames. Pose-preserving runtime attachments write USD FixedJoint frames relative to the targeted rigid-body Prims, so authored center-of-mass offsets cannot snap an attached child. Entity-level pose reads and writes remove authored scale and shear before extracting rotation and normalize the quaternion explicitly; they target the same Prim and move the associated physical bodies coherently without changing articulation joints or authored scale. FastSim worlds may additionally carry an immutable `balanced` physics profile, which caps effective PhysX articulation solver iterations at `16/1`; `accurate` and standalone worlds preserve authored values. The adapter also renders resource-backed debug meshes as filled native USD overlays and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
+Adapter 0.10.21 requires UniRoboSim Core `>=0.10.8,<0.11`, authors its implicit ground plane locally without Isaac Nucleus access, adds physical checkpoints, and defines entity pose as the imported asset-root USD Prim pose. Physical root-link and child-link poses remain explicit planning link states. Initial spawn captures the authored entity-to-physical-root transform and converts the public entity pose into Isaac Lab's physical-root `init_state`; runtime `set_pose` uses the same retargeting rule, and reset restores both frames. Pose-preserving runtime attachments write USD FixedJoint frames relative to the targeted rigid-body Prims, so authored center-of-mass offsets cannot snap an attached child. Entity-level pose reads and writes remove authored scale and shear before extracting rotation and normalize the quaternion explicitly; they target the same Prim and move the associated physical bodies coherently without changing articulation joints or authored scale. FastSim worlds may additionally carry an immutable `balanced` physics profile, which caps effective PhysX articulation solver iterations at `16/1`; `accurate` and standalone worlds preserve authored values. The adapter also renders resource-backed debug meshes as filled native USD overlays and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
 Static and composite USD scenes expose immutable planning resources plus live world
 transforms. Degenerate faces with fewer than three vertices are skipped; invalid
@@ -246,3 +246,57 @@ Fixed-60-Hz GPU acceptance compared rigid contacts and two stiffnesses at two lo
 ## Point-closure planning admission (0.10.20)
 
 Enabled, unbreakable, unlimited `PhysicsSphericalJoint` constraints excluded from the articulation are exported separately as `point_closures`. Endpoints must be distinct rigid bodies in the same robot; driven, mimic, animated or unsupported excluded constraints fail explicitly. Anchors include stage units and effective scale. Clone checks cover type, endpoints, properties and effective anchors. A single fixed anchor may connect the unique root link to world or the entity outer frame; physics topology is unchanged. Inert `NewtonCollisionAPI` and `NewtonMeshCollisionAPI` markers may coexist while USD Physics/PhysX geometry and effective collision filtering remain authoritative. The new side capability is `scene.point_closures.read@1`; it does not add a closure-motion solver.
+
+### Joint readback and persistent drive targets
+
+Joint state readback gathers only the deduplicated declared physical axes on the
+device, transfers the subset once per field, then restores declared order.
+Selected link reads likewise gather only the requested bodies, preserving duplicate
+requests and environment origins. One-body and full natural-order reads use device
+views directly. The cached name-to-index layout is tied to the asset identity and
+complete body-name tuple; dynamic pose/velocity buffers are reread every time. Rigid readback similarly
+transfers pose and velocity once each before splitting their fields.
+
+The adapter recognizes the optional Isaac Lab `write_data_to_sim` parameters
+`position_target_version` and `velocity_target_version` once per articulation.
+With that extension installed, CPU-side versions track physical joint targets
+across command groups and avoid resubmitting unchanged persistent position and
+velocity targets. Actuator computation, force/effort submission, external
+wrenches and diagnostics still run every physics substep. Mode changes and
+same-tick state/reset/restore operations invalidate the target versions.
+Verified SDK profiles without this optional extension use their original public
+write method with unchanged physics behavior.
+
+The same CPU ownership record also avoids repeated writes to Isaac Lab's
+persistent input buffers: unchanged position/velocity holds allocate no device
+target tensors, while changed targets preserve already-established zero velocity
+and feed-forward effort buffers. Explicit effort commands still write their input
+each time. A failed setter invalidates both the target record and affected mode
+records before propagating the error, so a later command cannot trust a partial write.
+
+Planning catalogs now publish positive finite `max_velocity` and `max_effort`
+from admitted native articulation limits, including effective runtime overrides.
+These are independent of authored URDF hint values. Unbounded limits and zero
+passive-effort limits remain unspecified under the positive-limit public
+contract; inconsistent environment layouts or limits fail admission.
+
+### Fresh scene poses
+
+Worlds admitted for planning expose the optional
+`planning_scene_pose_state(environment_index=0)` extension. It reads every
+catalogued entity and physical link pose and twist on the World authority thread,
+including same-tick state writes, without constructing geometry transforms,
+joint arrays or planning history publications. The result is validated against
+the exact provider/world/generation/environment and catalog identity; invalid
+environment indices, missing links and stale native ticks are rejected. Callers
+must request planning support and explicitly handle an unavailable extension.
+
+CPU target deduplication additionally requires the SDK's optional read-only
+`target_state_revision`. Public target/state/gain/reset writes change that revision;
+the adapter records it only after successful own writes and invalidates both
+physical-axis target and control-mode records on external changes or failed writes.
+Without it, setters and the ordinary public submission path run each time.
+A caller directly editing raw PhysX views or target data tensors must call
+`asset.invalidate_target_state()` afterward; these bypasses cannot be automatically
+observed. Signature negotiation rejects positional-only or uninspectable optional
+parameters and preserves the legacy call shape. No private SDK patch is installed.

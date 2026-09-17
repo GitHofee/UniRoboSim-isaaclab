@@ -36,6 +36,7 @@ from .native_protocols import (
     NativePhysicsDiagnostics,
     NativePlanningCatalog,
     NativePlanningError,
+    NativePlanningPoseState,
     NativePlanningResource,
     NativePlanningState,
     NativePlanningWorldDriver,
@@ -542,6 +543,9 @@ def _dispatch(
     if operation == "planning_catalog":
         planning = cast(NativePlanningWorldDriver, active)
         return active, planning.planning_catalog(cast(int, args[0])), False
+    if operation == "planning_pose_state":
+        planning = cast(NativePlanningWorldDriver, active)
+        return active, planning.planning_pose_state(cast(int, args[0])), False
     if operation == "planning_state":
         planning = cast(NativePlanningWorldDriver, active)
         return active, planning.planning_state(cast(int, args[0])), False
@@ -1357,6 +1361,10 @@ class IsaacLabWorkerPlanningWorld(IsaacLabWorkerWorld):
     def planning_catalog(self, environment_index: int = 0) -> NativePlanningCatalog:
         self._ensure_open("planning_catalog")
         return cast(NativePlanningCatalog, self._runtime._request("planning_catalog", environment_index))
+
+    def planning_pose_state(self, environment_index: int = 0) -> NativePlanningPoseState:
+        self._ensure_open("planning_pose_state")
+        return cast(NativePlanningPoseState, self._runtime._request("planning_pose_state", environment_index))
 
     def planning_state(self, environment_index: int = 0) -> NativePlanningState:
         self._ensure_open("planning_state")

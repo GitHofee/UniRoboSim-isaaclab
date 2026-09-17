@@ -27,6 +27,7 @@ from unirobosim import (
     PlanningSceneHashMismatchError,
     PlanningSceneIncompleteError,
     PlanningSceneNotFoundError,
+    PlanningScenePoseState,
     PlanningSceneRepresentationError,
     PlanningSceneStaleGenerationError,
     PlanningSceneState,
@@ -39,6 +40,7 @@ from unirobosim import (
 from .native_protocols import (
     NativePlanningCatalog,
     NativePlanningError,
+    NativePlanningPoseState,
     NativePlanningResource,
     NativePlanningState,
     NativePlanningWorldDriver,
@@ -503,6 +505,30 @@ class IsaacLabPlanningWorld(IsaacLabWorld):
         self._planning_require_authority(operation)
         environment = self._planning_environment_index(environment_index, operation)
         return self._planning_environments[environment].catalog
+
+    def planning_scene_pose_state(self, environment_index: int = 0) -> PlanningScenePoseState:
+        operation = "world.planning_scene_pose_state"
+        self._planning_require_authority(operation)
+        environment_index = self._planning_environment_index(environment_index, operation)
+        catalog = self._planning_environments[environment_index].catalog
+        reader = getattr(self._planning_native, "planning_pose_state", None)
+        if not callable(reader):
+            raise PlanningSceneContractError("native pose-state extension is unavailable", operation=operation)
+        native = self._native_planning_call(operation, lambda: reader(environment_index))
+        self._planning_require_authority(operation)
+        if self._planning_environments[environment_index].catalog is not catalog:
+            raise PlanningSceneContractError("pose-state catalog changed during read", operation=operation)
+        if (type(native) is not NativePlanningPoseState or type(native.step_index) is not int
+                or native.step_index != self._step_index):
+            raise PlanningSceneContractError("native pose state is invalid or stale", operation=operation)
+        result = PlanningScenePoseState(
+            self._session.descriptor.provider_id, self.world_id, catalog.generation, environment_index,
+            Tick(native.step_index, native.step_index * self._spec.physics.time_step_seconds),
+            catalog.catalog_revision, catalog.content_sha256, catalog.world_frame_id,
+            native.entities, native.links,
+        )
+        result.validate_against(catalog)
+        return result
 
     def planning_scene_state(self, environment_index: int = 0) -> PlanningSceneState:
         operation = "world.planning_scene_state"

@@ -12,7 +12,16 @@ class _Rows:
         self.values = values
         self.reads = 0
 
+    def __getitem__(self, indices):
+        selected = _Rows(
+            self.values[indices] if isinstance(indices, slice) else [self.values[index] for index in indices]
+        )
+        selected._source = self
+        return selected
+
     def detach(self):
+        if hasattr(self, "_source"):
+            self._source.reads += 1
         self.reads += 1
         return self
 
@@ -26,33 +35,57 @@ class _Rows:
 def _admission():
     admission = object.__new__(native._PlanningAdmission)
     path = EntityPath("/robot")
-    pose_rows = _Rows([[0., 0., 0., 1., 0., 0., 0.], [1., 0., 0., 1., 0., 0., 0.]])
-    velocity_rows = _Rows([[0.] * 6, [0.] * 6])
-    asset = NS(body_names=("base", "tip"), data=NS(
-        body_link_pose_w=NS(torch=[pose_rows, pose_rows]),
-        body_link_vel_w=NS(torch=[velocity_rows, velocity_rows]),
-    ))
+    pose_rows = _Rows([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+    velocity_rows = _Rows([[0.0] * 6, [0.0] * 6])
+    asset = NS(
+        body_names=("base", "tip"),
+        data=NS(
+            body_link_pose_w=NS(torch=[pose_rows, pose_rows]),
+            body_link_vel_w=NS(torch=[velocity_rows, velocity_rows]),
+        ),
+    )
     modules = NS(UsdGeom=NS(XformCache=object), sim_utils=NS(get_current_stage=object))
-    admission._world = NS(_m=modules, _spec=NS(environments=NS(count=2)), _step_index=0,
-                          _origins_cpu=[(0., 0., 0.), (2., 0., 0.)],
-                          _articulations={}, _rigids={path: asset})
+    admission._world = NS(
+        _m=modules,
+        _spec=NS(environments=NS(count=2)),
+        _step_index=0,
+        _origins_cpu=[(0.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
+        _articulations={},
+        _rigids={path: asset},
+    )
     admission._m = modules
     # Duplicate authored names retain the previous first-match behavior;
     # the second joint remains independently selectable through its stable ID.
-    joints = tuple(native._JointBinding(
-        NS(authored_name="joint", joint_id=f"joint.{i}"), parent, "tip",
-        PlanningGeometryLocalPose((offset, 0., 0.)), None,
-    ) for i, (parent, offset) in enumerate((("base", .25), ("tip", .75))))
-    admission._entities = {path: native._EntityBinding(
-        path, "entity.robot", "base", "link.base", {"base": "link.base", "tip": "link.tip"},
-        joints, ("/robot", "/robot"), entity_prim_link_name="base")}
+    joints = tuple(
+        native._JointBinding(
+            NS(authored_name="joint", joint_id=f"joint.{i}"),
+            parent,
+            "tip",
+            PlanningGeometryLocalPose((offset, 0.0, 0.0)),
+            None,
+        )
+        for i, (parent, offset) in enumerate((("base", 0.25), ("tip", 0.75)))
+    )
+    admission._entities = {
+        path: native._EntityBinding(
+            path,
+            "entity.robot",
+            "base",
+            "link.base",
+            {"base": "link.base", "tip": "link.tip"},
+            joints,
+            ("/robot", "/robot"),
+            entity_prim_link_name="base",
+        )
+    }
     admission._frames = {
         "frame.by_name": native._FrameBinding("frame.by_name", path, "joint", "joint"),
         "frame.by_id": native._FrameBinding("frame.by_id", path, "joint_id", "joint.1"),
     }
     admission._geometries = {
-        name: native._GeometryBinding(NS(parent_frame_T_geometry=PlanningGeometryLocalPose((0., 0., 0.))),
-                                     path, parent)
+        name: native._GeometryBinding(
+            NS(parent_frame_T_geometry=PlanningGeometryLocalPose((0.0, 0.0, 0.0))), path, parent
+        )
         for name, parent in (("geometry.z", "tip"), ("geometry.a", "base"))
     }
     admission._geometry_transform_caches = {}
@@ -64,7 +97,7 @@ def test_layout_keeps_joint_name_first_match_id_selection_and_geometry_order():
     admission, _, _, _ = _admission()
     state = admission.state(0)
     frames = {frame.frame_id: frame.world_pose.position_m[0] for frame in state.frames}
-    assert frames["frame.by_name"] == .25
+    assert frames["frame.by_name"] == 0.25
     assert frames["frame.by_id"] == 1.75
     assert tuple(item.geometry_id for item in state.geometry_transforms) == ("geometry.a", "geometry.z")
 
@@ -74,28 +107,45 @@ def test_layout_reads_current_poses_on_same_tick_reset_and_other_environment():
     initial = admission.state(0)
     assert admission.state(0) == initial
     assert poses.reads == velocities.reads == 2
-    poses.values[0][0] = .5
+    poses.values[0][0] = 0.5
     moved = admission.state(0)
     assert moved.step_index == initial.step_index
-    assert next(f for f in moved.frames if f.frame_id == "frame.by_name").world_pose.position_m[0] == .75
-    assert moved.geometry_transforms[0].world_pose.position_m[0] == .5
+    assert next(f for f in moved.frames if f.frame_id == "frame.by_name").world_pose.position_m[0] == 0.75
+    assert moved.geometry_transforms[0].world_pose.position_m[0] == 0.5
     other = admission.state(1)
     assert next(f for f in other.frames if f.frame_id == "frame.by_name").world_pose.position_m[0] == -1.25
-    poses.values[0][0] = 0.
+    poses.values[0][0] = 0.0
     assert admission.state(0) == initial
+
+
+def test_geometry_reuses_only_exact_parent_pose_and_immutable_admission():
+    admission, _, poses, _ = _admission()
+    initial = admission.state(0)
+    repeated = admission.state(0)
+    assert all(a is b for a, b in zip(initial.geometry_transforms, repeated.geometry_transforms, strict=True))
+    poses.values[0][0] = 0.000001
+    moved = admission.state(0)
+    assert moved.geometry_transforms[0] is not initial.geometry_transforms[0]
+    assert moved.geometry_transforms[1] is initial.geometry_transforms[1]
+    other = admission.state(1)
+    assert other.geometry_transforms[0] is not moved.geometry_transforms[0]
+    admission._prepare_state_reads()
+    rebuilt = admission.state(0)
+    assert rebuilt.geometry_transforms == moved.geometry_transforms
+    assert rebuilt.geometry_transforms[0] is not moved.geometry_transforms[0]
 
 
 def test_new_admission_owns_its_layout_and_resolves_new_joint_bindings():
     first, path, _, _ = _admission()
     second, _, _, _ = _admission()
     binding = second._entities[path]
-    changed_joint = replace(binding.joint_bindings[0], local_pose=PlanningGeometryLocalPose((.5, 0., 0.)))
+    changed_joint = replace(binding.joint_bindings[0], local_pose=PlanningGeometryLocalPose((0.5, 0.0, 0.0)))
     second._entities[path] = replace(binding, joint_bindings=(changed_joint, *binding.joint_bindings[1:]))
     second._prepare_state_reads()
     assert first._joint_frame_bindings is not second._joint_frame_bindings
     first_pose = next(f for f in first.state(0).frames if f.frame_id == "frame.by_name").world_pose.position_m
     second_pose = next(f for f in second.state(0).frames if f.frame_id == "frame.by_name").world_pose.position_m
-    assert first_pose == (.25, 0., 0.) and second_pose == (.5, 0., 0.)
+    assert first_pose == (0.25, 0.0, 0.0) and second_pose == (0.5, 0.0, 0.0)
 
 
 def test_constructor_prepares_layout_after_catalog_admission(monkeypatch):

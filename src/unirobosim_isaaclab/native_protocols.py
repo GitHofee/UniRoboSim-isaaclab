@@ -155,6 +155,15 @@ class NativePlanningCatalog:
 
 
 @dataclass(frozen=True, slots=True)
+class NativePlanningPoseState:
+    """Complete entity/link poses at one native tick, independent of full publications."""
+
+    step_index: int
+    entities: tuple[PlanningEntityState, ...]
+    links: tuple[PlanningLinkState, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class NativePlanningState:
     """One coherent environment-local state captured from a committed tick."""
 
@@ -380,6 +389,8 @@ class NativePlanningWorldDriver(NativeWorldDriver, Protocol):
     def planning_catalog(self, environment_index: int = 0) -> NativePlanningCatalog: ...
 
     def planning_state(self, environment_index: int = 0) -> NativePlanningState: ...
+
+    def planning_pose_state(self, environment_index: int = 0) -> NativePlanningPoseState: ...
 
     def planning_resource(self, geometry_id: str, environment_index: int = 0) -> NativePlanningResource: ...
 

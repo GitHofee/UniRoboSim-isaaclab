@@ -14,7 +14,7 @@ import math
 import struct
 import sys
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -58,9 +58,11 @@ from ._collision_mesh import single_exact_convex_mesh
 from ._planning_cache import PlanningMeshCache
 from ._planning_cache import cache_key as planning_cache_key
 from .native import IsaacLabNativeWorld, _native_name
+from .native_joint_limits import effective_joint_drive_limits
 from .native_protocols import (
     NativePlanningCatalog,
     NativePlanningError,
+    NativePlanningPoseState,
     NativePlanningResource,
     NativePlanningState,
 )
@@ -808,6 +810,11 @@ class _PlanningAdmission:
                 joint for joint in joints if getattr(joint.descriptor, attribute) == frame.source_name
             )
         self._ordered_geometry_bindings = tuple(sorted(self._geometries.items()))
+        # Admission owns immutable local geometry poses. Reuse only when the
+        # freshly read parent pose is exactly equal, never merely by tick.
+        self._geometry_transform_caches: dict[
+            int, dict[str, tuple[PlanningPose, PlanningGeometryTransform]]
+        ] = {}
 
     @property
     def catalog(self) -> NativePlanningCatalog:
@@ -1003,6 +1010,12 @@ class _PlanningAdmission:
             else:
                 result = self._entity_catalog(spec)
             entity, entity_links, entity_joints, entity_frames, entity_geometries, binding = result
+            entity_joints = effective_joint_drive_limits(self._world, spec, binding, entity_joints)
+            effective_by_id = {joint.joint_id: joint for joint in entity_joints}
+            binding = replace(binding, joint_bindings=tuple(
+                replace(item, descriptor=effective_by_id[item.descriptor.joint_id])
+                for item in binding.joint_bindings
+            ))
             entities.append(entity)
             links.extend(entity_links)
             joints.extend(entity_joints)
@@ -2900,7 +2913,9 @@ class _PlanningAdmission:
         if live_bodies != self._accounted_bodies or live_colliders != self._accounted_colliders:
             raise NativePlanningError("catalog_invalid")
 
-    def state(self, environment_index: int) -> NativePlanningState:
+    def state(
+        self, environment_index: int, *, poses_only: bool = False,
+    ) -> NativePlanningState | NativePlanningPoseState:
         if type(environment_index) is not int or not 0 <= environment_index < self._world._spec.environments.count:
             raise NativePlanningError("generation_stale")
         poses: dict[tuple[EntityPath, str], PlanningPose] = {}
@@ -2977,6 +2992,8 @@ class _PlanningAdmission:
                 twists[path, _COMPOSITE_ENTITY_POSE] = entity_twist
             entity_pose_by_path[path] = entity_pose
             entity_states.append(PlanningEntityState(binding.entity_id, entity_pose, entity_twist))
+            if poses_only:
+                continue
             if binding.state_source == "asset" and path in self._world._articulations:
                 assert asset is not None
                 joint_names = tuple(asset.joint_names)
@@ -3026,6 +3043,13 @@ class _PlanningAdmission:
                     )
                 )
 
+        if poses_only:
+            return NativePlanningPoseState(
+                self._world._step_index,
+                tuple(sorted(entity_states, key=lambda item: item.entity_id)),
+                tuple(sorted(link_states, key=lambda item: item.link_id)),
+            )
+
         frame_poses: dict[str, PlanningPose] = {_WORLD_FRAME_ID: _IDENTITY_POSE}
         if _SYSTEM_FRAME_ID in self._frames:
             frame_poses[_SYSTEM_FRAME_ID] = _IDENTITY_POSE
@@ -3052,6 +3076,7 @@ class _PlanningAdmission:
                 frame_poses[frame_id] = _compose_pose(parent_pose, frame.local_pose)
         frame_states = tuple(PlanningFrameState(frame_id, frame_poses[frame_id]) for frame_id in sorted(frame_poses))
         geometry_transforms = []
+        geometry_cache = self._geometry_transform_caches.setdefault(environment_index, {})
         for geometry_id, geometry_binding in self._ordered_geometry_bindings:
             if geometry_binding.entity_path is None:
                 parent_pose = _IDENTITY_POSE
@@ -3059,12 +3084,16 @@ class _PlanningAdmission:
                 parent_pose = entity_pose_by_path[geometry_binding.entity_path]
             else:
                 parent_pose = poses[geometry_binding.entity_path, geometry_binding.owner_link_name]
-            geometry_transforms.append(
-                PlanningGeometryTransform(
+            cached = geometry_cache.get(geometry_id)
+            if cached is not None and cached[0] == parent_pose:
+                transform = cached[1]
+            else:
+                transform = PlanningGeometryTransform(
                     geometry_id,
                     _compose_pose(parent_pose, geometry_binding.descriptor.parent_frame_T_geometry),
                 )
-            )
+                geometry_cache[geometry_id] = (parent_pose, transform)
+            geometry_transforms.append(transform)
         attachments: list[PlanningAttachment] = []
         for (attachment_environment, _attachment_id), attachment in sorted(
             getattr(self._world, "_runtime_attachments", {}).items()
@@ -3165,7 +3194,14 @@ class IsaacLabNativePlanningWorld(IsaacLabNativeWorld):
         return self._planning().catalog
 
     def planning_state(self, environment_index: int = 0) -> NativePlanningState:
-        return self._planning().state(environment_index)
+        result = self._planning().state(environment_index)
+        assert type(result) is NativePlanningState
+        return result
+
+    def planning_pose_state(self, environment_index: int = 0) -> NativePlanningPoseState:
+        result = self._planning().state(environment_index, poses_only=True)
+        assert type(result) is NativePlanningPoseState
+        return result
 
     def planning_resource(self, geometry_id: str, environment_index: int = 0) -> NativePlanningResource:
         if type(environment_index) is not int or not 0 <= environment_index < self._spec.environments.count:

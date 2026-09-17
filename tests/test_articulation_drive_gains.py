@@ -53,6 +53,7 @@ class _Torch:
 
 class _Asset:
     def __init__(self) -> None:
+        self.target_state_revision = 0
         self.stiffness_writes: list[list[list[float]]] = []
         self.damping_writes: list[list[list[float]]] = []
 

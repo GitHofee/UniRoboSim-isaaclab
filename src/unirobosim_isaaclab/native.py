@@ -7,6 +7,7 @@ constructed before importing simulation, torch, Omni, or USD modules.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import sys
 from collections.abc import Callable, Iterable
@@ -55,6 +56,7 @@ from .native_protocols import (
     PointBatch,
 )
 from .native_state import ArticulationStateCache
+from .native_targets import JointTargetVersions
 from .native_velocity import root_com_velocity_from_link
 from .physics_activation import (
     DynamicRigidBodyCandidate,
@@ -1240,6 +1242,9 @@ class IsaacLabNativeWorld:
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
         self._initial_articulation_gains: dict[EntityPath, tuple[Any, Any]] = {}
         self._articulation_control_modes: dict[EntityPath, list[list[CommandMode | None]]] = {}
+        self._joint_target_versions: dict[EntityPath, JointTargetVersions] = {}
+        self._versioned_target_writers: dict[EntityPath, bool] = {}
+        self._kinematic_body_indices: dict[EntityPath, tuple[Any, tuple[str, ...], dict[str, int]]] = {}
         self._initial_rigid: dict[EntityPath, tuple[Any, Any]] = {}
         self._rigid_wrenches: dict[EntityPath, tuple[Any, Any]] = {}
         self._initial_entity_prim_poses: dict[EntityPath, tuple[Pose, ...]] = {}
@@ -3598,43 +3603,153 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         env_ids = list(environment_indices)
         joint_ids = [self._joint_maps[path][index] for index in degree_of_freedom_indices]
-        target = self._m.torch.tensor(targets, device=self._sim.device, dtype=self._m.torch.float32)
-        zeros = self._m.torch.zeros_like(target)
+        versions, _ = self._synchronize_target_state(path, asset)
         control_modes = self._articulation_control_modes[path]
         gains_changed = any(
             control_modes[environment][joint] is not mode for environment in environment_indices for joint in joint_ids
         )
+        native_joint_ids = tuple(joint_ids)
+        zero_targets = tuple(tuple(0.0 for _ in row) for row in targets)
+        # Isaac Lab's public setters fill persistent input buffers. Compare the
+        # authoritative CPU commands before allocating or launching device work.
         if mode is CommandMode.POSITION:
-            asset.set_joint_position_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
-            asset.set_joint_velocity_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
-            asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
-            if gains_changed:
-                initial_stiffness, initial_damping = self._initial_articulation_gains[path]
-                stiffness = initial_stiffness[env_ids][:, joint_ids]
-                damping = initial_damping[env_ids][:, joint_ids]
-                stiffness, damping = _position_command_gains(
-                    stiffness,
-                    damping,
-                    fallback_authored_zero=self._config.position_stiffness is None,
-                    fallback_authored_damping=self._config.position_damping is None,
-                )
+            write_position = gains_changed or not versions.matches(
+                "position", targets, environment_indices, native_joint_ids,
+            )
+            write_velocity = gains_changed or not versions.matches(
+                "velocity", zero_targets, environment_indices, native_joint_ids,
+            )
+            # A completed position command also cleared feed-forward effort.
+            write_effort = write_velocity
         elif mode is CommandMode.VELOCITY:
-            asset.set_joint_velocity_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
-            asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
-            if gains_changed:
-                stiffness = zeros
-                damping = self._m.torch.full_like(target, self._config.velocity_damping)
+            write_position = False
+            write_velocity = gains_changed or not versions.matches(
+                "velocity", targets, environment_indices, native_joint_ids,
+            )
+            # Unknown/reset axes must establish the zero-effort input again.
+            write_effort = gains_changed or not versions.contains(
+                "velocity", environment_indices, native_joint_ids,
+            )
         else:
-            asset.set_joint_effort_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
-            if gains_changed:
-                stiffness = zeros
-                damping = zeros
+            write_position = write_velocity = False
+            # Keep explicit effort-command submission behavior unchanged.
+            write_effort = True
+        if not (write_position or write_velocity or write_effort or gains_changed):
+            return
         if gains_changed:
-            asset.write_joint_stiffness_to_sim_index(stiffness=stiffness, joint_ids=joint_ids, env_ids=env_ids)
-            asset.write_joint_damping_to_sim_index(damping=damping, joint_ids=joint_ids, env_ids=env_ids)
+            versions.invalidate()
+        try:
+            target = self._m.torch.tensor(targets, device=self._sim.device, dtype=self._m.torch.float32)
+            zeros = (
+                self._m.torch.zeros_like(target)
+                if (mode is CommandMode.POSITION and (write_velocity or write_effort))
+                or (mode is CommandMode.VELOCITY and (write_effort or gains_changed))
+                or (mode is CommandMode.EFFORT and gains_changed)
+                else None
+            )
+            if mode is CommandMode.POSITION:
+                if write_position:
+                    asset.set_joint_position_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
+                if write_velocity:
+                    asset.set_joint_velocity_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
+                if write_effort:
+                    asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
+                if gains_changed:
+                    initial_stiffness, initial_damping = self._initial_articulation_gains[path]
+                    stiffness = initial_stiffness[env_ids][:, joint_ids]
+                    damping = initial_damping[env_ids][:, joint_ids]
+                    stiffness, damping = _position_command_gains(
+                        stiffness,
+                        damping,
+                        fallback_authored_zero=self._config.position_stiffness is None,
+                        fallback_authored_damping=self._config.position_damping is None,
+                    )
+            elif mode is CommandMode.VELOCITY:
+                if write_velocity:
+                    asset.set_joint_velocity_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
+                if write_effort:
+                    asset.set_joint_effort_target_index(target=zeros, joint_ids=joint_ids, env_ids=env_ids)
+                if gains_changed:
+                    stiffness = zeros
+                    damping = self._m.torch.full_like(target, self._config.velocity_damping)
+            else:
+                asset.set_joint_effort_target_index(target=target, joint_ids=joint_ids, env_ids=env_ids)
+                if gains_changed:
+                    stiffness = zeros
+                    damping = zeros
+            if gains_changed:
+                asset.write_joint_stiffness_to_sim_index(stiffness=stiffness, joint_ids=joint_ids, env_ids=env_ids)
+                asset.write_joint_damping_to_sim_index(damping=damping, joint_ids=joint_ids, env_ids=env_ids)
+                for environment in environment_indices:
+                    for joint in joint_ids:
+                        control_modes[environment][joint] = mode
+        except Exception:
+            # A setter may already have changed a device buffer. Do not let a
+            # later retry trust pre-failure targets; preserve the original error.
+            versions.invalidate()
             for environment in environment_indices:
                 for joint in joint_ids:
-                    control_modes[environment][joint] = mode
+                    control_modes[environment][joint] = None
+            raise
+        versions.native_revision = self._native_target_revision(asset)
+        if mode is CommandMode.POSITION:
+            versions.update("position", targets, environment_indices, native_joint_ids)
+            versions.update("velocity", zero_targets, environment_indices, native_joint_ids)
+        elif mode is CommandMode.VELOCITY:
+            versions.update("velocity", targets, environment_indices, native_joint_ids)
+
+    @staticmethod
+    def _native_target_revision(asset: Any) -> int | None:
+        revision = getattr(asset, "target_state_revision", None)
+        return revision if type(revision) is int and revision >= 0 else None
+
+    def _invalidate_target_state(self, path: EntityPath, versions: JointTargetVersions) -> None:
+        versions.invalidate()
+        for row in getattr(self, "_articulation_control_modes", {}).get(path, ()):
+            for index in range(len(row)):
+                row[index] = None
+
+    def _synchronize_target_state(self, path: EntityPath, asset: Any) -> tuple[JointTargetVersions, int | None]:
+        records = getattr(self, "_joint_target_versions", None)
+        if records is None:
+            records = self._joint_target_versions = {}
+        versions = records.setdefault(path, JointTargetVersions())
+        revision = self._native_target_revision(asset)
+        if revision is None or revision != versions.native_revision:
+            self._invalidate_target_state(path, versions)
+            versions.native_revision = revision
+        return versions, revision
+
+    def _write_articulation_data(self, path: EntityPath, asset: Any) -> None:
+        # Signature negotiation never executes a speculative write. Unknown or
+        # positional-only signatures preserve the original public call shape.
+        writers = getattr(self, "_versioned_target_writers", None)
+        if writers is None:
+            writers = self._versioned_target_writers = {}
+        supported = writers.get(path)
+        if supported is None:
+            try:
+                parameters = inspect.signature(asset.write_data_to_sim).parameters
+                supported = all(
+                    name in parameters and parameters[name].kind in (
+                        inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    ) for name in ("position_target_version", "velocity_target_version")
+                )
+            except (TypeError, ValueError):
+                supported = False
+            writers[path] = supported
+        versions, revision = self._synchronize_target_state(path, asset)
+        try:
+            if supported and revision is not None:
+                asset.write_data_to_sim(
+                    position_target_version=versions.position,
+                    velocity_target_version=versions.velocity,
+                )
+            else:
+                asset.write_data_to_sim()
+        except Exception:
+            self._invalidate_target_state(path, versions)
+            raise
 
     def _validate_articulation_command(self, command: NativeArticulationCommand) -> None:
         if type(command) is not NativeArticulationCommand or command.path not in self._joint_maps:
@@ -3781,22 +3896,24 @@ class IsaacLabNativeWorld:
         view.set_dof_dampings(damping[damping_indices], damping_indices)
 
     def read_articulation(self, path: EntityPath) -> tuple[Matrix, Matrix]:
+        joint_map = self._joint_maps[path]
+        unique = tuple(dict.fromkeys(joint_map))
         if path in self._usd_articulation_views:
             view = self._usd_articulation_views[path]
-            joint_map = list(self._joint_maps[path])
-            positions = view.get_dof_positions()[:, joint_map].detach().cpu().tolist()
-            velocities = view.get_dof_velocities()[:, joint_map].detach().cpu().tolist()
-            return (
-                tuple(tuple(float(value) for value in row) for row in positions),
-                tuple(tuple(float(value) for value in row) for row in velocities),
-            )
-        asset = self._articulations[path]
-        joint_map = list(self._joint_maps[path])
-        positions = asset.data.joint_pos.torch[:, joint_map].detach().cpu().tolist()
-        velocities = asset.data.joint_vel.torch[:, joint_map].detach().cpu().tolist()
+            positions = view.get_dof_positions()
+            velocities = view.get_dof_velocities()
+        else:
+            asset = self._articulations[path]
+            positions = asset.data.joint_pos.torch
+            velocities = asset.data.joint_vel.torch
+        # Gather on-device before download. Sparse public joint groups must not
+        # pay for every physical DOF; duplicate/reordered mappings remain exact.
+        position_rows = positions[:, list(unique)].detach().cpu().tolist()
+        velocity_rows = velocities[:, list(unique)].detach().cpu().tolist()
+        offsets = {index: offset for offset, index in enumerate(unique)}
         return (
-            tuple(tuple(float(value) for value in row) for row in positions),
-            tuple(tuple(float(value) for value in row) for row in velocities),
+            tuple(tuple(float(row[offsets[index]]) for index in joint_map) for row in position_rows),
+            tuple(tuple(float(row[offsets[index]]) for index in joint_map) for row in velocity_rows),
         )
 
     def read_selected_kinematics(
@@ -3806,30 +3923,59 @@ class IsaacLabNativeWorld:
     ) -> tuple[NativeKinematicState, ...]:
         """Read only requested articulation bodies without admitting geometry."""
 
-        if not 0 <= environment_index < self._spec.environments.count:
+        if type(environment_index) is not int or not 0 <= environment_index < self._spec.environments.count:
             raise IndexError("selected kinematics environment index is out of range")
         origin = self._origins_cpu[environment_index]
         result: list[NativeKinematicState] = []
+        # Freeze each requested subset before native reads. Gather only unique
+        # requested bodies on-device, then restore authored order and duplicates.
+        selections: dict[EntityPath, dict[str, int]] = {}
+        for target in targets:
+            if target.entity_path not in self._articulations or target.link_name is None:
+                continue
+            selected = selections.get(target.entity_path)
+            if selected is None:
+                selected = selections[target.entity_path] = {}
+            selected.setdefault(target.link_name, 0)
+        asset_rows = {}
+        layouts = getattr(self, "_kinematic_body_indices", None)
+        if layouts is None:
+            layouts = self._kinematic_body_indices = {}
+        for path, selected in selections.items():
+            asset = self._articulations[path]
+            names = tuple(asset.body_names)
+            layout = layouts.get(path)
+            if layout is None or layout[0] is not asset or layout[1] != names:
+                indices = {name: index for index, name in enumerate(names)}
+                if len(indices) != len(names):
+                    raise RuntimeError("selected articulation body names must be unique")
+                layout = layouts[path] = (asset, names, indices)
+            indices = layout[2]
+            for name in selected:
+                if name not in indices:
+                    raise KeyError(f"selected link {name!r} must match exactly one body on {path.value}")
+            requested = [indices[name] for name in selected]
+            # One contiguous body needs no gather kernel or index tensor. Full
+            # natural-order coverage likewise reuses the device view directly.
+            selection = (slice(requested[0], requested[0] + 1) if len(requested) == 1
+                         else slice(None) if requested == list(range(len(names))) else requested)
+            poses = asset.data.body_link_pose_w.torch[environment_index][selection].detach().cpu().tolist()
+            velocities = asset.data.body_link_vel_w.torch[environment_index][selection].detach().cpu().tolist()
+            asset_rows[path] = dict(zip(selected, zip(poses, velocities, strict=True), strict=True))
+        roots = {}
         for target in targets:
             path = target.entity_path
             if path in self._articulations:
                 asset = self._articulations[path]
                 if target.link_name is None:
-                    pose_row = asset.data.root_link_pose_w.torch[environment_index]
-                    velocity_row = asset.data.root_link_vel_w.torch[environment_index]
-                else:
-                    matches = tuple(
-                        index for index, name in enumerate(asset.body_names) if name == target.link_name
-                    )
-                    if len(matches) != 1:
-                        raise KeyError(
-                            f"selected link {target.link_name!r} must match exactly one body on {path.value}"
+                    if path not in roots:
+                        roots[path] = (
+                            asset.data.root_link_pose_w.torch[environment_index].detach().cpu().tolist(),
+                            asset.data.root_link_vel_w.torch[environment_index].detach().cpu().tolist(),
                         )
-                    body_index = matches[0]
-                    pose_row = asset.data.body_link_pose_w.torch[environment_index, body_index]
-                    velocity_row = asset.data.body_link_vel_w.torch[environment_index, body_index]
-                row = pose_row.detach().cpu().tolist()
-                velocity = velocity_row.detach().cpu().tolist()
+                    row, velocity = roots[path]
+                else:
+                    row, velocity = asset_rows[path][target.link_name]
             elif path in self._usd_articulation_views:
                 articulation_view = self._usd_articulation_views[path]
                 if target.link_name is None:
@@ -4518,29 +4664,21 @@ class IsaacLabNativeWorld:
             velocity = view.get_velocities()
             origins = self._m.torch.tensor(self._origins_cpu, device=pose.device, dtype=pose.dtype)
             pose[:, :3] -= origins
-            positions = pose[:, :3].detach().cpu().tolist()
-            orientations = pose[:, 3:].detach().cpu().tolist()
-            linear_velocities = velocity[:, :3].detach().cpu().tolist()
-            angular_velocities = velocity[:, 3:].detach().cpu().tolist()
-            return (
-                tuple(tuple(float(value) for value in row) for row in positions),
-                tuple(tuple(float(value) for value in row) for row in orientations),
-                tuple(tuple(float(value) for value in row) for row in linear_velocities),
-                tuple(tuple(float(value) for value in row) for row in angular_velocities),
-            )
-        asset = self._rigids[path]
-        assert self._origins is not None
-        pose = asset.data.root_link_pose_w.torch.clone()
-        pose[:, :3] -= self._origins
-        velocity = asset.data.root_link_vel_w.torch
-        positions = pose[:, :3].detach().cpu().tolist()
-        orientations = pose[:, 3:].detach().cpu().tolist()
-        linear_velocities = velocity[:, :3].detach().cpu().tolist()
-        angular_velocities = velocity[:, 3:].detach().cpu().tolist()
-        return tuple(
-            tuple(tuple(float(value) for value in row) for row in values)
-            for values in (positions, orientations, linear_velocities, angular_velocities)
-        )  # type: ignore[return-value]
+        else:
+            asset = self._rigids[path]
+            assert self._origins is not None
+            pose = asset.data.root_link_pose_w.torch.clone()
+            pose[:, :3] -= self._origins
+            velocity = asset.data.root_link_vel_w.torch
+        # Transfer each complete tensor once; split its fields on the CPU.
+        pose_rows = pose.detach().cpu().tolist()
+        velocity_rows = velocity.detach().cpu().tolist()
+        return (
+            tuple(tuple(float(value) for value in row[:3]) for row in pose_rows),
+            tuple(tuple(float(value) for value in row[3:]) for row in pose_rows),
+            tuple(tuple(float(value) for value in row[:3]) for row in velocity_rows),
+            tuple(tuple(float(value) for value in row[3:]) for row in velocity_rows),
+        )
 
     def _entity_prim_path(self, path: EntityPath, environment_index: int) -> str:
         key = (path, environment_index)
@@ -5463,8 +5601,8 @@ class IsaacLabNativeWorld:
                     forces, torques = self._usd_rigid_wrenches[path]
                     indices = self._m.torch.arange(view.count, device=forces.device, dtype=self._m.torch.int64)
                     view.apply_forces_and_torques_at_position(forces, torques, None, indices, True)
-                for asset in self._articulations.values():
-                    asset.write_data_to_sim()
+                for path, asset in self._articulations.items():
+                    self._write_articulation_data(path, asset)
                 for asset in self._rigids.values():
                     asset.write_data_to_sim()
                 for asset in self._deformables.values():
@@ -5495,6 +5633,9 @@ class IsaacLabNativeWorld:
         for path, asset in self._articulations.items():
             if dt == 0.0:
                 self._articulation_state_caches[path].invalidate()
+                versions = getattr(self, "_joint_target_versions", {}).get(path)
+                if versions is not None:
+                    versions.invalidate()
             asset.update(dt)
         for asset in self._rigids.values():
             asset.update(dt)
@@ -5511,6 +5652,9 @@ class IsaacLabNativeWorld:
         self._sim = None
         self._articulations.clear()
         self._articulation_state_caches.clear()
+        self._joint_target_versions.clear()
+        self._versioned_target_writers.clear()
+        self._kinematic_body_indices.clear()
         self._usd_articulations.clear()
         self._usd_articulation_views.clear()
         self._selected_link_views.clear()

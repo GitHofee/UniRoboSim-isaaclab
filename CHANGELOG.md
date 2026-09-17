@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.21
+
+- Require UniRoboSim 0.10.8 and provide fresh pose-only entity/link reads with exact catalog, environment, tick and authority checks.
+- Gather deduplicated requested joint/body subsets on device before transfer, preserving order, duplicates and environment origins.
+- Publish admitted native velocity/effort limits and reject inconsistent environment layouts.
+- Reuse persistent targets only with SDK mutation revisions, invalidate target/mode state after native changes or failures, and preserve the original public write path for older SDKs. Effort, wrench and per-step actuator computation remain active.
+
 ## 0.10.20
 
 - Admit fixed-root outer-frame anchors and supported excluded spherical constraints; publish closures separately with SI anchors and coupled tree joints.
