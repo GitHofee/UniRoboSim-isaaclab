@@ -2,6 +2,14 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+原生世界显式开启 `PhysxCfg.enable_external_forces_every_iteration`，将重力和外力
+分配到每次 TGS 位置迭代，使其与驱动和约束的作用时段一致，减少关节位置已稳定但
+报告速度仍非零的现象。该设置统一用于原生世界，不修改资产增益、关节限位、求解器
+迭代次数或物理步长。它会改变积分行为：自由落体位移可能受位置迭代次数影响，
+因此不保证旧轨迹逐点不变。PGS 忽略此设置；它也不保证所有关节系统和接触条件下
+速度都归零，仍需在固定 SDK 上验证负载保持和实际任务。
+原理见 [PhysX TGS 外力施加说明](https://nvidia-omniverse.github.io/PhysX/physx/5.8.0/docs/Simulation.html#tgs-force-application)。
+
 `unirobosim-isaaclab` 将 UniRoboSim `0.10.x` 接入 Isaac Lab 3.0 / Isaac Sim 6.0.1。导入包和执行 `probe()` 不产生仿真副作用；`open()` 会在 Adapter 自己管理的 worker 进程中启动 Kit，避免 Isaac Sim 接管或终止应用主进程。
 
 Worker 启动只上报一组固定且严格有序的阶段。pre-Kit 阶段继续使用较短的

@@ -1397,7 +1397,10 @@ class IsaacLabNativeWorld:
                 f"tensor-backed deformables in one native world: {unsupported_mixed}"
             )
         physx_cfg = self._m.PhysxCfg(
-            gpu_max_num_partitions=_resolved_gpu_max_num_partitions(self._config, self._spec)
+            gpu_max_num_partitions=_resolved_gpu_max_num_partitions(self._config, self._spec),
+            # Apply gravity and drive/constraint forces over the same TGS substeps.
+            # Otherwise a held joint can report nonzero velocity at steady position.
+            enable_external_forces_every_iteration=True,
         )
         sim_cfg = sim_utils.SimulationCfg(
             dt=self._native_dt,

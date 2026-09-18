@@ -15,6 +15,17 @@ configuration, protocol, and package-fingerprint failures remain fail-fast.
 
 ## Compatibility
 
+Native worlds explicitly enable `PhysxCfg.enable_external_forces_every_iteration`.
+Gravity and external forces are distributed across TGS position iterations, aligning
+their application with drives and constraints to reduce nonzero reported velocities
+at otherwise steady joint positions. This applies to all native worlds, without
+changing authored gains, joint limits, solver iteration counts, or the physics timestep.
+It changes integration behavior: free-fall displacement can depend on the position
+iteration count, so previous trajectories are not guaranteed to remain identical.
+PGS ignores this flag. This does not guarantee zero velocity for every articulation
+or contact configuration; verify loaded holds and task outcomes with the pinned SDK.
+See [PhysX TGS force application](https://nvidia-omniverse.github.io/PhysX/physx/5.8.0/docs/Simulation.html#tgs-force-application).
+
 Python `>=3.12,<3.13`, UniRoboSim `>=0.10.8,<0.11`, and runtime contract
 `v0alpha6` are common to both admitted profiles:
 

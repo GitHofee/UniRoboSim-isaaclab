@@ -7,6 +7,47 @@ import pytest
 from unirobosim import FrozenMap
 
 
+def test_native_scene_enables_tgs_force_substeps_before_simulation_creation() -> None:
+    from unirobosim_isaaclab import IsaacLabAdapterConfig
+    from unirobosim_isaaclab.native import IsaacLabNativeWorld
+
+    created: list[SimpleNamespace] = []
+
+    class SceneCreated(Exception):
+        pass
+
+    class SimulationContext:
+        @staticmethod
+        def clear_instance() -> None:
+            pass
+
+        def __init__(self, cfg: SimpleNamespace) -> None:
+            created.append(cfg)
+            raise SceneCreated
+
+    world = object.__new__(IsaacLabNativeWorld)
+    world._has_fluid = False
+    world._native_dt = 1 / 60
+    world._render_interval_steps = 2
+    world._config = IsaacLabAdapterConfig(device="cuda:0", gpu_max_num_partitions=4)
+    world._spec = SimpleNamespace(entities=(), physics=SimpleNamespace(gravity_m_s2=(0.0, 0.0, -9.81)))
+    world._m = SimpleNamespace(
+        PhysxCfg=SimpleNamespace,
+        sim_utils=SimpleNamespace(
+            SimulationContext=SimulationContext, SimulationCfg=SimpleNamespace, create_new_stage=lambda: None
+        ),
+    )
+
+    with pytest.raises(SceneCreated):
+        world._build()
+
+    assert len(created) == 1
+    cfg = created[0]
+    assert cfg.physics.enable_external_forces_every_iteration is True
+    assert cfg.physics.gpu_max_num_partitions == 4
+    assert (cfg.dt, cfg.gravity, cfg.device, cfg.render_interval) == (1 / 60, (0.0, 0.0, -9.81), "cuda:0", 2)
+
+
 class _Attribute:
     def __init__(self, value: int) -> None:
         self.value = value
