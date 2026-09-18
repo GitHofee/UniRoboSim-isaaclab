@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.22
+
+- Enable external forces at every TGS position iteration for all native worlds, aligning gravity with drive and constraint substeps to reduce steady-position/nonzero-velocity discrepancies.
+- Preserve authored gains, limits, timestep, and solver iteration counts. This changes physical integration, including free-fall displacement; previous trajectories are not guaranteed to remain identical. PGS ignores the flag.
+- Validate empty/loaded native GPU holds and the complete 1e task (21 Actions, 22 Motions); add scene-construction regression coverage and bilingual behavior documentation.
+
 ## 0.10.21
 
 - Require UniRoboSim 0.10.8 and provide fresh pose-only entity/link reads with exact catalog, environment, tick and authority checks.
