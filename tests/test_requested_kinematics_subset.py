@@ -16,7 +16,8 @@ class Tensor:
     def __getitem__(self, index):
         if isinstance(index, tuple):
             rows, columns = index
-            return Tensor([[row[i] for i in columns] for row in self.values[rows]], self.transfers)
+            return Tensor([row[columns] if isinstance(columns, slice) else [row[i] for i in columns]
+                           for row in self.values[rows]], self.transfers)
         return Tensor(
             [self.values[i] for i in index] if isinstance(index, list) else self.values[index], self.transfers
         )
@@ -88,3 +89,31 @@ def test_joint_read_deduplicates_on_device_before_transfer(raw):
         ((-4095.0, -1.0, -4095.0),) * 2,
     )
     assert transfers == [(2, 2), (2, 2)]
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("mapping", [
+    (0, 1, 2, 3), (3, 2, 1, 0, 3), (3, 1, 2, 1), (2, 2), (3, 0, 3), (),
+])
+def test_joint_span_preserves_order_duplicates_empty_and_same_tick_mutation(raw, mapping):
+    path = EntityPath("/robot")
+    world = object.__new__(IsaacLabNativeWorld)
+    transfers = []
+    position_values = [[0.25, 1.5, -2.0, 3.75], [4.0, -5.5, 6.25, 7.0]]
+    velocity_values = [[-8.0, 9.0, -10.0, 11.0], [12.0, -13.0, 14.0, -15.0]]
+    positions = Tensor(position_values, transfers)
+    velocities = Tensor(velocity_values, transfers)
+    world._joint_maps = {path: mapping}
+    world._articulations = (
+        {} if raw else {path: NS(data=NS(joint_pos=NS(torch=positions), joint_vel=NS(torch=velocities)))}
+    )
+    world._usd_articulation_views = (
+        {path: NS(get_dof_positions=lambda: positions, get_dof_velocities=lambda: velocities)} if raw else {}
+    )
+    def expected(values):
+        return tuple(tuple(row[index] for index in mapping) for row in values)
+    assert world.read_articulation(path) == (expected(position_values), expected(velocity_values))
+    assert transfers == [(2, len(set(mapping)))] * 2
+    position_values[0][3] = 100.25
+    velocity_values[1][0] = -100.5
+    assert world.read_articulation(path) == (expected(position_values), expected(velocity_values))

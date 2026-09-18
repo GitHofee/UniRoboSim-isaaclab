@@ -262,6 +262,9 @@ Enabled, unbreakable, unlimited `PhysicsSphericalJoint` constraints excluded fro
 
 Joint state readback gathers only the deduplicated declared physical axes on the
 device, transfers the subset once per field, then restores declared order.
+Contiguous physical-axis sets use a device slice instead of an advanced-index
+gather, including reordered and repeated public axes; sparse sets still transfer
+only their requested unique axes. No dynamic state is cached.
 Selected link reads likewise gather only the requested bodies, preserving duplicate
 requests and environment origins. One-body and full natural-order reads use device
 views directly. The cached name-to-index layout is tied to the asset identity and

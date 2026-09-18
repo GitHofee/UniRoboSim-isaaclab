@@ -3909,11 +3909,18 @@ class IsaacLabNativeWorld:
             asset = self._articulations[path]
             positions = asset.data.joint_pos.torch
             velocities = asset.data.joint_vel.torch
-        # Gather on-device before download. Sparse public joint groups must not
-        # pay for every physical DOF; duplicate/reordered mappings remain exact.
-        position_rows = positions[:, list(unique)].detach().cpu().tolist()
-        velocity_rows = velocities[:, list(unique)].detach().cpu().tolist()
-        offsets = {index: offset for offset, index in enumerate(unique)}
+        # A contiguous physical span needs no advanced-index kernel, even if
+        # public axes are reordered or repeated. Preserve sparse transfer volume
+        # by gathering only when the unique axes leave holes in that span.
+        if unique and max(unique) - min(unique) + 1 == len(unique):
+            first = min(unique)
+            selection = slice(first, first + len(unique))
+            offsets = {index: index - first for index in unique}
+        else:
+            selection = list(unique)
+            offsets = {index: offset for offset, index in enumerate(unique)}
+        position_rows = positions[:, selection].detach().cpu().tolist()
+        velocity_rows = velocities[:, selection].detach().cpu().tolist()
         return (
             tuple(tuple(float(row[offsets[index]]) for index in joint_map) for row in position_rows),
             tuple(tuple(float(row[offsets[index]]) for index in joint_map) for row in velocity_rows),
