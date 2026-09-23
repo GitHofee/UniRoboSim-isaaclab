@@ -958,8 +958,8 @@ def test_worker_startup_progress_cannot_extend_hard_limit(monkeypatch: pytest.Mo
         return connection, process
 
     monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock)
-    with pytest.warns(RuntimeWarning, match="30s hard limit"):
-        with pytest.raises(NativeWorkerError, match="30s hard limit"):
+    with pytest.warns(RuntimeWarning, match="hard limit 30s"):
+        with pytest.raises(NativeWorkerError, match="hard limit 30s"):
             IsaacLabWorkerRuntime(
                 IsaacLabAdapterConfig(
                     worker_startup_hard_timeout_s=30,

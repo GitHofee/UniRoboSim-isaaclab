@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
+import os
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from unirobosim import (
 )
 
 from .config import _ANTI_ALIASING_MODES, IsaacLabAdapterConfig
+from .render_device import renderer_gpu_override
 from .contact_compliance import author_contact_compliance
 from .native_debug import NativeDebugOverlay, NativeDebugPayload
 from .native_protocols import (
@@ -955,12 +957,15 @@ def _camera_render_mode(config: IsaacLabAdapterConfig) -> str:
 def _camera_launcher_settings(config: IsaacLabAdapterConfig) -> tuple[str, ...]:
     """Return pre-launch RTX settings for the requested texture residency profile."""
 
+    render_gpu = renderer_gpu_override(os.environ, config.device)
     texture_streaming = "true" if config.texture_streaming else "false"
     settings = [
         "--/renderer/multiGpu/enabled=false",
         "--/rtx-transient/dlssg/enabled=false",
         f"--/rtx-transient/resourcemanager/enableTextureStreaming={texture_streaming}",
     ]
+    if render_gpu is not None:
+        settings.append(f"--/renderer/activeGpu={render_gpu}")
     if _camera_render_mode(config) == _DEFAULT_CAMERA_RENDERER:
         # Isaac Sim 6 disables the legacy RTX Real-Time implementation at Kit
         # startup.  Selecting RaytracedLighting through SimulationApp happens
@@ -999,6 +1004,9 @@ class IsaacLabNativeRuntime:
         process_isolated: bool = False,
         startup_progress: Callable[[str], None] | None = None,
     ) -> None:
+        startup_log = os.environ.get("UNIROBOSIM_ISAACLAB_STARTUP_LOG")
+        if startup_log:
+            _ensure_launcher_setting(f"--/log/file={startup_log}")
         if config.enable_cameras:
             # The installed RTX 5090 profile is stable with one renderer device and no frame generation.
             for setting in _camera_launcher_settings(config):
@@ -1011,6 +1019,9 @@ class IsaacLabNativeRuntime:
             startup_progress("kit_launching")
         self._launcher = AppLauncher(**_launcher_kwargs(config, process_isolated=process_isolated))
         self._app = self._launcher.app
+        if config.enable_cameras:
+            import carb
+            print("[FastSim RTX device]", {"cuda_visible": os.environ.get("CUDA_VISIBLE_DEVICES"), "physics_device": config.device, "renderer_active_gpu": carb.settings.get_settings().get("/renderer/activeGpu")}, flush=True)
         if startup_progress is not None:
             startup_progress("kit_ready")
             startup_progress("runtime_importing")
@@ -1219,6 +1230,7 @@ class IsaacLabNativeWorld:
         self._physics_activation: PhysicsActivationController | None = None
         self._physics_activation_live_state = False
         self._mounted_cameras: dict[EntityPath, _MountedCamera] = {}
+        self._render_transform_publishers: dict[tuple[str, EntityPath], Any] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
         self._deformables: dict[EntityPath, Any] = {}
@@ -3140,6 +3152,45 @@ class IsaacLabNativeWorld:
         self._sync_all_mounted_cameras()
         self._invalidate_render()
 
+    def configure_render_quality(
+        self, *, enable_global_illumination: bool, enable_ambient_occlusion: bool,
+    ) -> tuple[bool, bool]:
+        if self._closed or self._sim is None:
+            raise RuntimeError("render quality requires an open world")
+        if type(enable_global_illumination) is not bool or type(enable_ambient_occlusion) is not bool:
+            raise TypeError("render quality flags must be booleans")
+        import carb
+
+        settings = carb.settings.get_settings()
+        keys = ("/rtx/indirectDiffuse/enabled", "/rtx/ambientOcclusion/enabled")
+        previous = tuple(settings.get(key) for key in keys)
+        requested = (enable_global_illumination, enable_ambient_occlusion)
+        try:
+            for key, value in zip(keys, requested, strict=True):
+                settings.set_bool(key, value)
+            effective = tuple(settings.get(key) for key in keys)
+            if any(type(value) is not bool for value in effective) or effective != requested:
+                raise RuntimeError("renderer quality readback differs from requested settings")
+        except BaseException:
+            for key, value in zip(keys, previous, strict=True):
+                settings.set(key, value)
+            raise
+        if getattr(self, "_render_quality_baseline", None) is None:
+            self._render_quality_baseline = previous
+        self._invalidate_render()
+        return effective
+
+    def _restore_render_quality(self) -> None:
+        baseline = getattr(self, "_render_quality_baseline", None)
+        if baseline is None:
+            return
+        import carb
+
+        settings = carb.settings.get_settings()
+        for key, value in zip(("/rtx/indirectDiffuse/enabled", "/rtx/ambientOcclusion/enabled"), baseline, strict=True):
+            settings.set(key, value)
+        self._render_quality_baseline = None
+
     def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
         """Apply one fully prevalidated frame without calling the physics step API."""
 
@@ -3587,8 +3638,49 @@ class IsaacLabNativeWorld:
                 fluid_set.points.GetVelocitiesAttr().Set(velocity_value)
         self._sim.forward()
         self._update_assets(0.0)
+        # Tensor writes need an explicit render publication: PhysX Fabric can
+        # retain prior body transforms when no physics tick has advanced.
+        self._publish_render_body_transforms(
+            tuple(path for kind, path, *_ in articulation_stages if kind != "usd"),
+            tuple(path for kind, path, *_ in rigid_stages if kind != "usd"),
+        )
         self._sync_all_mounted_cameras()
         self._invalidate_render()
+
+    def _publish_render_body_transforms(
+        self, articulation_paths: tuple[EntityPath, ...], rigid_paths: tuple[EntityPath, ...]
+    ) -> None:
+        if not articulation_paths and not rigid_paths:
+            return
+        import warp as wp
+        from isaaclab.sim.views import FrameView
+
+        from .render_transforms import RenderTransformPublisher
+
+        for path in articulation_paths:
+            asset = self._articulations[path]
+            paths = tuple(str(value) for row in asset.root_view.link_paths for value in row)
+            poses = asset.data.body_link_pose_w.torch.reshape(-1, 7)
+            key = ('articulation', path)
+            publisher = self._render_transform_publishers.get(key)
+            if publisher is None:
+                publisher = RenderTransformPublisher(
+                    paths, device=poses.device, view_factory=FrameView, torch=self._m.torch, warp=wp
+                )
+                self._render_transform_publishers[key] = publisher
+            publisher.publish(poses)
+        for path in rigid_paths:
+            asset = self._rigids[path]
+            paths = tuple(str(value) for value in asset.root_view.prim_paths)
+            poses = asset.data.root_link_pose_w.torch.reshape(-1, 7)
+            key = ('rigid', path)
+            publisher = self._render_transform_publishers.get(key)
+            if publisher is None:
+                publisher = RenderTransformPublisher(
+                    paths, device=poses.device, view_factory=FrameView, torch=self._m.torch, warp=wp
+                )
+                self._render_transform_publishers[key] = publisher
+            publisher.publish(poses)
 
     def apply_articulation(
         self,
@@ -4700,6 +4792,16 @@ class IsaacLabNativeWorld:
             raise KeyError(f"entity {path.value!r} does not exist")
         if not 0 <= environment_index < self._spec.environments.count:
             raise IndexError("entity Prim environment index is out of range")
+        mounted_camera = self._mounted_cameras.get(path) if entity.kind is EntityKind.CAMERA_SENSOR else None
+        if mounted_camera is not None:
+            # Camera authoring nests the prim below the resolved articulation body.
+            # Entity state reads, writes, and reset must use that same physical path.
+            result = (
+                f"/World/env_{environment_index}/{_native_name(mounted_camera.parent_path)}"
+                f"{mounted_camera.body_suffix}/{_native_name(path)}"
+            )
+            self._entity_prim_path_cache[key] = result
+            return result
         binding = entity.embedded_binding
         if binding is None:
             result = f"/World/env_{environment_index}/{_native_name(path)}"
@@ -5657,6 +5759,7 @@ class IsaacLabNativeWorld:
     def _close(self, *, notify_runtime: bool) -> None:
         if self._closed:
             return
+        self._restore_render_quality()
         self._closed = True
         sim = self._sim
         self._sim = None
@@ -5685,6 +5788,7 @@ class IsaacLabNativeWorld:
         self._physics_activation = None
         self._physics_activation_live_state = False
         self._mounted_cameras.clear()
+        self._render_transform_publishers.clear()
         self._usd_tensor_view = None
         self._contacts.clear()
         self._deformables.clear()

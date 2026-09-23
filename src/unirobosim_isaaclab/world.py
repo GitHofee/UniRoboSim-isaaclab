@@ -16,6 +16,7 @@ from unirobosim import (
     ARTICULATION_POSITION_AXIS_UNITS_UNSUPPORTED,
     PHYSICAL_WORLD_SCHEMA_VERSION,
     RENDER_STATE_CAPABILITY_ID,
+    RENDER_QUALITY_CAPABILITY_ID,
     ArrayValue,
     ArticulationCommand,
     ArticulationState,
@@ -480,6 +481,24 @@ class IsaacLabWorld:
                 raise ValidationError("checkpoint attachment state is invalid", operation=operation)
             restored[key] = (child, child_link)
         return restored
+
+    def configure_render_quality(
+        self, *, enable_global_illumination: bool, enable_ambient_occlusion: bool,
+    ) -> tuple[bool, bool]:
+        operation = "world.configure_render_quality"
+        self._ensure_ready(operation)
+        if type(enable_global_illumination) is not bool or type(enable_ambient_occlusion) is not bool:
+            raise ValidationError("render quality flags must be booleans", operation=operation)
+        if self._descriptor.capabilities.get(RENDER_QUALITY_CAPABILITY_ID) is None:
+            raise UnsupportedCapabilityError("render quality is unavailable", operation=operation)
+        result = self._native_call(operation, lambda: self._native.configure_render_quality(
+            enable_global_illumination=enable_global_illumination,
+            enable_ambient_occlusion=enable_ambient_occlusion,
+        ))
+        expected = (enable_global_illumination, enable_ambient_occlusion)
+        if type(result) is not tuple or any(type(value) is not bool for value in result) or result != expected:
+            raise RuntimeError("renderer did not apply the requested quality settings")
+        return result
 
     def apply_render_state(self, frame: RenderStateFrame) -> RenderStateResult:
         """Atomically apply a render frame while preserving the native physics tick."""

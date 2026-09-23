@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import warnings
@@ -25,6 +26,7 @@ from unirobosim import CommandMode, DebugBatch, EntityPath, KinematicTarget, Poi
 
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
+from .startup_activity import KitStartupActivity
 from .native_protocols import (
     Matrix,
     NativeArticulationCommand,
@@ -256,6 +258,7 @@ class _SubprocessHandle:
 
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
+        self.startup_activity: KitStartupActivity | None = None
 
     @property
     def pid(self) -> int:
@@ -293,6 +296,9 @@ def _planning_error_reply(exc: BaseException) -> Reply:
     """Return the only failure envelope allowed across the planning IPC seam."""
 
     code = exc.code if isinstance(exc, NativePlanningError) else "native_failure"
+    # Persist the original stack locally before the deliberately bounded IPC envelope.
+    print("[FastSim native planning failure]", type(exc).__name__, code, flush=True)
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
     try:
         exc.__traceback__ = None
         exc.__cause__ = None
@@ -402,6 +408,10 @@ def _dispatch(
     if operation == "restore_checkpoint":
         active.restore_checkpoint(cast(dict[str, object], args[0]))
         return active, None, False
+    if operation == "configure_render_quality":
+        return active, active.configure_render_quality(
+            enable_global_illumination=args[0], enable_ambient_occlusion=args[1],
+        ), False
     if operation == "apply_render_state":
         active.apply_render_state(cast(NativeRenderStateFrame, args[0]))
         return active, None, False
@@ -675,14 +685,20 @@ def _spawn_worker(config: IsaacLabAdapterConfig) -> tuple[Connection, _ProcessHa
         descriptor = child.fileno()
         process: _SubprocessHandle | None = None
         try:
+            environment = _worker_environment()
+            descriptor_log, path_log = tempfile.mkstemp(prefix="unirobosim-kit-", suffix=".log")
+            os.close(descriptor_log)
+            activity = KitStartupActivity(Path(path_log))
+            environment["UNIROBOSIM_ISAACLAB_STARTUP_LOG"] = path_log
             bootstrap_process = subprocess.Popen(
                 _worker_command(descriptor),
                 close_fds=True,
-                env=_worker_environment(),
+                env=environment,
                 pass_fds=(descriptor,),
                 start_new_session=True,
             )
             process = _SubprocessHandle(bootstrap_process)
+            process.startup_activity = activity
             child.close()
             parent.send(config)
             return parent, process
@@ -779,6 +795,7 @@ class IsaacLabWorkerRuntime:
         worker_factory: WorkerFactory = _spawn_worker,
     ) -> None:
         self._closed = False
+        self._rpc_failed = False
         self._active_world: IsaacLabWorkerWorld | None = None
         self._rgb_transport: shared_memory.SharedMemory | None = None
         for attempt in range(1, _STARTUP_ATTEMPTS + 1):
@@ -809,6 +826,8 @@ class IsaacLabWorkerRuntime:
         hard_deadline = started + hard_limit
         phase = "process_spawned"
         next_phase_index = 0
+        last_activity = started
+        activity = getattr(self._process, "startup_activity", None)
         while True:
             now = time.monotonic()
             idle_limit = (
@@ -816,16 +835,24 @@ class IsaacLabWorkerRuntime:
                 if phase == "kit_launching"
                 else _STARTUP_PHASE_IDLE_TIMEOUT_SECONDS[phase]
             )
-            timeout = min(idle_limit, max(0.0, hard_deadline - now))
+            if phase == "kit_launching" and activity is not None and activity.poll():
+                last_activity = now
+            timeout = min(idle_limit - (now - last_activity), max(0.0, hard_deadline - now))
             if timeout <= 0.0:
-                raise _NativeWorkerTimeout(f"stalled in startup phase {phase!r} at the {hard_limit:g}s hard limit")
+                limit_kind = "hard" if now >= hard_deadline else "idle"
+                raise _NativeWorkerTimeout(
+                    f"stalled in startup phase {phase!r} after {now - started:.3f}s "
+                    f"({limit_kind} limit, phase idle limit {idle_limit:g}s, hard limit {hard_limit:g}s)"
+                )
             try:
                 value = self._receive(
                     "worker startup",
-                    timeout_seconds=timeout,
+                    timeout_seconds=min(timeout, 0.5) if phase == "kit_launching" and activity is not None else timeout,
                     allow_startup_progress=True,
                 )
             except _NativeWorkerTimeout as exc:
+                if phase == "kit_launching" and activity is not None:
+                    continue  # Re-evaluate both deadlines and only this worker's new log activity.
                 elapsed = time.monotonic() - started
                 limit_kind = "hard" if elapsed >= hard_limit else "idle"
                 raise _NativeWorkerTimeout(
@@ -841,6 +868,7 @@ class IsaacLabWorkerRuntime:
                         f"expected {expected_phase!r}, got {value.phase!r}"
                     )
                 phase = value.phase
+                last_activity = time.monotonic()
                 next_phase_index += 1
                 continue
             if next_phase_index != len(_STARTUP_PHASES):
@@ -959,18 +987,39 @@ class IsaacLabWorkerRuntime:
             previous_end = end
         return tuple(result)
 
+    @property
+    def terminated(self) -> bool:
+        """Local child liveness for retiring an already-dead pooled worker."""
+        return not self._process.is_alive()
+
+    @property
+    def reusable(self) -> bool:
+        """Whether an idle worker can serve a fresh, isolated Session."""
+        return (
+            not self._closed
+            and not self._rpc_failed
+            and self._active_world is None
+            and self._process.is_alive()
+        )
+
     def _request(self, operation: str, *args: Any) -> Any:
-        if self._closed:
-            raise NativeWorkerError(f"native worker is closed during {operation}")
-        if not self._process.is_alive():
-            raise NativeWorkerError(f"native worker exited before {operation}; exitcode={self._process.exitcode}")
         try:
-            self._connection.send((operation, args))
-        except (BrokenPipeError, EOFError, OSError) as exc:
-            raise NativeWorkerError(
-                f"failed to contact native worker during {operation}; exitcode={self._process.exitcode}"
-            ) from exc
-        return self._receive(operation)
+            if self._closed:
+                raise NativeWorkerError(f"native worker is closed during {operation}")
+            if not self._process.is_alive():
+                raise NativeWorkerError(f"native worker exited before {operation}; exitcode={self._process.exitcode}")
+            try:
+                self._connection.send((operation, args))
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                raise NativeWorkerError(
+                    f"failed to contact native worker during {operation}; exitcode={self._process.exitcode}"
+                ) from exc
+            return self._receive(operation)
+        except BaseException:
+            # A timeout can leave a late response in the IPC channel. Never lend
+            # this worker to a different Run after any failed RPC.
+            self._rpc_failed = True
+            raise
 
     def build_world(self, spec: WorldSpec) -> IsaacLabWorkerWorld:
         if self._active_world is not None and not self._active_world.closed:
@@ -1078,6 +1127,14 @@ class IsaacLabWorkerWorld:
     def restore_checkpoint(self, state: dict[str, object]) -> None:
         self._ensure_open("restore_checkpoint")
         self._runtime._request("restore_checkpoint", state)
+
+    def configure_render_quality(
+        self, *, enable_global_illumination: bool, enable_ambient_occlusion: bool,
+    ) -> tuple[bool, bool]:
+        self._ensure_open("configure_render_quality")
+        return cast(tuple[bool, bool], self._runtime._request(
+            "configure_render_quality", enable_global_illumination, enable_ambient_occlusion,
+        ))
 
     def apply_render_state(self, frame: NativeRenderStateFrame) -> None:
         self._ensure_open("apply_render_state")

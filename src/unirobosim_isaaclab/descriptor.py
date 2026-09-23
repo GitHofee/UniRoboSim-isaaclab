@@ -5,6 +5,7 @@ from unirobosim import (
     COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
     RENDER_STATE_CAPABILITY_ID,
+    RENDER_QUALITY_CAPABILITY_ID,
     WORLD_SCHEMA_VERSION,
     CapabilityDeclaration,
     CapabilityId,
@@ -221,6 +222,7 @@ CAPABILITIES = CapabilitySet(
             ),
         ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
+        CapabilityDeclaration(RENDER_QUALITY_CAPABILITY_ID),
         CapabilityDeclaration(
             RENDER_STATE_CAPABILITY_ID,
             FrozenMap(

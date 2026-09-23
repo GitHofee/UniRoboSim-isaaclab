@@ -835,7 +835,12 @@ class _PlanningAdmission:
         return cached
 
     def _entity_root(self, spec: Any, environment_index: int) -> Any:
-        root = self._stage.GetPrimAtPath(f"/World/env_{environment_index}/{_native_name(spec.path)}")
+        path = (
+            self._world._entity_prim_path(spec.path, environment_index)
+            if spec.kind is EntityKind.CAMERA_SENSOR
+            else f"/World/env_{environment_index}/{_native_name(spec.path)}"
+        )
+        root = self._stage.GetPrimAtPath(path)
         if not root.IsValid():
             raise NativePlanningError("catalog_invalid")
         return root

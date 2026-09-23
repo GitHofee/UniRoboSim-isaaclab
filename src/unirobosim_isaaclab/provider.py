@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import logging
 import os
 import stat
 from collections.abc import Callable, Iterable
@@ -53,8 +54,11 @@ def _scrub_exception(error: BaseException) -> None:
 
 
 def _default_runtime_factory(config: IsaacLabAdapterConfig) -> NativeRuntime:
+    from .runtime_pool import PROCESS_RUNTIME_POOL, REUSE_WORKER_ENV
     from .worker import IsaacLabWorkerRuntime
 
+    if os.environ.get(REUSE_WORKER_ENV) == "1":
+        return PROCESS_RUNTIME_POOL.acquire(config, IsaacLabWorkerRuntime)
     return IsaacLabWorkerRuntime(config)
 
 
@@ -303,15 +307,18 @@ class IsaacLabSession:
         try:
             native_world = self._native.build_world(spec)
         except NativePlanningError as caught:
+            logging.getLogger(__name__).exception("Isaac native world build failed before admission wrapping")
             _scrub_exception(caught)
             planning_admission_failed = True
         except UniRoboSimError as caught:
+            logging.getLogger(__name__).exception("Isaac native world build failed before admission wrapping")
             if planning_demanded:
                 _scrub_exception(caught)
                 planning_admission_failed = True
             else:
                 raise
         except Exception as caught:
+            logging.getLogger(__name__).exception("Isaac native world build failed before admission wrapping")
             if planning_demanded:
                 _scrub_exception(caught)
                 planning_admission_failed = True
@@ -368,6 +375,12 @@ class IsaacLabSession:
         try:
             if world is not None:
                 world._close(notify_session=False)
+        except BaseException:
+            from .runtime_pool import RuntimeLease
+
+            if isinstance(self._native, RuntimeLease):
+                self._native.invalidate()
+            raise
         finally:
             try:
                 self._native.close()

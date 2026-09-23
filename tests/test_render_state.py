@@ -257,6 +257,7 @@ def _native_world() -> tuple[IsaacLabNativeWorld, _Simulation, _Articulation, _R
         )
     }
     world._update_assets = lambda dt: events.append(f"update:{dt}")
+    world._publish_render_body_transforms = lambda *_: events.append("publish")
     world._sync_all_mounted_cameras = lambda: events.append("sync")
     world._render_revision = 4
     world._rendered_revision = 4
@@ -303,7 +304,7 @@ def _assert_native_render_state_batches_writes_and_syncs_once_without_physics() 
     assert simulation.forward_count == 1
     assert simulation.step_count == 0
     assert world._step_index == 9
-    assert events == ["update:0.0", "sync"]
+    assert events == ["update:0.0", "publish", "sync"]
     assert world._render_revision == 5
     assert articulation.writes["positions"].tolist() == [[1.0, -1.0]]
     assert articulation.writes["velocities"].tolist()[0] == pytest.approx([0.2, -0.2])

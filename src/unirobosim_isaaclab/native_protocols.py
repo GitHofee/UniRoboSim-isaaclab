@@ -253,6 +253,10 @@ class NativeWorldDriver(Protocol):
 
     def restore_checkpoint(self, state: dict[str, object]) -> None: ...
 
+    def configure_render_quality(
+        self, *, enable_global_illumination: bool, enable_ambient_occlusion: bool,
+    ) -> tuple[bool, bool]: ...
+
     def apply_render_state(self, frame: NativeRenderStateFrame) -> None: ...
 
     def apply_articulation(
