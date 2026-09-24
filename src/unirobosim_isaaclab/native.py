@@ -1233,7 +1233,7 @@ class IsaacLabNativeWorld:
         self._physics_activation: PhysicsActivationController | None = None
         self._physics_activation_live_state = False
         self._mounted_cameras: dict[EntityPath, _MountedCamera] = {}
-        self._render_transform_publishers: dict[tuple[str, EntityPath], Any] = {}
+        self._render_transform_publishers: dict[tuple[str, ...], Any] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
         self._deformables: dict[EntityPath, Any] = {}
@@ -3768,30 +3768,31 @@ class IsaacLabNativeWorld:
 
         from .render_transforms import RenderTransformPublisher
 
+        paths = []
+        pose_batches = []
         for path in articulation_paths:
             asset = self._articulations[path]
-            paths = tuple(str(value) for row in asset.root_view.link_paths for value in row)
-            poses = asset.data.body_link_pose_w.torch.reshape(-1, 7)
-            key = ('articulation', path)
-            publisher = self._render_transform_publishers.get(key)
-            if publisher is None:
-                publisher = RenderTransformPublisher(
-                    paths, device=poses.device, view_factory=FrameView, torch=self._m.torch, warp=wp
-                )
-                self._render_transform_publishers[key] = publisher
-            publisher.publish(poses)
+            paths.extend(str(value) for row in asset.root_view.link_paths for value in row)
+            pose_batches.append(asset.data.body_link_pose_w.torch.reshape(-1, 7))
         for path in rigid_paths:
             asset = self._rigids[path]
-            paths = tuple(str(value) for value in asset.root_view.prim_paths)
-            poses = asset.data.root_link_pose_w.torch.reshape(-1, 7)
-            key = ('rigid', path)
-            publisher = self._render_transform_publishers.get(key)
-            if publisher is None:
-                publisher = RenderTransformPublisher(
-                    paths, device=poses.device, view_factory=FrameView, torch=self._m.torch, warp=wp
-                )
-                self._render_transform_publishers[key] = publisher
-            publisher.publish(poses)
+            paths.extend(str(value) for value in asset.root_view.prim_paths)
+            pose_batches.append(asset.data.root_link_pose_w.torch.reshape(-1, 7))
+        # A FrameView write synchronizes and updates the global Fabric hierarchy.
+        # Share each path-depth group across entities, preserving parent-before-
+        # child order while avoiding the same global update once per entity.
+        layout = tuple(paths)
+        cached = self._render_transform_publishers.get(("frame",))
+        if cached is None or cached[0] != layout:
+            publisher = RenderTransformPublisher(
+                layout, device=pose_batches[0].device, view_factory=FrameView, torch=self._m.torch, warp=wp
+            )
+            self._render_transform_publishers.clear()
+            self._render_transform_publishers[("frame",)] = (layout, publisher)
+        else:
+            publisher = cached[1]
+        poses = pose_batches[0] if len(pose_batches) == 1 else self._m.torch.cat(pose_batches, dim=0)
+        publisher.publish(poses)
 
     def apply_articulation(
         self,
