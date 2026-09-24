@@ -410,6 +410,15 @@ DEBUG_RENDER_CAPABILITIES = (
 
 CAMERA_CAPABILITIES = (
     CapabilityDeclaration(
+        CapabilityId("sensor.camera.calibrated@1"),
+        FrozenMap({"projection_models": ["opencv_pinhole"], "distortion_models": ["rational8"], "precision": "usd-float32"}),
+    ),
+    CapabilityDeclaration(
+        CapabilityId("sensor.camera.render-exclusions@1"),
+        FrozenMap({"selection": "exact-mesh", "implementation": "rtx-scene-partitions", "collision": "unchanged"}),
+        limitations=("external cameras created after world initialization require an explicit partition",),
+    ),
+    CapabilityDeclaration(
         CapabilityId("sensor.camera@1"),
         FrozenMap(
             {

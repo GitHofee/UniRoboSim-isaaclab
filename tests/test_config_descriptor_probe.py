@@ -35,7 +35,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.22"
+    assert unirobosim_isaaclab.__version__ == "0.10.23"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -578,8 +578,10 @@ def test_launcher_disables_process_terminating_fast_shutdown() -> None:
         "fast_shutdown": False,
         "anti_aliasing": 2,
         "renderer": "RaytracedLighting",
+        "kit_args": "--enable omni.usd.schema.omni_lens_distortion",
     }
 
+    assert "kit_args" not in _launcher_kwargs(IsaacLabAdapterConfig(enable_cameras=False))
     isosurface = IsaacLabAdapterConfig(enable_cameras=True, fluid_render_mode="isosurface")
     assert _launcher_kwargs(isosurface)["renderer"] == "RealTimePathTracing"
 

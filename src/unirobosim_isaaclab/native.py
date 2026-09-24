@@ -933,6 +933,9 @@ def _launcher_kwargs(config: IsaacLabAdapterConfig, *, process_isolated: bool = 
         launcher_args["visualizer"] = ["kit"]
         launcher_args["visualizer_explicit"] = True
     if config.enable_cameras:
+        # Register the RTX lens schema before Kit creates any USD schema registry.
+        # Late extension enablement cannot refresh an already cached registry.
+        launcher_args["kit_args"] = "--enable omni.usd.schema.omni_lens_distortion"
         launcher_args["anti_aliasing"] = _ANTI_ALIASING_MODES[config.anti_aliasing]
         # Isaac Sim 6 defaults SimulationApp to RealTimePathTracing.  That path
         # depends on the NGX/DLSS Ray Reconstruction denoiser and degrades to a
@@ -1507,6 +1510,7 @@ class IsaacLabNativeWorld:
         for entity in self._spec.entities:
             if entity.kind is EntityKind.CAMERA_SENSOR:
                 self._author_camera(entity)
+        self._configure_camera_render_exclusions()
         self._apply_runtime_physics_profile()
         self._initialize_physics_activation()
         self._sim.reset()
@@ -2534,6 +2538,34 @@ class IsaacLabNativeWorld:
             bindingStrength=self._m.UsdShade.Tokens.strongerThanDescendants,
         )
 
+    def _configure_camera_render_exclusions(self) -> None:
+        from .camera_visibility import configure_camera_exclusions
+
+        cameras = tuple(entity for entity in self._spec.entities if entity.camera is not None)
+        if not any(entity.camera.render_exclusions for entity in cameras):
+            return
+        known_entities = {entity.path for entity in self._spec.entities}
+        selections = {}
+        for entity in cameras:
+            for environment in range(self._spec.environments.count):
+                camera_path = self._cameras[entity.path].cfg.prim_path.replace(
+                    "/env_.*/", f"/env_{environment}/"
+                )
+                excluded = []
+                for selection in entity.camera.render_exclusions:
+                    if selection.entity_path not in known_entities:
+                        raise ValueError("camera exclusion refers to an unknown entity")
+                    excluded.append(
+                        f"/World/env_{environment}/{_native_name(selection.entity_path)}/"
+                        f"{selection.relative_prim_path}"
+                    )
+                selections[camera_path] = tuple(excluded)
+        self._camera_visual_references = configure_camera_exclusions(
+            self._m.sim_utils.get_current_stage(), selections,
+            usd=self._m.Usd, usd_geom=self._m.UsdGeom, sdf=self._m.Sdf,
+            settings=self._m.carb.settings.get_settings(),
+        )
+
     def _author_camera(self, entity: EntitySpec) -> None:
         assert entity.camera is not None
         if not self._config.enable_cameras or not self._config.render:
@@ -2591,6 +2623,19 @@ class IsaacLabNativeWorld:
             ),
         )
         self._cameras[entity.path] = self._m.Camera(cfg)
+        if camera.calibration is not None:
+            from .camera_optics import author_opencv_pinhole
+
+            stage = self._m.sim_utils.get_current_stage()
+            for environment in range(self._spec.environments.count):
+                concrete_path = prim_path.replace("/env_.*/", f"/env_{environment}/")
+                author_opencv_pinhole(
+                    stage.GetPrimAtPath(concrete_path),
+                    camera.calibration,
+                    camera.width_px,
+                    camera.height_px,
+                    gf=self._m.Gf,
+                )
 
     def _mounted_parent_pose(self, binding: _MountedCamera) -> tuple[Any, Any]:
         if binding.parent_path in self._articulations:
@@ -5607,9 +5652,15 @@ class IsaacLabNativeWorld:
             raise RuntimeError("native camera calibration requires exactly one USD camera prim")
         sensor_prim = sensor_prims[0]
         clipping = sensor_prim.GetClippingRangeAttr().Get()
+        from .camera_optics import read_opencv_pinhole
+
+        optics = read_opencv_pinhole(sensor_prim.GetPrim())
         return NativeCameraCalibration(
             resolution_px=(width, height),
-            intrinsic_matrix=tuple(float(value) for value in matrices[0].reshape(-1).tolist()),
+            intrinsic_matrix=(
+                optics[0] if optics is not None
+                else tuple(float(value) for value in matrices[0].reshape(-1).tolist())
+            ),
             projection=str(sensor_prim.GetProjectionAttr().Get()),
             focal_length=float(sensor_prim.GetFocalLengthAttr().Get()),
             horizontal_aperture=float(sensor_prim.GetHorizontalApertureAttr().Get()),
@@ -5619,6 +5670,9 @@ class IsaacLabNativeWorld:
                 tuple[float, float, float, float],
                 tuple(float(value) for value in orientations[0].tolist()),
             ),
+            projection_model="opencv_pinhole" if optics is not None else "pinhole",
+            distortion_model="rational8" if optics is not None else "none",
+            distortion_coefficients=optics[1] if optics is not None else (),
         )
 
     def publish_debug(self, batch: DebugBatch) -> NativeDebugReport:

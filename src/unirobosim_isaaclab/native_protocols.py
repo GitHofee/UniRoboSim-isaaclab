@@ -84,6 +84,9 @@ class NativeCameraCalibration:
     clipping_range_m: tuple[float, float]
     position_m: Vector3
     orientation_opengl_xyzw: Quaternion
+    projection_model: str = "pinhole"
+    distortion_model: str = "none"
+    distortion_coefficients: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
