@@ -264,3 +264,29 @@ def test_native_batch_validates_every_path_before_rendering() -> None:
     assert simulation.render_count == 0
     assert cameras[0].update_count == 0
     assert counters == {"to": 0, "cpu": 0, "stack": 0, "empty": 0, "copy": 0, "sync": 0}
+
+
+def test_grouped_reads_use_owned_pixels_without_refreshing_recycled_camera_storage() -> None:
+    entities = (_rgb_camera("/left"), _rgb_camera("/right"))
+    world, simulation, counters, cameras = _native_camera_world(
+        entities,
+        lambda index, entity: bytes((99,)) * 12,
+    )
+    world._camera_exclusion_groups = {"/left": ("/left_mesh",), "/right": ("/right_mesh",)}
+    world._rendered_revision = world._render_revision
+    world._camera_group_outputs = {
+        id(camera): {"rgb": _Tensor((1, 2, 2, 3), bytes((index + 1,)) * 12, counters)}
+        for index, camera in enumerate(cameras)
+    }
+    for camera in cameras:
+        camera.update = lambda *args, **kwargs: pytest.fail("grouped read refreshed an annotator")
+    assert world.read_sensor(entities[0].path)[0][2] == bytes((1,)) * 12
+    batch = world.read_sensors(tuple(entity.path for entity in entities))
+    assert tuple(sample[0][2] for sample in batch) == (bytes((1,)) * 12, bytes((2,)) * 12)
+    assert simulation.render_count == 0
+    # Every modality shares this lookup; missing snapshots fail closed.
+    depth = object()
+    world._camera_group_outputs[id(cameras[0])]["distance_to_image_plane"] = depth
+    assert world._camera_channel_output(cameras[0], "distance_to_image_plane") is depth
+    with pytest.raises(RuntimeError, match="snapshot"):
+        world._camera_channel_output(cameras[0], "normals")

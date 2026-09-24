@@ -38,7 +38,6 @@ from unirobosim import (
 )
 
 from .config import _ANTI_ALIASING_MODES, IsaacLabAdapterConfig
-from .render_device import renderer_gpu_override
 from .contact_compliance import author_contact_compliance
 from .native_debug import NativeDebugOverlay, NativeDebugPayload
 from .native_protocols import (
@@ -65,6 +64,7 @@ from .physics_activation import (
     PhysicsActivationController,
     build_physics_activation_controller,
 )
+from .render_device import renderer_gpu_override
 
 Vector3 = tuple[float, float, float]
 Segment = tuple[Vector3, Vector3]
@@ -2539,31 +2539,91 @@ class IsaacLabNativeWorld:
         )
 
     def _configure_camera_render_exclusions(self) -> None:
-        from .camera_visibility import configure_camera_exclusions
-
         cameras = tuple(entity for entity in self._spec.entities if entity.camera is not None)
+        self._camera_exclusion_groups = {}
         if not any(entity.camera.render_exclusions for entity in cameras):
             return
+        if len(cameras) > 128:
+            raise ValueError("camera exclusion supports at most 128 managed cameras")
+        stage = self._m.sim_utils.get_current_stage()
         known_entities = {entity.path for entity in self._spec.entities}
-        selections = {}
         for entity in cameras:
+            excluded = []
             for environment in range(self._spec.environments.count):
-                camera_path = self._cameras[entity.path].cfg.prim_path.replace(
-                    "/env_.*/", f"/env_{environment}/"
-                )
-                excluded = []
                 for selection in entity.camera.render_exclusions:
                     if selection.entity_path not in known_entities:
                         raise ValueError("camera exclusion refers to an unknown entity")
-                    excluded.append(
-                        f"/World/env_{environment}/{_native_name(selection.entity_path)}/"
-                        f"{selection.relative_prim_path}"
-                    )
-                selections[camera_path] = tuple(excluded)
-        self._camera_visual_references = configure_camera_exclusions(
-            self._m.sim_utils.get_current_stage(), selections,
-            usd=self._m.Usd, usd_geom=self._m.UsdGeom, sdf=self._m.Sdf,
-            settings=self._m.carb.settings.get_settings(),
+                    path = (f"/World/env_{environment}/{_native_name(selection.entity_path)}/"
+                            f"{selection.relative_prim_path}")
+                    prim = stage.GetPrimAtPath(path)
+                    if not prim or not prim.IsA(self._m.UsdGeom.Mesh):
+                        raise ValueError(f"camera exclusion requires an exact Mesh: {path}")
+                    if any(child.IsA(self._m.UsdGeom.Mesh) for child in self._m.Usd.PrimRange(prim)
+                           if child != prim):
+                        raise ValueError("camera exclusion cannot hide nested meshes")
+                    while prim.IsInstanceProxy():
+                        ancestor = prim.GetParent()
+                        while ancestor and not ancestor.IsInstance():
+                            ancestor = ancestor.GetParent()
+                        if not ancestor:
+                            raise RuntimeError("cannot resolve camera exclusion instance proxy")
+                        ancestor.SetInstanceable(False)
+                        prim = stage.GetPrimAtPath(path)
+                    excluded.append(path)
+            self._camera_exclusion_groups[entity.path.value] = tuple(sorted(set(excluded)))
+        self._camera_visibility_meshes = tuple(sorted({
+            path for paths in self._camera_exclusion_groups.values() for path in paths
+        }))
+        if len(self._camera_visibility_meshes) > 256:
+            raise ValueError("camera exclusion supports at most 256 exact meshes")
+        # Keep this layer alive and attached until stage teardown. RTX can retain
+        # native weak references beyond an individual render transaction.
+        self._camera_visibility_layer = self._m.Sdf.Layer.CreateAnonymous("camera-visibility.usda")
+        session = stage.GetSessionLayer()
+        session.subLayerPaths = [self._camera_visibility_layer.identifier, *session.subLayerPaths]
+
+    def _render_camera_exclusion_groups(self) -> None:
+        from omni.kit.viewport.window import get_viewport_window_instances
+        from omni.replicator.core.scripts.utils.viewport_manager import ViewportManager
+
+        from .camera_visibility_transaction import render_camera_groups, temporary_mesh_visibility
+
+        manager = ViewportManager()
+        products = {
+            path.value: [manager._hydra_textures.get(None, product).hydra_texture
+                         for product in camera._render_data.render_product_paths]
+            for path, camera in self._cameras.items()
+        }
+        viewports = [window.viewport_api for window in get_viewport_window_instances()]
+        stage = self._m.sim_utils.get_current_stage()
+
+        self._camera_group_outputs = {}
+
+        def render_active_group() -> None:
+            self._sim.render()
+            # In headless Isaac Lab, camera.update drives the native RTX pump.
+            # Capture while product gates and visibility are still scoped to this
+            # group. Later reads share its cached render-generation stamp.
+            for path, camera in self._cameras.items():
+                if any(product.get_updates_enabled() for product in products[path.value]):
+                    camera.update(0.0, force_recompute=True)
+                    entity = next(entity for entity in self._spec.entities if entity.path == path)
+                    snapshots = {}
+                    for modality in entity.camera.modalities:
+                        name = _camera_native_data_type(modality)
+                        value = camera.data.output[name]
+                        tensor = getattr(value, "torch", value)
+                        # Replicator may recycle annotator storage for the next
+                        # active product. Own the pixels before switching groups.
+                        snapshots[name] = tensor.clone()
+                    self._camera_group_outputs[id(camera)] = snapshots
+
+        render_camera_groups(
+            self._camera_exclusion_groups, products, viewports, render_active_group,
+            lambda hidden: temporary_mesh_visibility(
+                stage, hidden, usd=self._m.Usd, layer=self._camera_visibility_layer,
+                selected=self._camera_visibility_meshes,
+            ),
         )
 
     def _author_camera(self, entity: EntitySpec) -> None:
@@ -2712,6 +2772,9 @@ class IsaacLabNativeWorld:
         self._render_revision = getattr(self, "_render_revision", 0) + 1
 
     def _mark_rendered(self) -> None:
+        if getattr(self, "_camera_exclusion_groups", None):
+            # An ordinary physics render cannot satisfy per-camera exclusions.
+            return
         self._rendered_revision = getattr(self, "_render_revision", 0)
 
     def _ensure_camera_render(self) -> None:
@@ -2723,7 +2786,10 @@ class IsaacLabNativeWorld:
         # Synchronize every mounted camera before that shared render so all
         # camera reads at this simulation revision consume one coherent frame.
         self._sync_all_mounted_cameras()
-        self._sim.render()
+        if getattr(self, "_camera_exclusion_groups", None):
+            self._render_camera_exclusion_groups()
+        else:
+            self._sim.render()
         self._rendered_revision = revision
 
     def _initialize_articulations(self) -> None:
@@ -5403,12 +5469,21 @@ class IsaacLabNativeWorld:
             )
         return tuple(positions), tuple(velocities)
 
+    def _camera_channel_output(self, camera: Any, name: str) -> Any:
+        if getattr(self, "_camera_exclusion_groups", None):
+            outputs = getattr(self, "_camera_group_outputs", {}).get(id(camera))
+            if outputs is None or name not in outputs:
+                raise RuntimeError("camera exclusion snapshot is unavailable at this render revision")
+            return outputs[name]
+        value = camera.data.output[name]
+        return getattr(value, "torch", value)
+
     def _read_camera_channels(self, camera: Any, entity: EntitySpec) -> NativeSensorSample:
         assert entity.camera is not None
         channels = []
         for modality in entity.camera.modalities:
             native_name = _camera_native_data_type(modality)
-            value = camera.data.output[native_name]
+            value = self._camera_channel_output(camera, native_name)
             tensor = getattr(value, "torch", value)
             channel_values: tuple[float | int, ...] | bytes
             if modality is CameraModality.RGB:
@@ -5448,7 +5523,8 @@ class IsaacLabNativeWorld:
         assert entity.camera is not None
         assert self._sim is not None
         self._ensure_camera_render()
-        camera.update(0.0, force_recompute=True)
+        if not getattr(self, "_camera_exclusion_groups", None):
+            camera.update(0.0, force_recompute=True)
         return self._read_camera_channels(camera, entity)
 
     def read_sensors(self, paths: tuple[EntityPath, ...]) -> NativeSensorBatch:
@@ -5472,13 +5548,14 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         self._ensure_camera_render()
         for camera, _ in targets:
-            camera.update(0.0, force_recompute=True)
+            if not getattr(self, "_camera_exclusion_groups", None):
+                camera.update(0.0, force_recompute=True)
 
         if all(
             entity.camera is not None and entity.camera.modalities == (CameraModality.RGB,) for _, entity in targets
         ):
             rgb_tensors = tuple(
-                getattr(camera.data.output["rgb"], "torch", camera.data.output["rgb"]) for camera, _ in targets
+                self._camera_channel_output(camera, "rgb") for camera, _ in targets
             )
             packed = _pack_compatible_rgb_tensors(self._m.torch, rgb_tensors, self._rgb_host_staging)
             if packed is not None:
@@ -5518,9 +5595,10 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         self._ensure_camera_render()
         for camera, _ in targets:
-            camera.update(0.0, force_recompute=True)
+            if not getattr(self, "_camera_exclusion_groups", None):
+                camera.update(0.0, force_recompute=True)
         tensors = tuple(
-            getattr(camera.data.output["rgb"], "torch", camera.data.output["rgb"])
+            self._camera_channel_output(camera, "rgb")
             for camera, _ in targets
         )
         devices = tuple(getattr(tensor, "device", None) for tensor in tensors)
@@ -5589,7 +5667,8 @@ class IsaacLabNativeWorld:
         assert self._sim is not None
         self._ensure_camera_render()
         for camera, _, _ in targets:
-            camera.update(0.0, force_recompute=True)
+            if not getattr(self, "_camera_exclusion_groups", None):
+                camera.update(0.0, force_recompute=True)
 
         try:
             from torchvision.io import encode_jpeg
@@ -5598,7 +5677,7 @@ class IsaacLabNativeWorld:
 
         tensors = []
         for camera, _, _ in targets:
-            tensor = getattr(camera.data.output["rgb"], "torch", camera.data.output["rgb"])
+            tensor = self._camera_channel_output(camera, "rgb")
             if tensor.ndim == 4 and tensor.shape[0] == 1:
                 tensor = tensor[0]
             if tensor.ndim != 3 or tensor.shape[-1] != 3 or tensor.device.type != "cuda":

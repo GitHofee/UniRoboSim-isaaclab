@@ -4,8 +4,8 @@ from unirobosim import (
     CHECKPOINT_CAPABILITY_ID,
     COMPOSITE_WORLD_SCHEMA_VERSION,
     PHYSICAL_WORLD_SCHEMA_VERSION,
-    RENDER_STATE_CAPABILITY_ID,
     RENDER_QUALITY_CAPABILITY_ID,
+    RENDER_STATE_CAPABILITY_ID,
     WORLD_SCHEMA_VERSION,
     CapabilityDeclaration,
     CapabilityId,
@@ -411,12 +411,16 @@ DEBUG_RENDER_CAPABILITIES = (
 CAMERA_CAPABILITIES = (
     CapabilityDeclaration(
         CapabilityId("sensor.camera.calibrated@1"),
-        FrozenMap({"projection_models": ["opencv_pinhole"], "distortion_models": ["rational8"], "precision": "usd-float32"}),
+        FrozenMap(
+            {"projection_models": ["opencv_pinhole"], "distortion_models": ["rational8"], "precision": "usd-float32"}
+        ),
     ),
     CapabilityDeclaration(
         CapabilityId("sensor.camera.render-exclusions@1"),
-        FrozenMap({"selection": "exact-mesh", "implementation": "rtx-scene-partitions", "collision": "unchanged"}),
-        limitations=("external cameras created after world initialization require an explicit partition",),
+        FrozenMap(
+            {"selection": "exact-mesh", "implementation": "synchronous-render-product-groups", "collision": "unchanged"}
+        ),
+        limitations=("unmanaged external render products must be paused during grouped acquisition",),
     ),
     CapabilityDeclaration(
         CapabilityId("sensor.camera@1"),
