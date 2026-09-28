@@ -268,3 +268,8 @@ CPU 目标去重还要求 SDK 提供可选只读 `target_state_revision`。公�
 和控制模式记录。缺少代次的旧 SDK 每次调用 setter 与原始公开提交路径。直接改 raw PhysX view
 或目标数据张量的调用方，必须随后显式调用 `asset.invalidate_target_state()`；后端不能自动
 观察这种绕过。方法签名不可检查或参数仅允许 positional 时保留旧调用形式，不安装私有补丁。
+
+规划位置上下界同样从已准入的原生 articulation 读取，使用 SI 单位，原样保留 SDK
+实际值，包括角度转换后的浮点精度；不重新解释资产角度，也不放宽物理限位。
+受管 Isaac Lab articulation 与原生 tensor view 使用相同校验。两端无限表示无界；
+单侧无限、NaN、上下界颠倒或环境间限位不一致会拒绝准入。

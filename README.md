@@ -314,3 +314,10 @@ A caller directly editing raw PhysX views or target data tensors must call
 `asset.invalidate_target_state()` afterward; these bypasses cannot be automatically
 observed. Signature negotiation rejects positional-only or uninspectable optional
 parameters and preserves the legacy call shape. No private SDK patch is installed.
+
+Planning position bounds are also read from the admitted native articulation in SI units.
+The catalog preserves the SDK values exactly, including floating-point degree conversion;
+it does not reinterpret authored angular limits or relax physical limits. Both managed
+Isaac Lab articulations and raw tensor views use the same validation. Two infinite
+endpoints represent an unbounded joint; one-sided infinity, NaN, reversed bounds,
+and inconsistent environment limits fail admission.

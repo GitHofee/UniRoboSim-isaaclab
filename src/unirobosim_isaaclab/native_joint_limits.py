@@ -1,4 +1,4 @@
-"""Publish effective native drive limits rather than authored planning hints."""
+"""Publish effective native joint limits rather than authored planning hints."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def effective_joint_drive_limits(
         indices = {name: index for index, name in enumerate(names)}
         if len(indices) != len(names):
             raise NativePlanningError("catalog_invalid")
+        positions = asset.data.joint_pos_limits.torch.detach().cpu().tolist()
         velocities = asset.data.joint_vel_limits.torch.detach().cpu().tolist()
         efforts = asset.data.joint_effort_limits.torch.detach().cpu().tolist()
     else:
@@ -35,12 +36,13 @@ def effective_joint_drive_limits(
         if view is None:
             raise NativePlanningError("native_failure")
         indices = dict(zip(spec.joint_names, world._joint_maps[spec.path], strict=True))
+        positions = view.get_dof_limits().detach().cpu().tolist()
         velocities = view.get_dof_max_velocities().detach().cpu().tolist()
         efforts = view.get_dof_max_forces().detach().cpu().tolist()
     count = world._spec.environments.count
-    if len(velocities) != count or len(efforts) != count:
+    if any(len(rows) != count for rows in (positions, velocities, efforts)):
         raise NativePlanningError("catalog_invalid")
-    widths = {len(row) for row in (*velocities, *efforts)}
+    widths = {len(row) for row in (*positions, *velocities, *efforts)}
     if len(widths) != 1 or any(type(index) is not int or index < 0 for index in indices.values()):
         raise NativePlanningError("catalog_invalid")
     if len(indices) != len(set(indices.values())):
@@ -50,6 +52,7 @@ def effective_joint_drive_limits(
         index = indices.get(item.movable_name)
         if index is None:
             raise NativePlanningError("catalog_invalid")
+        lower, upper = _position_bounds(positions, index)
         limits = []
         for rows in (velocities, efforts):
             if any(index >= len(row) for row in rows):
@@ -62,5 +65,32 @@ def effective_joint_drive_limits(
             # The public contract represents positive finite limits; zero passive
             # effort and native unbounded values do not assert a positive cap.
             limits.append(values[0] if 0.0 < values[0] < math.inf else None)
-        updated[item.descriptor.joint_id] = replace(item.descriptor, max_velocity=limits[0], max_effort=limits[1])
+        updated[item.descriptor.joint_id] = replace(
+            item.descriptor, lower=lower, upper=upper, max_velocity=limits[0], max_effort=limits[1]
+        )
     return tuple(updated.get(joint.joint_id, joint) for joint in joints)
+
+
+def _position_bounds(rows: Any, index: int) -> tuple[float | None, float | None]:
+    """Read SDK SI values exactly; the SDK owns degree conversion and precision."""
+    if any(index >= len(row) for row in rows):
+        raise NativePlanningError("catalog_invalid")
+    pairs = tuple(row[index] for row in rows)
+    if any(not isinstance(pair, (list, tuple)) or len(pair) != 2 for pair in pairs):
+        raise NativePlanningError("catalog_invalid")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value)
+        for pair in pairs
+        for value in pair
+    ):
+        raise NativePlanningError("catalog_invalid")
+    if not pairs or any(pair != pairs[0] for pair in pairs[1:]):
+        raise NativePlanningError("catalog_invalid")
+    lower, upper = (float(value) for value in pairs[0])
+    if lower == -math.inf and upper == math.inf:
+        return None, None
+    # The public descriptor supports two finite endpoints or a fully unbounded
+    # joint. Never erase a remaining finite endpoint on a one-sided interval.
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower > upper:
+        raise NativePlanningError("catalog_invalid")
+    return lower, upper
