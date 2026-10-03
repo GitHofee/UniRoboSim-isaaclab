@@ -138,6 +138,7 @@ def _native_camera_world(
     payload: Callable[[int, EntitySpec], bytes],
 ) -> tuple[IsaacLabNativeWorld, _Simulation, dict[str, int], tuple[_Camera, ...]]:
     world = object.__new__(IsaacLabNativeWorld)
+    world._fluids = {}
     counters = {"to": 0, "cpu": 0, "stack": 0, "empty": 0, "copy": 0, "sync": 0}
     cameras = tuple(
         _Camera(

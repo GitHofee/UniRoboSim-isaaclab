@@ -202,6 +202,9 @@ class _Attribute:
 
 
 class _Points:
+    def GetWidthsAttr(self):
+        return _Attribute((.03,))
+
     def __init__(self) -> None:
         self.positions = _Attribute(((0.0, 0.0, 1.0), (0.1, 0.0, 1.0)))
         self.velocities = _Attribute(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
@@ -224,6 +227,7 @@ def _native_world() -> tuple[IsaacLabNativeWorld, _Simulation, _Articulation, _R
     import torch
 
     world = object.__new__(IsaacLabNativeWorld)
+    world._sync_particle_visual = lambda points, radius: None
     simulation = _Simulation()
     articulation = _Articulation()
     rigid = _Rigid()

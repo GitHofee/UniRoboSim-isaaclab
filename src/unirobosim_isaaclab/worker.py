@@ -26,7 +26,6 @@ from unirobosim import CommandMode, DebugBatch, EntityPath, KinematicTarget, Poi
 
 from ._version import DISTRIBUTION_VERSION
 from .config import IsaacLabAdapterConfig
-from .startup_activity import KitStartupActivity
 from .native_protocols import (
     Matrix,
     NativeArticulationCommand,
@@ -52,6 +51,7 @@ from .native_protocols import (
     Vector3,
 )
 from .planning_scene import planning_scene_demanded
+from .startup_activity import KitStartupActivity
 
 _CALL_TIMEOUT_SECONDS = 300.0
 _STARTUP_ATTEMPTS = 2
@@ -522,6 +522,14 @@ def _dispatch(
             cast(tuple[int, ...], args[4]),
         )
         return active, None, False
+    if operation == "capture_appearance":
+        return active, active.capture_appearance(), False
+    if operation == "apply_appearance":
+        return active, active.apply_appearance(args[0]), False
+    if operation == "read_render_appearance":
+        return active, active.read_render_appearance(), False
+    if operation == "read_particle_colors":
+        return active, active.read_particle_colors(cast(EntityPath, args[0])), False
     if operation == "read_particle_fluid":
         return active, active.read_particle_fluid(cast(EntityPath, args[0])), False
     if operation == "read_sensor":
@@ -1349,6 +1357,22 @@ class IsaacLabWorkerWorld:
             environment_indices,
             particle_indices,
         )
+
+    def capture_appearance(self):
+        self._ensure_open("capture_appearance")
+        return self._runtime._request("capture_appearance")
+
+    def apply_appearance(self, snapshot):
+        self._ensure_open("apply_appearance")
+        return self._runtime._request("apply_appearance", snapshot)
+
+    def read_render_appearance(self):
+        self._ensure_open("read_render_appearance")
+        return self._runtime._request("read_render_appearance")
+
+    def read_particle_colors(self, path: EntityPath) -> object | None:
+        self._ensure_open("read_particle_colors")
+        return self._runtime._request("read_particle_colors", path)
 
     def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]:
         self._ensure_open("read_particle_fluid")

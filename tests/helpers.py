@@ -315,6 +315,9 @@ class FakeNativeWorld:
     ) -> None:
         self.calls.append(("fluid", (path, mode, targets, environment_indices, particle_indices)))
 
+    def read_particle_colors(self, path):
+        return None
+
     def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]:
         self.calls.append(("read_fluid", path))
         entity = next(item for item in self.spec.entities if item.path == path)

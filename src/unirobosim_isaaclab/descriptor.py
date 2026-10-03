@@ -1,5 +1,7 @@
 """Backend identity and launch-profile-aware capabilities."""
 
+from dataclasses import replace
+
 from unirobosim import (
     CHECKPOINT_CAPABILITY_ID,
     COMPOSITE_WORLD_SCHEMA_VERSION,
@@ -493,8 +495,41 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
     extras = (*DEBUG_RENDER_CAPABILITIES,) if render else ()
     if render and enable_cameras:
         extras = (*extras, *CAMERA_CAPABILITIES)
-    if extras:
-        capabilities = CapabilitySet((*CAPABILITIES, *extras))
+    render_only = getattr(config, "deformable_mode", "simulation") == "render_only"
+    if extras or render_only:
+        declarations = (*CAPABILITIES, *extras)
+        if render_only:
+            declarations = tuple(
+                value
+                for value in declarations
+                if value.capability
+                not in {
+                    CHECKPOINT_CAPABILITY_ID,
+                    CapabilityId("physics.deformable.self-collision@1"),
+                    CapabilityId("control.deformable.points@1"),
+                }
+            )
+            declarations = tuple(
+                replace(
+                    value,
+                    properties=FrozenMap(
+                        {
+                            **value.properties.to_dict(),
+                            "deformable_mode": "render_only",
+                            "deformable_physics": False,
+                            "state_kinds": [*value.properties.to_dict()["state_kinds"], "deformable-nodes"],
+                        }
+                    ),
+                    limitations=(
+                        *value.limitations,
+                        "deformables are visual recorded topology only; no deformable solver",
+                    ),
+                )
+                if value.capability == RENDER_STATE_CAPABILITY_ID
+                else value
+                for value in declarations
+            )
+        capabilities = CapabilitySet(declarations)
         anti_aliasing = str(getattr(config, "anti_aliasing", "fxaa"))
         texture_streaming = bool(getattr(config, "texture_streaming", False))
         render_on_step = bool(getattr(config, "render_on_step", True))
@@ -515,6 +550,7 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
                     "render_on_step": render_on_step,
                     "max_render_hz": max_render_hz,
                     "fluid_render_mode": fluid_render_mode,
+                    "deformable_mode": getattr(config, "deformable_mode", "simulation"),
                 }
             ),
         )
