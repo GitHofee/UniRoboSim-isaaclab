@@ -84,6 +84,9 @@ class NativeCameraCalibration:
     clipping_range_m: tuple[float, float]
     position_m: Vector3
     orientation_opengl_xyzw: Quaternion
+    projection_model: str = "pinhole"
+    distortion_model: str = "none"
+    distortion_coefficients: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +236,15 @@ class NativeRenderParticleFluidState:
     velocities_m_s: PointBatch | PackedFloat32Array | None
     environment_indices: tuple[int, ...]
     first_particle_index: int
+    colors_rgba: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRenderDeformableState:
+    path: EntityPath
+    positions_m: PointBatch | PackedFloat32Array
+    velocities_m_s: PointBatch | PackedFloat32Array | None
+    environment_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +254,7 @@ class NativeRenderStateFrame:
     articulations: tuple[NativeRenderArticulationState, ...]
     rigid_bodies: tuple[NativeRenderRigidBodyState, ...]
     particle_fluids: tuple[NativeRenderParticleFluidState, ...]
+    deformables: tuple[NativeRenderDeformableState, ...] = ()
 
 
 class NativeWorldDriver(Protocol):
@@ -362,6 +375,14 @@ class NativeWorldDriver(Protocol):
     ) -> None: ...
 
     def read_particle_fluid(self, path: EntityPath) -> tuple[PointBatch, PointBatch]: ...
+
+    def read_particle_colors(self, path: EntityPath) -> object | None: ...
+
+    def read_render_appearance(self) -> dict: ...
+
+    def capture_appearance(self): ...
+
+    def apply_appearance(self, snapshot): ...
 
     def read_sensor(self, path: EntityPath) -> NativeSensorSample: ...
 

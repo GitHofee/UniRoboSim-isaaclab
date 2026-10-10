@@ -23,6 +23,7 @@ class _Simulation:
 
 def _render_world() -> tuple[IsaacLabNativeWorld, _Simulation, list[str]]:
     world = object.__new__(IsaacLabNativeWorld)
+    world._fluids = {}
     simulation = _Simulation()
     mounted_syncs: list[str] = []
     world._sim = simulation

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from unirobosim import ValidationError
 
+from .appearance import IsaacLabAppearanceConfig
+
 _DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)$")
 _ANTI_ALIASING_MODES = {"off": 0, "taa": 1, "fxaa": 2, "dlss": 3, "dlaa": 4}
 _FLUID_RENDER_MODES = {"particles", "isosurface"}
@@ -27,6 +29,9 @@ class IsaacLabAdapterConfig:
     texture_streaming: bool = False
     render_on_step: bool = True
     max_render_hz: float | None = None
+    default_dome_light_intensity: float | None = None
+    appearance: IsaacLabAppearanceConfig | None = None
+    deformable_mode: str = "simulation"
     fluid_render_mode: str = "particles"
     fluid_surface_color_rgb: tuple[float, float, float] | None = None
     fluid_surface_distance_scale: float = 2.5
@@ -64,6 +69,18 @@ class IsaacLabAdapterConfig:
             or not isinstance(self.render_on_step, bool)
         ):
             raise ValidationError("launch flags must be boolean", operation="isaaclab.config.validate")
+        if self.appearance is not None and not isinstance(self.appearance, IsaacLabAppearanceConfig):
+            raise ValidationError("appearance must be IsaacLabAppearanceConfig", operation="isaaclab.config.validate")
+        if self.default_dome_light_intensity is not None:
+            value = self.default_dome_light_intensity
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValidationError(
+                    "default_dome_light_intensity must be finite and non-negative", operation="isaaclab.config.validate"
+                )
+        if self.deformable_mode not in ("simulation", "render_only"):
+            raise ValidationError(
+                "deformable_mode must be simulation or render_only", operation="isaaclab.config.validate"
+            )
         if not isinstance(self.device, str) or not _DEVICE.fullmatch(self.device):
             raise ValidationError(
                 "device must be cpu, cuda, or cuda:<index>",

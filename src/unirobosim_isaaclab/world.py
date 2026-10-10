@@ -15,8 +15,8 @@ from unirobosim import (
     ARTICULATION_AXIS_UNITS_MISMATCH,
     ARTICULATION_POSITION_AXIS_UNITS_UNSUPPORTED,
     PHYSICAL_WORLD_SCHEMA_VERSION,
-    RENDER_STATE_CAPABILITY_ID,
     RENDER_QUALITY_CAPABILITY_ID,
+    RENDER_STATE_CAPABILITY_ID,
     ArrayValue,
     ArticulationCommand,
     ArticulationState,
@@ -84,6 +84,7 @@ from .native_protocols import (
     NativeEntityPrimState,
     NativeKinematicState,
     NativeRenderArticulationState,
+    NativeRenderDeformableState,
     NativeRenderParticleFluidState,
     NativeRenderRigidBodyState,
     NativeRenderStateFrame,
@@ -375,6 +376,8 @@ class IsaacLabWorld:
     def create_checkpoint(self) -> WorldCheckpoint:
         operation = "world.create_checkpoint"
         self._ensure_ready(operation)
+        if self._session.config.deformable_mode == "render_only":
+            raise UnsupportedCapabilityError("render-only deformable checkpoints are unsupported", operation=operation)
         if self._pending_articulation_commands:
             raise ValidationError(
                 "checkpoint capture requires an empty pending articulation-command buffer",
@@ -405,6 +408,8 @@ class IsaacLabWorld:
     def restore_checkpoint(self, checkpoint: WorldCheckpoint) -> CheckpointRestoreResult:
         operation = "world.restore_checkpoint"
         self._ensure_ready(operation)
+        if self._session.config.deformable_mode == "render_only":
+            raise UnsupportedCapabilityError("render-only deformable checkpoints are unsupported", operation=operation)
         if type(checkpoint) is not WorldCheckpoint:
             raise ValidationError("operation requires a WorldCheckpoint", operation=operation)
         if self._pending_articulation_commands:
@@ -491,10 +496,13 @@ class IsaacLabWorld:
             raise ValidationError("render quality flags must be booleans", operation=operation)
         if self._descriptor.capabilities.get(RENDER_QUALITY_CAPABILITY_ID) is None:
             raise UnsupportedCapabilityError("render quality is unavailable", operation=operation)
-        result = self._native_call(operation, lambda: self._native.configure_render_quality(
-            enable_global_illumination=enable_global_illumination,
-            enable_ambient_occlusion=enable_ambient_occlusion,
-        ))
+        result = self._native_call(
+            operation,
+            lambda: self._native.configure_render_quality(
+                enable_global_illumination=enable_global_illumination,
+                enable_ambient_occlusion=enable_ambient_occlusion,
+            ),
+        )
         expected = (enable_global_illumination, enable_ambient_occlusion)
         if type(result) is not tuple or any(type(value) is not bool for value in result) or result != expected:
             raise RuntimeError("renderer did not apply the requested quality settings")
@@ -713,6 +721,38 @@ class IsaacLabWorld:
                     ),
                     environments,
                     fluid_update.first_particle_index,
+                    fluid_update.colors_rgba if isinstance(fluid_update.colors_rgba, PackedFloat32Array)
+                    else None if fluid_update.colors_rgba is None else fluid_update.colors_rgba.nested(),
+                )
+            )
+
+        deformables: list[NativeRenderDeformableState] = []
+        for update in frame.deformables:
+            entity = self._validate_handle(update.handle, operation)
+            if entity.deformable is None:
+                raise CommandError("render state entity is not a deformable", operation=operation)
+            if self._session.config.deformable_mode != "render_only":
+                raise UnsupportedCapabilityError(
+                    "deformable render state requires deformable_mode=render_only", operation=operation
+                )
+            environments = self._indices(
+                update.environment_indices, self._spec.environments.count, "environment_indices", operation=operation
+            )
+            expected = (len(environments), entity.deformable.node_count, 3)
+            if update.positions_m.shape != expected or (
+                update.velocities_m_s is not None and update.velocities_m_s.shape != expected
+            ):
+                raise CommandError("render deformable state shape is invalid", operation=operation)
+
+            def payload(value):
+                return value if isinstance(value, PackedFloat32Array) else value.nested()
+
+            deformables.append(
+                NativeRenderDeformableState(
+                    entity.path,
+                    payload(update.positions_m),
+                    None if update.velocities_m_s is None else payload(update.velocities_m_s),
+                    environments,
                 )
             )
 
@@ -720,6 +760,7 @@ class IsaacLabWorld:
             tuple(articulations),
             tuple(rigid_bodies),
             tuple(particle_fluids),
+            tuple(deformables),
         )
         self._native_call(operation, lambda: self._native.apply_render_state(native_frame))
         self._pending_articulation_commands.clear()
@@ -732,6 +773,7 @@ class IsaacLabWorld:
             articulation_count=len(articulations),
             rigid_body_count=len(rigid_bodies),
             particle_fluid_count=len(particle_fluids),
+            deformable_count=len(deformables),
         )
 
     def apply_articulation_command(self, command: ArticulationCommand) -> None:
@@ -928,6 +970,10 @@ class IsaacLabWorld:
     def apply_deformable_command(self, command: DeformableCommand) -> None:
         operation = "world.apply_deformable_command"
         self._ensure_ready(operation)
+        if self._session.config.deformable_mode == "render_only":
+            raise UnsupportedCapabilityError(
+                "render-only deformables do not accept physics commands", operation=operation
+            )
         if not isinstance(command, DeformableCommand):
             raise CommandError("operation requires a DeformableCommand", operation=operation)
         entity = self._validate_handle(command.handle, operation)
@@ -1039,6 +1085,19 @@ class IsaacLabWorld:
             entity_path=entity.path.value,
         )
 
+    def capture_appearance(self):
+        self._ensure_ready("world.capture_appearance")
+        return self._native_call("world.capture_appearance", self._native.capture_appearance)
+
+    def apply_appearance(self, snapshot):
+        self._ensure_ready("world.apply_appearance")
+        return self._native_call("world.apply_appearance", lambda: self._native.apply_appearance(snapshot))
+
+    def read_render_appearance(self):
+        """Diagnostic readback of authored lighting, shader and camera state."""
+        self._ensure_ready("world.read_render_appearance")
+        return self._native_call("world.read_render_appearance", self._native.read_render_appearance)
+
     def read_particle_fluid(self, handle: EntityHandle) -> ParticleFluidState:
         operation = "world.read_particle_fluid"
         self._ensure_ready(operation)
@@ -1050,7 +1109,10 @@ class IsaacLabWorld:
             lambda: self._native.read_particle_fluid(entity.path),
             entity_path=entity.path.value,
         )
-        return ParticleFluidState(ArrayValue.from_nested(positions), ArrayValue.from_nested(velocities), self.tick)
+        colors = self._native_call(operation, lambda: self._native.read_particle_colors(entity.path),
+                                   entity_path=entity.path.value)
+        return ParticleFluidState(ArrayValue.from_nested(positions), ArrayValue.from_nested(velocities), self.tick,
+                                  None if colors is None else ArrayValue.from_nested(colors, dtype="float32"))
 
     def _sensor_sample(
         self,

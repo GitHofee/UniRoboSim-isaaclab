@@ -5,6 +5,7 @@ import os
 from unirobosim import ValidationError
 
 from ._version import DISTRIBUTION_VERSION
+from .appearance import IsaacLabAppearanceConfig
 from .config import IsaacLabAdapterConfig
 from .descriptor import CAMERA_CAPABILITIES, CAPABILITIES, DESCRIPTOR, descriptor_for_config
 from .probe import probe_environment, recommended_startup_budgets
@@ -148,6 +149,7 @@ def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvid
 
 
 __all__ = [
+    "IsaacLabAppearanceConfig",
     "CAPABILITIES",
     "CAMERA_CAPABILITIES",
     "DESCRIPTOR",
