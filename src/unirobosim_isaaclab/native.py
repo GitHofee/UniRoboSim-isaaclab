@@ -122,14 +122,9 @@ def _resolved_gpu_max_num_partitions(config: IsaacLabAdapterConfig, spec: WorldS
     ):
         return _DEFAULT_GPU_MAX_NUM_PARTITIONS
     articulation_dofs = sum(
-        len(entity.joint_names)
-        for entity in spec.entities
-        if entity.kind is EntityKind.ARTICULATION
+        len(entity.joint_names) for entity in spec.entities if entity.kind is EntityKind.ARTICULATION
     )
-    dynamic_entities = sum(
-        entity.kind in {EntityKind.ARTICULATION, EntityKind.RIGID_BODY}
-        for entity in spec.entities
-    )
+    dynamic_entities = sum(entity.kind in {EntityKind.ARTICULATION, EntityKind.RIGID_BODY} for entity in spec.entities)
     if (
         articulation_dofs <= _SMALL_WORLD_MAX_ARTICULATION_DOFS
         and dynamic_entities <= _SMALL_WORLD_MAX_DYNAMIC_ENTITIES
@@ -915,10 +910,20 @@ def _transform_position(
 
 def _surface_from_tetrahedra(
     tetrahedra: tuple[tuple[int, int, int, int], ...],
+    positions: tuple[tuple[float, ...], ...],
 ) -> tuple[tuple[int, int, int], ...]:
     faces: dict[tuple[int, int, int], tuple[int, int, int] | None] = {}
     for a, b, c, d in tetrahedra:
-        for face in ((a, b, c), (a, d, b), (a, c, d), (b, d, c)):
+        edges = tuple(tuple(positions[i][j] - positions[a][j] for j in range(3)) for i in (b, c, d))
+        u, v, w = edges
+        determinant = (
+            u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0]) + u[2] * (v[0] * w[1] - v[1] * w[0])
+        )
+        if determinant == 0:
+            raise ValueError("deformable tetrahedron has zero rest volume")
+        if determinant < 0:
+            b, c = c, b
+        for face in ((b, c, d), (a, d, c), (a, b, d), (a, c, b)):
             ordered = sorted(face)
             key = (ordered[0], ordered[1], ordered[2])
             faces[key] = face if key not in faces else None
@@ -1333,12 +1338,10 @@ class IsaacLabNativeWorld:
         self._m.UsdGeom.Xform.Define(stage, prototype_path)
         mesh = self._m.UsdGeom.Mesh.Define(stage, f"{prototype_path}/surface")
         vertices = tuple(
-            (float(values[0]), float(values[1]), float(values[2]))
-            for values in resource.vertices_m.nested()
+            (float(values[0]), float(values[1]), float(values[2])) for values in resource.vertices_m.nested()
         )
         triangles = tuple(
-            (int(values[0]), int(values[1]), int(values[2]))
-            for values in resource.triangle_indices.nested()
+            (int(values[0]), int(values[1]), int(values[2])) for values in resource.triangle_indices.nested()
         )
         mesh.CreatePointsAttr().Set(self._m.Vt.Vec3fArray(vertices))
         mesh.CreateFaceVertexCountsAttr().Set(self._m.Vt.IntArray([3] * len(triangles)))
@@ -1361,9 +1364,7 @@ class IsaacLabNativeWorld:
         curves = self._m.UsdGeom.BasisCurves.Define(stage, f"{prototype_path}/edges")
         curves.CreateTypeAttr().Set(self._m.UsdGeom.Tokens.linear)
         curves.CreateWrapAttr().Set(self._m.UsdGeom.Tokens.nonperiodic)
-        curves.CreatePointsAttr().Set(
-            self._m.Vt.Vec3fArray([vertices[index] for edge in edges for index in edge])
-        )
+        curves.CreatePointsAttr().Set(self._m.Vt.Vec3fArray([vertices[index] for edge in edges for index in edge]))
         curves.CreateCurveVertexCountsAttr().Set(self._m.Vt.IntArray([2] * len(edges)))
         curves.CreateWidthsAttr().Set(self._m.Vt.FloatArray([max(0.0005, primitive.size)]))
         curves.SetWidthsInterpolation(self._m.UsdGeom.Tokens.constant)
@@ -1515,6 +1516,8 @@ class IsaacLabNativeWorld:
         for entity in self._spec.entities:
             if entity.embedded_binding is not None or entity.kind is EntityKind.COMPOSITE_SCENE:
                 continue
+            if entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
+                continue
             if entity.kind is EntityKind.ARTICULATION:
                 self._author_articulation(entity)
             elif entity.kind is EntityKind.RIGID_BODY:
@@ -1531,10 +1534,12 @@ class IsaacLabNativeWorld:
                     )
             elif entity.kind is EntityKind.STATIC_SCENE:
                 self._author_static_scene(entity)
-            elif entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
-                self._author_deformable(entity)
             elif entity.kind is EntityKind.PARTICLE_FLUID:
                 self._author_particle_fluid(entity)
+        # All physical parents must exist before mounted soft bodies resolve links.
+        for entity in self._spec.entities:
+            if entity.kind in {EntityKind.SURFACE_DEFORMABLE, EntityKind.VOLUME_DEFORMABLE}:
+                self._author_deformable(entity)
         # Camera parents must already exist before a mounted sensor resolves its
         # articulation root/link. WorldSpec ordering is deliberately irrelevant.
         for entity in self._spec.entities:
@@ -1542,8 +1547,10 @@ class IsaacLabNativeWorld:
                 self._author_camera(entity)
         if self._config.appearance is not None:
             from .appearance import apply_appearance
-            self._appearance_keys = apply_appearance(self._m.sim_utils.get_current_stage(),
-                self._m.carb.settings.get_settings(), self._config.appearance)
+
+            self._appearance_keys = apply_appearance(
+                self._m.sim_utils.get_current_stage(), self._m.carb.settings.get_settings(), self._config.appearance
+            )
         self._configure_camera_render_exclusions()
         self._apply_runtime_physics_profile()
         self._initialize_physics_activation()
@@ -1620,9 +1627,7 @@ class IsaacLabNativeWorld:
             if container_roots is None:
                 raise RuntimeError("embedded physics-activation entity has no composite container")
             for container_root in container_roots:
-                protected_roots.extend(
-                    f"{container_root}/{item.relative_prim_path}" for item in binding.link_prims
-                )
+                protected_roots.extend(f"{container_root}/{item.relative_prim_path}" for item in binding.link_prims)
         scene_roots = tuple(
             root
             for collection in (self._static_scene_roots, self._composite_scene_roots)
@@ -1773,9 +1778,7 @@ class IsaacLabNativeWorld:
         """Translate the public entity-Prim pose into Isaac's physical-root initial state."""
 
         if len(physical_root_paths) != self._spec.environments.count:
-            raise ValueError(
-                f"physical root count for {entity.path.value} does not match the environment count"
-            )
+            raise ValueError(f"physical root count for {entity.path.value} does not match the environment count")
         targets = tuple(
             _retarget_physical_root_pose(
                 entity.pose,
@@ -2362,10 +2365,12 @@ class IsaacLabNativeWorld:
         """Author recorded topology as visual USD geometry without a native solver."""
         spec = entity.deformable
         assert spec is not None
+        points = _render_deformable_initial_points(entity)
         faces = () if spec.surface_triangles is None else spec.surface_triangles.rows()
         if not faces and spec.tetrahedra is not None:
-            faces = _surface_from_tetrahedra(tuple(tuple(int(v) for v in row) for row in spec.tetrahedra.rows()))
-        points = _render_deformable_initial_points(entity)
+            faces = _surface_from_tetrahedra(
+                tuple(tuple(int(v) for v in row) for row in spec.tetrahedra.rows()), points
+            )
         stage = self._m.sim_utils.get_current_stage()
         meshes = []
         for index in range(self._spec.environments.count):
@@ -2383,11 +2388,29 @@ class IsaacLabNativeWorld:
         self._render_deformables[entity.path] = meshes
 
     def _author_deformable(self, entity: EntitySpec) -> None:
+        """Build transaction: a rejected soft body leaves no partially authored roots."""
+        stage = self._m.sim_utils.get_current_stage()
+        roots = tuple(f"/World/env_{i}/{_native_name(entity.path)}" for i in range(self._spec.environments.count))
+        try:
+            self._author_deformable_impl(entity)
+        except Exception:
+            self._deformables.pop(entity.path, None)
+            for root in roots:
+                if stage.GetPrimAtPath(root):
+                    stage.RemovePrim(root)
+            raise
+
+    def _author_deformable_impl(self, entity: EntitySpec) -> None:
         if self._config.deformable_mode == "render_only":
             self._author_render_deformable(entity)
             return
         assert entity.deformable is not None
         deformable = entity.deformable
+        if (
+            deformable.rigid_mount is not None
+            and self._entity_specs[deformable.rigid_mount.parent_path].embedded_binding is not None
+        ):
+            raise ValueError("mounted deformables currently require standalone physical parents")
         points = deformable.rest_positions_m.rows()
         surface: tuple[tuple[int, int, int], ...] = (
             ()
@@ -2400,16 +2423,33 @@ class IsaacLabNativeWorld:
             else tuple((int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])) for tet in deformable.tetrahedra.rows())
         )
         if not surface and tetrahedra:
-            surface = _surface_from_tetrahedra(tetrahedra)
+            surface = _surface_from_tetrahedra(tetrahedra, points)
         name = _native_name(entity.path)
         stage = self._m.sim_utils.get_current_stage()
         for index in range(self._spec.environments.count):
             root = f"/World/env_{index}/{name}"
+            parent_body = None
+            mounted_pose = entity.pose
+            if deformable.rigid_mount is not None:
+                mount = deformable.rigid_mount
+                parent_body = self._attachment_body_path(mount.parent_path, mount.parent_link_name, index)
+                cache = self._m.UsdGeom.XformCache()
+                matrix = (
+                    cache.GetLocalToWorldTransform(stage.GetPrimAtPath(parent_body))
+                    * cache.GetLocalToWorldTransform(stage.GetPrimAtPath(f"/World/env_{index}")).GetInverse()
+                )
+                position = matrix.Transform(self._m.Gf.Vec3d(*entity.pose.position))
+                parent_rotation = matrix.ExtractRotationQuat()
+                parent_xyzw = (*parent_rotation.GetImaginary(), parent_rotation.GetReal())
+                mounted_pose = Pose(
+                    position=cast(Vector3, tuple(float(v) for v in position)),
+                    orientation_xyzw=_multiply_xyzw(parent_xyzw, entity.pose.orientation_xyzw),
+                )
             self._m.sim_utils.create_prim(
                 root,
                 "Xform",
-                translation=entity.pose.position,
-                orientation=entity.pose.orientation_xyzw,
+                translation=mounted_pose.position,
+                orientation=mounted_pose.orientation_xyzw,
             )
             vis_mesh = self._m.UsdGeom.Mesh.Define(stage, f"{root}/vis_mesh")
             vis_mesh.GetPointsAttr().Set(self._m.Vt.Vec3fArray(points))
@@ -2425,12 +2465,58 @@ class IsaacLabNativeWorld:
                 mass=deformable.node_mass_kg * deformable.node_count,
                 linear_damping=deformable.linear_damping_per_s,
                 self_collision=deformable.self_collision,
+                solver_position_iteration_count=64 if deformable.rigid_mount is not None else 16,
             )
             self._m.define_deformable_body_properties(
                 root,
                 properties,
                 deformable_type="surface" if entity.kind is EntityKind.SURFACE_DEFORMABLE else "volume",
             )
+            collision_prims = tuple(
+                prim
+                for prim in self._m.Usd.PrimRange(stage.GetPrimAtPath(root), self._m.Usd.TraverseInstanceProxies())
+                if prim.HasAPI(self._m.UsdPhysics.CollisionAPI)
+            )
+            if len(collision_prims) != 1:
+                raise ValueError(
+                    f"deformable {root!r} requires exactly one collision mesh; found {len(collision_prims)}"
+                )
+            collision_prim = collision_prims[0]
+            collision_type = (
+                self._m.UsdGeom.TetMesh if entity.kind is EntityKind.VOLUME_DEFORMABLE else self._m.UsdGeom.Mesh
+            )
+            if not collision_prim.IsA(collision_type):
+                raise ValueError(f"deformable {root!r} collision mesh does not match its surface/volume topology")
+            if deformable.contact_offset_m is not None:
+                # PhysX collision offsets belong to the actual collision mesh,
+                # which the SDK may create separately from the visual mesh.
+                collision_api = self._m.PhysxSchema.PhysxCollisionAPI.Apply(collision_prim)
+                if not collision_api:
+                    raise RuntimeError(f"failed to apply deformable collision offsets to {collision_prim.GetPath()}")
+                if collision_api.CreateContactOffsetAttr().Set(deformable.contact_offset_m) is False:
+                    raise RuntimeError(f"failed to author deformable contact offset on {collision_prim.GetPath()}")
+                if collision_api.CreateRestOffsetAttr().Set(deformable.rest_offset_m) is False:
+                    raise RuntimeError(f"failed to author deformable rest offset on {collision_prim.GetPath()}")
+            if deformable.elastic_material is not None:
+                from .deformable_mounts import author_elastic_material
+
+                author_elastic_material(self._m, stage, root, deformable.elastic_material)
+            if parent_body is not None:
+                from .deformable_mounts import author_rigid_mount
+
+                assert deformable.rigid_mount is not None
+                mount = deformable.rigid_mount
+                if mount.coupling == "solver":
+                    author_rigid_mount(self._m, stage, root, parent_body, mount.node_indices, points)
+                else:
+                    from .deformable_mounts import _filter_backing
+
+                    _filter_backing(self._m, stage, root, (self._m.Sdf.Path(parent_body),))
+                if self._entity_specs[mount.parent_path].kind is EntityKind.ARTICULATION:
+                    from .deformable_mounts import author_robot_self_collision_filter
+
+                    parent_root = f"/World/env_{index}/{_native_name(mount.parent_path)}"
+                    author_robot_self_collision_filter(self._m, stage, root, parent_root)
         cfg = self._m.DeformableObjectCfg(prim_path=f"/World/env_.*/{name}", spawn=None)
         self._deformables[entity.path] = self._m.DeformableObject(cfg)
 
@@ -2469,9 +2555,7 @@ class IsaacLabNativeWorld:
             if self._config.fluid_max_velocity_m_s is not None:
                 system.CreateMaxVelocityAttr().Set(self._config.fluid_max_velocity_m_s)
             if self._config.fluid_max_depenetration_velocity_m_s is not None:
-                system.CreateMaxDepenetrationVelocityAttr().Set(
-                    self._config.fluid_max_depenetration_velocity_m_s
-                )
+                system.CreateMaxDepenetrationVelocityAttr().Set(self._config.fluid_max_depenetration_velocity_m_s)
             system.CreateGlobalSelfCollisionEnabledAttr().Set(True)
             system.CreateNonParticleCollisionEnabledAttr().Set(True)
 
@@ -2494,9 +2578,11 @@ class IsaacLabNativeWorld:
                 self._m.Vt.FloatArray((fluid.particle_radius_m * 2.0,) * fluid.particle_count)
             )
             fluid_color = getattr(fluid, "color_rgba", None) or (0.1, 0.45, 1.0, 1.0)
-            colors = (fluid.initial_particle_colors_rgba.nested()
-                      if fluid.initial_particle_colors_rgba is not None
-                      else (fluid_color,) * fluid.particle_count)
+            colors = (
+                fluid.initial_particle_colors_rgba.nested()
+                if fluid.initial_particle_colors_rgba is not None
+                else (fluid_color,) * fluid.particle_count
+            )
             self._write_particle_colors(points, colors)
             self._bind_particle_material(points)
             if self._config.fluid_render_mode == "particles":
@@ -2550,9 +2636,7 @@ class IsaacLabNativeWorld:
             material = self._m.UsdShade.Material.Define(stage, material_path)
             shader = self._m.UsdShade.Shader.Define(stage, f"{material_path}/Shader")
             shader.CreateIdAttr("UsdPreviewSurface")
-            shader.CreateInput("diffuseColor", self._m.Sdf.ValueTypeNames.Color3f).Set(
-                self._m.Gf.Vec3f(*color[:3])
-            )
+            shader.CreateInput("diffuseColor", self._m.Sdf.ValueTypeNames.Color3f).Set(self._m.Gf.Vec3f(*color[:3]))
             shader.CreateInput("roughness", self._m.Sdf.ValueTypeNames.Float).Set(0.28)
             shader.CreateInput("metallic", self._m.Sdf.ValueTypeNames.Float).Set(0.0)
             shader.CreateInput("opacity", self._m.Sdf.ValueTypeNames.Float).Set(float(color[3]))
@@ -2598,13 +2682,9 @@ class IsaacLabNativeWorld:
         fluid_rest_offset = fluid.particle_radius_m * 0.6
         grid_spacing = fluid_rest_offset * 1.5
         isosurface.CreateGridSpacingAttr().Set(grid_spacing)
-        isosurface.CreateSurfaceDistanceAttr().Set(
-            fluid_rest_offset * self._config.fluid_surface_distance_scale
-        )
+        isosurface.CreateSurfaceDistanceAttr().Set(fluid_rest_offset * self._config.fluid_surface_distance_scale)
         isosurface.CreateGridFilteringPassesAttr().Set("")
-        isosurface.CreateGridSmoothingRadiusAttr().Set(
-            fluid_rest_offset * self._config.fluid_surface_smoothing_scale
-        )
+        isosurface.CreateGridSmoothingRadiusAttr().Set(fluid_rest_offset * self._config.fluid_surface_smoothing_scale)
         isosurface.CreateNumMeshSmoothingPassesAttr().Set(5)
         isosurface.CreateNumMeshNormalSmoothingPassesAttr().Set(6)
         self._m.UsdGeom.PrimvarsAPI(system).CreatePrimvar(
@@ -2639,8 +2719,7 @@ class IsaacLabNativeWorld:
                     prim = stage.GetPrimAtPath(path)
                     if not prim or not prim.IsA(self._m.UsdGeom.Mesh):
                         raise ValueError(f"camera exclusion requires an exact Mesh: {path}")
-                    if any(child.IsA(self._m.UsdGeom.Mesh) for child in self._m.Usd.PrimRange(prim)
-                           if child != prim):
+                    if any(child.IsA(self._m.UsdGeom.Mesh) for child in self._m.Usd.PrimRange(prim) if child != prim):
                         raise ValueError("camera exclusion cannot hide nested meshes")
                     while prim.IsInstanceProxy():
                         ancestor = prim.GetParent()
@@ -2652,9 +2731,9 @@ class IsaacLabNativeWorld:
                         prim = stage.GetPrimAtPath(path)
                     excluded.append(path)
             self._camera_exclusion_groups[entity.path.value] = tuple(sorted(set(excluded)))
-        self._camera_visibility_meshes = tuple(sorted({
-            path for paths in self._camera_exclusion_groups.values() for path in paths
-        }))
+        self._camera_visibility_meshes = tuple(
+            sorted({path for paths in self._camera_exclusion_groups.values() for path in paths})
+        )
         if len(self._camera_visibility_meshes) > 256:
             raise ValueError("camera exclusion supports at most 256 exact meshes")
         # Keep this layer alive and attached until stage teardown. RTX can retain
@@ -2671,8 +2750,10 @@ class IsaacLabNativeWorld:
 
         manager = ViewportManager()
         products = {
-            path.value: [manager._hydra_textures.get(None, product).hydra_texture
-                         for product in camera._render_data.render_product_paths]
+            path.value: [
+                manager._hydra_textures.get(None, product).hydra_texture
+                for product in camera._render_data.render_product_paths
+            ]
             for path, camera in self._cameras.items()
         }
         viewports = [window.viewport_api for window in get_viewport_window_instances()]
@@ -2700,9 +2781,15 @@ class IsaacLabNativeWorld:
                     self._camera_group_outputs[id(camera)] = snapshots
 
         render_camera_groups(
-            self._camera_exclusion_groups, products, viewports, render_active_group,
+            self._camera_exclusion_groups,
+            products,
+            viewports,
+            render_active_group,
             lambda hidden: temporary_mesh_visibility(
-                stage, hidden, usd=self._m.Usd, layer=self._camera_visibility_layer,
+                stage,
+                hidden,
+                usd=self._m.Usd,
+                layer=self._camera_visibility_layer,
                 selected=self._camera_visibility_meshes,
             ),
         )
@@ -2870,7 +2957,7 @@ class IsaacLabNativeWorld:
         for sets in self._fluids.values():
             for fluid_set in sets:
                 if self._config.fluid_render_mode == "particles" or fluid_set.render_state_visualization_enabled:
-                    self._sync_particle_visual(fluid_set.points, float(fluid_set.points.GetWidthsAttr().Get()[0]) / 2.)
+                    self._sync_particle_visual(fluid_set.points, float(fluid_set.points.GetWidthsAttr().Get()[0]) / 2.0)
         if getattr(self, "_camera_exclusion_groups", None):
             self._render_camera_exclusion_groups()
         else:
@@ -3170,6 +3257,9 @@ class IsaacLabNativeWorld:
                 target[..., 3] = 1.0
                 if entity.deformable.kinematic_node_indices:
                     target[:, list(entity.deformable.kinematic_node_indices), 3] = 0.0
+                mount = entity.deformable.rigid_mount
+                if mount is not None and mount.coupling == "kinematic_boundary":
+                    target[:, list(mount.node_indices), 3] = 0.0
             self._initial_deformable[path] = (state, target)
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
@@ -3259,7 +3349,8 @@ class IsaacLabNativeWorld:
             root_pose, positions, velocities = self._initial_articulation[path]
             asset.write_root_pose_to_sim_index(root_pose=root_pose[env_ids], env_ids=env_ids)
             asset.write_root_velocity_to_sim_index(
-                root_velocity=asset.data.default_root_vel.torch[env_ids], env_ids=env_ids,
+                root_velocity=asset.data.default_root_vel.torch[env_ids],
+                env_ids=env_ids,
             )
             asset.write_joint_position_to_sim_index(position=positions[env_ids], env_ids=env_ids)
             asset.write_joint_velocity_to_sim_index(velocity=velocities[env_ids], env_ids=env_ids)
@@ -3336,8 +3427,49 @@ class IsaacLabNativeWorld:
                 forces, torques = stored_wrench
                 forces[indices] = 0.0
                 torques[indices] = 0.0
+        mounted = bool(self._deformables) and any(
+            e.deformable is not None and e.deformable.rigid_mount is not None for e in self._spec.entities
+        )
+        if mounted:
+            # Reset articulated parents first; initialize pads in the actual reset
+            # link frame, not the imported asset's authored home configuration.
+            assert self._sim is not None
+            self._sim.forward()
+            self._update_assets(0.0)
         for path, asset in self._deformables.items():
             state, target = self._initial_deformable[path]
+            spec = self._entity_specs[path].deformable
+            if spec is not None and spec.rigid_mount is not None:
+                assert self._origins is not None
+                state = state.clone()
+                target = None if target is None else target.clone()
+                entity = self._entity_specs[path]
+                mount = spec.rigid_mount
+                for environment in environment_indices:
+                    parent, linear, omega = self._soft_mount_parent_state(mount, environment)
+                    pose = _compose_pose(parent, entity.pose)
+                    points = tuple(
+                        _transform_position(cast(Vector3, tuple(row)), pose.position, pose.orientation_xyzw)
+                        for row in spec.rest_positions_m.rows()
+                    )
+                    tensor = self._m.torch.tensor(points, device=state.device, dtype=state.dtype)
+                    tensor += self._origins[environment]
+                    state[environment, :, :3] = tensor
+                    mounted_velocities = []
+                    for point, local in zip(points, spec.initial_velocities().rows(), strict=True):
+                        relative = tuple(point[i] - parent.position[i] for i in range(3))
+                        spin = (
+                            omega[1] * relative[2] - omega[2] * relative[1],
+                            omega[2] * relative[0] - omega[0] * relative[2],
+                            omega[0] * relative[1] - omega[1] * relative[0],
+                        )
+                        rotated = _rotate_xyzw(cast(Vector3, tuple(local)), pose.orientation_xyzw)
+                        mounted_velocities.append(tuple(rotated[i] + linear[i] + spin[i] for i in range(3)))
+                    state[environment, :, 3:] = self._m.torch.tensor(
+                        mounted_velocities, device=state.device, dtype=state.dtype
+                    )
+                    if target is not None:
+                        target[environment, :, :3] = tensor
             asset.write_nodal_state_to_sim_index(state[env_ids], env_ids=env_ids)
             if target is not None:
                 asset.write_nodal_kinematic_target_to_sim_index(target[env_ids], env_ids=env_ids)
@@ -3348,15 +3480,22 @@ class IsaacLabNativeWorld:
                 fluid_set = sets[environment]
                 fluid_set.points.GetPointsAttr().Set(self._m.Vt.Vec3fArray(fluid_set.initial_positions))
                 fluid_set.points.GetVelocitiesAttr().Set(self._m.Vt.Vec3fArray(fluid_set.initial_velocities))
-                colors = (fluid_spec.initial_particle_colors_rgba.nested()
-                          if fluid_spec.initial_particle_colors_rgba is not None
-                          else (fluid_spec.color_rgba or (0.1, 0.45, 1.0, 1.0),) * fluid_spec.particle_count)
+                colors = (
+                    fluid_spec.initial_particle_colors_rgba.nested()
+                    if fluid_spec.initial_particle_colors_rgba is not None
+                    else (fluid_spec.color_rgba or (0.1, 0.45, 1.0, 1.0),) * fluid_spec.particle_count
+                )
                 self._write_particle_colors(fluid_set.points, colors)
                 if self._config.fluid_render_mode == "particles":
                     self._sync_particle_visual(fluid_set.points, fluid_spec.particle_radius_m)
         for camera in self._cameras.values():
             camera.reset(env_ids=env_ids)
         for path, poses in getattr(self, "_initial_entity_prim_poses", {}).items():
+            if path in self._deformables:
+                # Tensor-backed soft bodies were reset through nodal state above.
+                # Reauthoring their root transform recooks native meshes and
+                # invalidates all live PhysX tensor views, including the robot.
+                continue
             for environment in environment_indices:
                 if not self._entity_prim_is_physical_root(path, environment):
                     self._write_entity_prim_pose(path, environment, poses[environment])
@@ -3374,7 +3513,10 @@ class IsaacLabNativeWorld:
         self._invalidate_render()
 
     def configure_render_quality(
-        self, *, enable_global_illumination: bool, enable_ambient_occlusion: bool,
+        self,
+        *,
+        enable_global_illumination: bool,
+        enable_ambient_occlusion: bool,
     ) -> tuple[bool, bool]:
         if self._closed or self._sim is None:
             raise RuntimeError("render quality requires an open world")
@@ -3480,9 +3622,7 @@ class IsaacLabNativeWorld:
                 "degree-of-freedom",
             )
             joint_shape = (len(environments), len(degrees))
-            native_degrees = tuple(
-                self._joint_maps[articulation_update.path][index] for index in degrees
-            )
+            native_degrees = tuple(self._joint_maps[articulation_update.path][index] for index in degrees)
             root_values = (
                 articulation_update.root_positions_m,
                 articulation_update.root_orientations_xyzw,
@@ -3546,9 +3686,7 @@ class IsaacLabNativeWorld:
                         dim=1,
                     )
                     root_norms = torch.linalg.vector_norm(root_orientations, dim=1)
-                    if not bool(
-                        torch.allclose(root_norms, torch.ones_like(root_norms), rtol=0.0, atol=1.0e-6)
-                    ):
+                    if not bool(torch.allclose(root_norms, torch.ones_like(root_norms), rtol=0.0, atol=1.0e-6)):
                         raise ValueError("native render articulation root orientations must be unit quaternions")
                 articulation_stages.append(
                     (
@@ -3617,9 +3755,7 @@ class IsaacLabNativeWorld:
                         dim=1,
                     )
                     root_norms = torch.linalg.vector_norm(root_orientations, dim=1)
-                    if not bool(
-                        torch.allclose(root_norms, torch.ones_like(root_norms), rtol=0.0, atol=1.0e-6)
-                    ):
+                    if not bool(torch.allclose(root_norms, torch.ones_like(root_norms), rtol=0.0, atol=1.0e-6)):
                         raise ValueError("native render articulation root orientations must be unit quaternions")
                 articulation_stages.append(
                     (
@@ -3703,9 +3839,7 @@ class IsaacLabNativeWorld:
             environments = selection(fluid_update.environment_indices, environment_count, "environment")
             particle_count = len(sets[0].initial_positions)
             range_count = (
-                fluid_update.positions_m.shape[1]
-                if isinstance(fluid_update.positions_m, PackedFloat32Array)
-                else 0
+                fluid_update.positions_m.shape[1] if isinstance(fluid_update.positions_m, PackedFloat32Array) else 0
             )
             if not isinstance(fluid_update.positions_m, PackedFloat32Array):
                 try:
@@ -3726,8 +3860,11 @@ class IsaacLabNativeWorld:
                 if fluid_update.velocities_m_s is None
                 else tensor_payload(fluid_update.velocities_m_s, fluid_shape)
             )
-            colors = None if fluid_update.colors_rgba is None else tensor_payload(
-                fluid_update.colors_rgba, (len(environments), range_count, 4))
+            colors = (
+                None
+                if fluid_update.colors_rgba is None
+                else tensor_payload(fluid_update.colors_rgba, (len(environments), range_count, 4))
+            )
             if colors is not None and not bool(((colors >= 0) & (colors <= 1)).all().item()):
                 raise ValueError("particle colors must be linear RGBA in [0,1]")
             first = fluid_update.first_particle_index
@@ -3842,9 +3979,7 @@ class IsaacLabNativeWorld:
         # physics step and therefore preserves the render-only Replay contract.
         if any(kind == "usd" for kind, *_ in articulation_stages):
             self._usd_simulation_view().update_articulations_kinematic()
-        if any(kind == "usd" for kind, *_ in articulation_stages) or any(
-            kind == "usd" for kind, *_ in rigid_stages
-        ):
+        if any(kind == "usd" for kind, *_ in articulation_stages) or any(kind == "usd" for kind, *_ in rigid_stages):
             # RTX reads this profile from USD rather than Fabric.  The tensor
             # setters above mutate PhysX state only; publish those already-computed
             # transforms to USD without simulate()/fetch_results().
@@ -3970,21 +4105,32 @@ class IsaacLabNativeWorld:
         # authoritative CPU commands before allocating or launching device work.
         if mode is CommandMode.POSITION:
             write_position = gains_changed or not versions.matches(
-                "position", targets, environment_indices, native_joint_ids,
+                "position",
+                targets,
+                environment_indices,
+                native_joint_ids,
             )
             write_velocity = gains_changed or not versions.matches(
-                "velocity", zero_targets, environment_indices, native_joint_ids,
+                "velocity",
+                zero_targets,
+                environment_indices,
+                native_joint_ids,
             )
             # A completed position command also cleared feed-forward effort.
             write_effort = write_velocity
         elif mode is CommandMode.VELOCITY:
             write_position = False
             write_velocity = gains_changed or not versions.matches(
-                "velocity", targets, environment_indices, native_joint_ids,
+                "velocity",
+                targets,
+                environment_indices,
+                native_joint_ids,
             )
             # Unknown/reset axes must establish the zero-effort input again.
             write_effort = gains_changed or not versions.contains(
-                "velocity", environment_indices, native_joint_ids,
+                "velocity",
+                environment_indices,
+                native_joint_ids,
             )
         else:
             write_position = write_velocity = False
@@ -4087,9 +4233,13 @@ class IsaacLabNativeWorld:
             try:
                 parameters = inspect.signature(asset.write_data_to_sim).parameters
                 supported = all(
-                    name in parameters and parameters[name].kind in (
-                        inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    ) for name in ("position_target_version", "velocity_target_version")
+                    name in parameters
+                    and parameters[name].kind
+                    in (
+                        inspect.Parameter.KEYWORD_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                    for name in ("position_target_version", "velocity_target_version")
                 )
             except (TypeError, ValueError):
                 supported = False
@@ -4320,8 +4470,13 @@ class IsaacLabNativeWorld:
             requested = [indices[name] for name in selected]
             # One contiguous body needs no gather kernel or index tensor. Full
             # natural-order coverage likewise reuses the device view directly.
-            selection = (slice(requested[0], requested[0] + 1) if len(requested) == 1
-                         else slice(None) if requested == list(range(len(names))) else requested)
+            selection = (
+                slice(requested[0], requested[0] + 1)
+                if len(requested) == 1
+                else slice(None)
+                if requested == list(range(len(names)))
+                else requested
+            )
             poses = asset.data.body_link_pose_w.torch[environment_index][selection].detach().cpu().tolist()
             velocities = asset.data.body_link_vel_w.torch[environment_index][selection].detach().cpu().tolist()
             asset_rows[path] = dict(zip(selected, zip(poses, velocities, strict=True), strict=True))
@@ -4649,14 +4804,15 @@ class IsaacLabNativeWorld:
                 if (
                     type(raw_modes) is not list
                     or len(raw_modes) != len(expected_modes)
-                    or any(type(row) is not list or len(row) != len(expected_modes[index])
-                           for index, row in enumerate(raw_modes))
+                    or any(
+                        type(row) is not list or len(row) != len(expected_modes[index])
+                        for index, row in enumerate(raw_modes)
+                    )
                 ):
                     raise ValueError("checkpoint articulation control modes are invalid")
                 try:
                     staged_record["control_modes"] = [
-                        [None if value is None else CommandMode(value) for value in row]
-                        for row in raw_modes
+                        [None if value is None else CommandMode(value) for value in row] for row in raw_modes
                     ]
                 except (TypeError, ValueError) as error:
                     raise ValueError("checkpoint articulation control modes are invalid") from error
@@ -5071,9 +5227,7 @@ class IsaacLabNativeWorld:
         roots = self._composite_scene_roots.get(binding.container_path)
         if roots is None or environment_index >= len(roots):
             raise KeyError(f"embedded entity container for {path.value!r} is unavailable")
-        relative_paths = tuple(
-            item.relative_prim_path for item in (*binding.link_prims, *binding.joint_prims)
-        )
+        relative_paths = tuple(item.relative_prim_path for item in (*binding.link_prims, *binding.joint_prims))
         parts = tuple(relative.split("/") for relative in relative_paths)
         common: list[str] = []
         for values in zip(*parts, strict=False):
@@ -5146,9 +5300,7 @@ class IsaacLabNativeWorld:
         else:
             local = desired
         translation = local.ExtractTranslation()
-        orientation_xyzw = _normalized_quaternion_xyzw(
-            local.RemoveScaleShear().ExtractRotationQuat()
-        )
+        orientation_xyzw = _normalized_quaternion_xyzw(local.RemoveScaleShear().ExtractRotationQuat())
         translate_attribute = prim.GetAttribute("xformOp:translate")
         orient_attribute = prim.GetAttribute("xformOp:orient")
         if not translate_attribute or not orient_attribute:
@@ -5186,9 +5338,7 @@ class IsaacLabNativeWorld:
                 for environment in range(self._spec.environments.count)
             )
             rigid_state = (
-                self.read_rigid_body(path)
-                if entity.kind is EntityKind.RIGID_BODY and any(physical_root)
-                else None
+                self.read_rigid_body(path) if entity.kind is EntityKind.RIGID_BODY and any(physical_root) else None
             )
             row: list[NativeEntityPrimState] = []
             for environment in range(self._spec.environments.count):
@@ -5375,9 +5525,7 @@ class IsaacLabNativeWorld:
                 relative_path = binding.root_body_prim_path
             else:
                 matches = tuple(
-                    item.relative_prim_path
-                    for item in binding.link_prims
-                    if item.logical_name == link_name
+                    item.relative_prim_path for item in binding.link_prims if item.logical_name == link_name
                 )
                 if len(matches) != 1:
                     raise ValueError(
@@ -5463,12 +5611,8 @@ class IsaacLabNativeWorld:
             raise ValueError("attachment endpoints resolve to the same physical body")
         self._pin_physics_activation(parent_path)
         self._pin_physics_activation(child_path)
-        parent_endpoint_pose = self._attachment_endpoint_pose(
-            parent_path, parent_link_name, environment_index
-        )
-        child_endpoint_pose = self._attachment_endpoint_pose(
-            child_path, child_link_name, environment_index
-        )
+        parent_endpoint_pose = self._attachment_endpoint_pose(parent_path, parent_link_name, environment_index)
+        child_endpoint_pose = self._attachment_endpoint_pose(child_path, child_link_name, environment_index)
         relative, parent_body_T_joint, child_body_T_joint = _attachment_joint_frames(
             parent_endpoint_pose,
             child_endpoint_pose,
@@ -5611,16 +5755,22 @@ class IsaacLabNativeWorld:
 
     def capture_appearance(self):
         from .native_appearance import capture
+
         return capture(self)
 
     def apply_appearance(self, snapshot):
         from .native_appearance import apply
+
         return apply(self, snapshot)
 
     def read_render_appearance(self):
         from .appearance import read_appearance
-        return read_appearance(self._m.sim_utils.get_current_stage(), self._m.carb.settings.get_settings(),
-                               getattr(self, "_appearance_keys", ()))
+
+        return read_appearance(
+            self._m.sim_utils.get_current_stage(),
+            self._m.carb.settings.get_settings(),
+            getattr(self, "_appearance_keys", ()),
+        )
 
     def _sync_particle_visual(self, points: Any, radius: float) -> None:
         """Render native particle positions through standard USD sphere instances.
@@ -5638,7 +5788,8 @@ class IsaacLabNativeWorld:
         palette = list(dict.fromkeys(colors))
         lookup = {color: index for index, color in enumerate(palette)}
         roughness, metallic, ambient = getattr(self, "_particle_appearance", {}).get(
-            str(points.GetPath()), (1.0, 0.0, (0.0, 0.0, 0.0)))
+            str(points.GetPath()), (1.0, 0.0, (0.0, 0.0, 0.0))
+        )
         prototypes = []
         signature = (tuple(palette), roughness, metallic, ambient, radius)
         signatures = getattr(self, "_particle_visual_signatures", {})
@@ -5656,7 +5807,8 @@ class IsaacLabNativeWorld:
                 shader.CreateInput("roughness", types.Float).Set(roughness)
                 shader.CreateInput("metallic", types.Float).Set(metallic)
                 shader.CreateInput("emissiveColor", types.Color3f).Set(
-                    self._m.Gf.Vec3f(*(rgba[i] * ambient[i] / 1133.6 for i in range(3))))
+                    self._m.Gf.Vec3f(*(rgba[i] * ambient[i] / 1133.6 for i in range(3)))
+                )
                 material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
                 shade.MaterialBindingAPI.Apply(sphere.GetPrim()).Bind(material)
             prototypes.append(self._m.Sdf.Path(proto_path))
@@ -5669,9 +5821,11 @@ class IsaacLabNativeWorld:
 
     def _write_particle_colors(self, points: Any, colors: Any) -> None:
         points.CreateDisplayColorPrimvar(self._m.UsdGeom.Tokens.vertex).Set(
-            self._m.Vt.Vec3fArray([tuple(float(v) for v in row[:3]) for row in colors]))
+            self._m.Vt.Vec3fArray([tuple(float(v) for v in row[:3]) for row in colors])
+        )
         points.CreateDisplayOpacityPrimvar(self._m.UsdGeom.Tokens.vertex).Set(
-            self._m.Vt.FloatArray([float(row[3]) for row in colors]))
+            self._m.Vt.FloatArray([float(row[3]) for row in colors])
+        )
 
     def _read_particle_color_rows(self, points: Any) -> tuple:
         count = len(points.GetPointsAttr().Get())
@@ -5679,8 +5833,11 @@ class IsaacLabNativeWorld:
         opacity = points.GetDisplayOpacityPrimvar().ComputeFlattened()
         if not colors or not opacity or len(colors) not in (1, count) or len(opacity) not in (1, count):
             raise ValueError("particle USD colors/opacity are missing or malformed")
-        return tuple(tuple(float(v) for v in colors[0 if len(colors) == 1 else i])
-                     + (float(opacity[0 if len(opacity) == 1 else i]),) for i in range(count))
+        return tuple(
+            tuple(float(v) for v in colors[0 if len(colors) == 1 else i])
+            + (float(opacity[0 if len(opacity) == 1 else i]),)
+            for i in range(count)
+        )
 
     def read_particle_colors(self, path: EntityPath) -> object:
         rows = []
@@ -5696,8 +5853,10 @@ class IsaacLabNativeWorld:
             for prototype in instancer.GetPrototypesRel().GetTargets():
                 material, _ = self._m.UsdShade.MaterialBindingAPI(stage.GetPrimAtPath(prototype)).ComputeBoundMaterial()
                 shader = self._m.UsdShade.Shader.Get(stage, str(material.GetPath()) + "/surface")
-                palette.append(tuple(float(v) for v in shader.GetInput("diffuseColor").Get())
-                               + (float(shader.GetInput("opacity").Get()),))
+                palette.append(
+                    tuple(float(v) for v in shader.GetInput("diffuseColor").Get())
+                    + (float(shader.GetInput("opacity").Get()),)
+                )
             rows.append(tuple(palette[int(i)] for i in instancer.GetProtoIndicesAttr().Get()))
         return tuple(rows)
 
@@ -5824,9 +5983,7 @@ class IsaacLabNativeWorld:
         if all(
             entity.camera is not None and entity.camera.modalities == (CameraModality.RGB,) for _, entity in targets
         ):
-            rgb_tensors = tuple(
-                self._camera_channel_output(camera, "rgb") for camera, _ in targets
-            )
+            rgb_tensors = tuple(self._camera_channel_output(camera, "rgb") for camera, _ in targets)
             packed = _pack_compatible_rgb_tensors(self._m.torch, rgb_tensors, self._rgb_host_staging)
             if packed is not None:
                 shape, payloads = packed
@@ -5857,8 +6014,7 @@ class IsaacLabNativeWorld:
                 raise KeyError(f"native camera does not exist: {path.value}")
             targets.append((camera, entity))
         if not targets or not all(
-            entity.camera is not None and entity.camera.modalities == (CameraModality.RGB,)
-            for _, entity in targets
+            entity.camera is not None and entity.camera.modalities == (CameraModality.RGB,) for _, entity in targets
         ):
             return None
 
@@ -5867,10 +6023,7 @@ class IsaacLabNativeWorld:
         for camera, _ in targets:
             if not getattr(self, "_camera_exclusion_groups", None):
                 camera.update(0.0, force_recompute=True)
-        tensors = tuple(
-            self._camera_channel_output(camera, "rgb")
-            for camera, _ in targets
-        )
+        tensors = tuple(self._camera_channel_output(camera, "rgb") for camera, _ in targets)
         devices = tuple(getattr(tensor, "device", None) for tensor in tensors)
         if any(getattr(device, "type", None) != "cuda" for device in devices):
             return None
@@ -6007,8 +6160,7 @@ class IsaacLabNativeWorld:
         return NativeCameraCalibration(
             resolution_px=(width, height),
             intrinsic_matrix=(
-                optics[0] if optics is not None
-                else tuple(float(value) for value in matrices[0].reshape(-1).tolist())
+                optics[0] if optics is not None else tuple(float(value) for value in matrices[0].reshape(-1).tolist())
             ),
             projection=str(sensor_prim.GetProjectionAttr().Get()),
             focal_length=float(sensor_prim.GetFocalLengthAttr().Get()),
@@ -6105,6 +6257,74 @@ class IsaacLabNativeWorld:
             for environment in values
         )
 
+    def _soft_mount_parent_state(self, mount: Any, environment: int) -> tuple[Pose, Vector3, Vector3]:
+        """Physical parent origin twist, including COM-to-origin conversion for raw views."""
+        raw_view = None
+        if self._entity_specs[mount.parent_path].kind is EntityKind.ARTICULATION:
+            state = self.read_selected_kinematics(
+                (KinematicTarget("soft-mount", mount.parent_path, mount.parent_link_name),), environment
+            )[0]
+            pose = Pose(state.position_m, state.orientation_xyzw)
+            linear, omega = state.linear_velocity_m_s, state.angular_velocity_rad_s
+            if mount.parent_path in getattr(self, "_usd_articulation_views", {}):
+                raw_view = self._selected_link_views[(mount.parent_path, mount.parent_link_name)]
+        else:
+            positions, rotations, velocities, angular = self.read_rigid_body(mount.parent_path)
+            pose = Pose(
+                cast(Vector3, positions[environment]), cast(tuple[float, float, float, float], rotations[environment])
+            )
+            linear, omega = cast(Vector3, velocities[environment]), cast(Vector3, angular[environment])
+            raw_view = getattr(self, "_usd_rigid_views", {}).get(mount.parent_path)
+        if raw_view is not None:
+            local = raw_view.get_coms()[environment, :3].detach().cpu().tolist()
+            offset = _rotate_xyzw(cast(Vector3, tuple(local)), pose.orientation_xyzw)
+            spin = (
+                omega[1] * offset[2] - omega[2] * offset[1],
+                omega[2] * offset[0] - omega[0] * offset[2],
+                omega[0] * offset[1] - omega[1] * offset[0],
+            )
+            linear = cast(Vector3, tuple(linear[i] - spin[i] for i in range(3)))
+        if not all(math.isfinite(v) for v in (*linear, *omega)):
+            raise ValueError("mounted deformable parent twist must be finite")
+        return pose, linear, omega
+
+    def _update_soft_mount_boundaries(self) -> None:
+        """Prescribed moving FEM boundaries; no reaction coupling to the parent."""
+        for path, asset in self._deformables.items():
+            entity = self._entity_specs[path]
+            spec = entity.deformable
+            if spec is None or spec.rigid_mount is None or spec.rigid_mount.coupling != "kinematic_boundary":
+                continue
+            assert self._origins is not None
+            mount = spec.rigid_mount
+            target = asset.data.nodal_kinematic_target.torch.clone()
+            indices = list(mount.node_indices)
+            rest = spec.rest_positions_m.rows()
+            for environment in range(self._spec.environments.count):
+                parent, linear, omega = self._soft_mount_parent_state(mount, environment)
+                position, rotation = parent.position, parent.orientation_xyzw
+                # Targets are consumed at the end of the upcoming native step.
+                # First-order twist prediction avoids a full-step boundary lag.
+                dt = self._native_dt
+                speed = math.sqrt(sum(v * v for v in omega))
+                if speed > 0:
+                    scale = math.sin(speed * dt / 2) / speed
+                    delta = (omega[0] * scale, omega[1] * scale, omega[2] * scale, math.cos(speed * dt / 2))
+                    rotation = _multiply_xyzw(delta, rotation)
+                parent = Pose(
+                    cast(Vector3, tuple(p + v * dt for p, v in zip(position, linear, strict=True))),
+                    rotation,
+                )
+                pose = _compose_pose(parent, entity.pose)
+                points = tuple(
+                    _transform_position(cast(Vector3, tuple(rest[i])), pose.position, pose.orientation_xyzw)
+                    for i in indices
+                )
+                tensor = self._m.torch.tensor(points, device=target.device, dtype=target.dtype)
+                target[environment, indices, :3] = tensor + self._origins[environment]
+                target[environment, indices, 3] = 0.0
+            asset.write_nodal_kinematic_target_to_sim_index(target)
+
     def step(self, count: int) -> None:
         assert self._sim is not None
         for _ in range(count):
@@ -6120,6 +6340,7 @@ class IsaacLabNativeWorld:
                     self._write_articulation_data(path, asset)
                 for asset in self._rigids.values():
                     asset.write_data_to_sim()
+                self._update_soft_mount_boundaries()
                 for asset in self._deformables.values():
                     asset.write_data_to_sim()
                 native_step_index = self._step_index * self._spec.physics.substeps + substep_index + 1

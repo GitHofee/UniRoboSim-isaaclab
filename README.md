@@ -321,3 +321,53 @@ it does not reinterpret authored angular limits or relax physical limits. Both m
 Isaac Lab articulations and raw tensor views use the same validation. Two infinite
 endpoints represent an unbounded joint; one-sided infinity, NaN, reversed bounds,
 and inconsistent environment limits fail admission.
+
+### Mounted elastic volume pads (experimental)
+
+Volume deformables can declare elastic material and explicit backing-node mounts.
+The backend authors native `OmniPhysicsVtxXformAttachment` solver constraints and
+physics material schemas before initialization, using 64 position iterations for
+mounted bodies. Reset places
+nodes in the measured parent-link frame without reauthoring live soft mesh roots.
+The render-only profile does not advertise physical mounting/material support.
+This release validates two-environment build/step/partial-reset/close smokes with
+rotated parents and nonzero free-node initial velocity. G2 grasp success, a broad
+material-load matrix, and quantified parent reaction are not certified by these smokes.
+Soft bodies remain unsupported by planning-scene export; physics-only replay does not certify planning.
+
+Explicit `kinematic_boundary` coupling instead updates selected backing targets
+at each native substep; it leaves free nodes and the grasped object under physics.
+It is a prescribed moving boundary with no parent reaction, not a fallback from
+failed solver mounting. Solver and boundary requests have separate required capabilities.
+
+Structural pads inherit an explicitly disabled articulation self-collision policy;
+otherwise only their own backing body is filtered. Contacts with external objects
+remain enabled. Embedded composite-scene mounting parents are currently rejected.
+PhysX currently uses dynamic friction for deformables; authored static friction has
+no solver effect. Kinematic boundaries predict parent twist over the upcoming
+native substep to reduce boundary lag.
+
+When surface triangles are omitted, volume boundaries are generated outward from
+actual rest-element orientation, including cavity walls; zero-volume elements
+are rejected.
+
+Explicit deformable contact and rest offsets are authored on the unique native
+collision mesh before initialization: the volume TetMesh or surface Mesh carrying
+`PhysicsCollisionAPI`, including a simulation mesh created by the SDK. They are
+not body-root properties. Missing, ambiguous or topology-mismatched collision
+meshes fail admission. A `None` contact offset preserves the SDK's collision
+defaults without adding or overriding offset attributes. This changes contact
+generation for explicit offsets; previous grasp results require fresh native
+validation and do not establish FEM contact-pair observability.
+
+
+Requires Core >=0.10.11. Physical material, per-mode mount and explicit collision-offset
+requests are capability-gated; render-only rejects them before native initialization.
+Mounted initial node velocities are entity-local relative velocities rotated by
+parent×entity orientation, plus the parent physical-origin linear velocity and
+angular-velocity cross node lever arm. Reset uses the same rule after restoring and
+refreshing parents; selected backing nodes require zero relative initial velocity.
+`elasticity_damping` maps verbatim to `physxDeformableMaterial:elasticityDamping`;
+the installed schema does not document a unit. It is not `linear_damping_per_s`.
+Initial authoring failures fail the whole World build and clean the newly created
+soft-body roots; partially authored bodies must never continue simulation.

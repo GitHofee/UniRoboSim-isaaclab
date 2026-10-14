@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.26
+
+- Add capability-gated soft material/mount/offset support with frame-correct reset, explicit authoring failures and native lifecycle smokes.
+- Publish effective native joint-position limits, preserving SI precision and rejecting malformed numeric/DOF input.
+- Require Core 0.10.11; retain render-only and soft-planning admission boundaries.
+
 ## 0.10.22
 
 - Enable external forces at every TGS position iteration for all native worlds, aligning gravity with drive and constraint substeps to reduce steady-position/nonzero-velocity discrepancies.

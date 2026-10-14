@@ -279,6 +279,23 @@ CAPABILITIES = CapabilitySet(
             FrozenMap({"topology": "tetrahedra", "point_count": "fixed"}),
         ),
         CapabilityDeclaration(
+            CapabilityId("physics.deformable.rigid-mount@1"),
+            FrozenMap({"topology": "volume"}),
+            limitations=(
+                "mounts are permanent; selected nodes are bound in the parent link frame",
+                "kinematic boundaries do not transmit reaction forces to the parent",
+                "embedded composite-scene parents are unsupported",
+                "direct solver coupling to articulation links is experimental",
+            ),
+        ),
+        CapabilityDeclaration(CapabilityId("physics.deformable.rigid-mount.solver@1")),
+        CapabilityDeclaration(CapabilityId("physics.deformable.rigid-mount.kinematic-boundary@1")),
+        CapabilityDeclaration(CapabilityId("physics.deformable.contact-offsets@1")),
+        CapabilityDeclaration(
+            CapabilityId("physics.deformable.elastic-material@1"),
+            limitations=("PhysX supports dynamic friction; static friction is authored but has no solver effect",),
+        ),
+        CapabilityDeclaration(
             CapabilityId("physics.deformable.self-collision@1"),
             FrozenMap({"physics": "physx"}),
         ),
@@ -507,6 +524,11 @@ def descriptor_for_config(config: object) -> ProviderDescriptor:
                     CHECKPOINT_CAPABILITY_ID,
                     CapabilityId("physics.deformable.self-collision@1"),
                     CapabilityId("control.deformable.points@1"),
+                    CapabilityId("physics.deformable.rigid-mount@1"),
+                    CapabilityId("physics.deformable.rigid-mount.solver@1"),
+                    CapabilityId("physics.deformable.rigid-mount.kinematic-boundary@1"),
+                    CapabilityId("physics.deformable.contact-offsets@1"),
+                    CapabilityId("physics.deformable.elastic-material@1"),
                 }
             )
             declarations = tuple(

@@ -273,3 +273,26 @@ CPU 目标去重还要求 SDK 提供可选只读 `target_state_revision`。公�
 实际值，包括角度转换后的浮点精度；不重新解释资产角度，也不放宽物理限位。
 受管 Isaac Lab articulation 与原生 tensor view 使用相同校验。两端无限表示无界；
 单侧无限、NaN、上下界颠倒或环境间限位不一致会拒绝准入。
+
+### 弹性体积软体与永久安装（实验性）
+
+0.10.26 要求 Core >=0.10.11。弹性材料、solver 双向安装、kinematic_boundary
+单向运动边界及显式 contact/rest offsets 分别经过能力门禁；render-only 不声明
+这些物理能力。不能在 solver 失败后切换为单向边界。实体声明顺序不影响父体解析。
+
+安装只固定选定 backing 节点，自由节点保留原生 FEM。新安装软体使用64个位置
+迭代，普通软体仍为16；不改变 World substeps。碰撞过滤仅排除自身 backing，
+只有父机器人明确关闭 self-collision 时才继承整机过滤；外部接触保留。
+
+初速度是软体局部相对速度，经父体和实体组合旋转，加上父体物理原点线速度
+与角速度叉乘节点力臂。reset 先恢复父体并刷新链接，再按同一规则恢复节点；
+backing 节点相对初速度必须为零。部分环境 reset 不修改其他环境，不重写 live
+软体根 Xform，避免重新 cooking 和 tensor view 失效。
+
+显式 offsets 只写实际唯一的、拓扑匹配并带 CollisionAPI 的碰撞 Mesh/TetMesh，
+默认不覆盖 SDK 设置。材料 elasticity_damping 逐值映射到原生同名属性，
+官方 schema 未给出单位，不等同 linear_damping_per_s。PhysX 软体只实际使用
+动摩擦，静摩擦字段虽 author 但不宣称有求解效果。软体 planning export 仍拒绝。
+
+本次原生验收是两种模式各2环境、20步、部分 reset、关闭，以及旋转父体/非零
+自由节点初速度；不是完整G2抓取、多材料载荷或父体反作用力矩阵验收。

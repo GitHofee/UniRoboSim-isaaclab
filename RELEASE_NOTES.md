@@ -1,3 +1,18 @@
+# UniRoboSim Isaac Lab 0.10.26
+
+Requires UniRoboSim >=0.10.11,<0.11. Adds capability-gated elastic materials,
+permanent solver mounts, prescribed kinematic boundaries, and explicit deformable
+collision offsets on the actual collision mesh. Preserves the previously unpublished
+native effective joint-position limit fix and strengthens malformed DOF/numeric
+admission. Existing SDK SI precision is retained in catalog and binding descriptors.
+
+Two-mode, two-environment native create/step/partial-reset/close smokes pass with
+rotated parents and nonzero free-node initial velocity. This is not complete G2
+contact/load/reaction certification. See scripts/soft_mount_conformance.py.
+No SDK, Mission/cuRobo, vendor asset, or global solver timestep was modified.
+
+## Previous release
+
 # UniRoboSim Isaac Lab 0.10.25
 
 Adds immutable appearance capture/restore contracts for FSR materials, directional lighting, environment, stable visual bindings and portable opaque base-color PNG textures with explicit UV/topology validation. Includes prerequisite deformable render-state/topology and exact float32 per-particle RGBA contracts. Recorded render-state application does not advance physics.

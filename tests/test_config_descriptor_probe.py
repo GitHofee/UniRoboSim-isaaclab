@@ -35,7 +35,7 @@ def test_public_identity_and_protocol() -> None:
     provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(device="cpu"))
     assert isinstance(provider, Provider)
     assert provider.descriptor is DESCRIPTOR
-    assert unirobosim_isaaclab.__version__ == "0.10.25"
+    assert unirobosim_isaaclab.__version__ == "0.10.26"
     assert DESCRIPTOR.version == unirobosim_isaaclab.__version__
     assert DESCRIPTOR.provider_id == "nvidia.isaaclab"
     assert DESCRIPTOR.contract_version == "v0alpha6"
@@ -126,6 +126,13 @@ def test_valid_config(device: str) -> None:
     assert config.anti_aliasing == "fxaa"
 
 
+def test_render_only_does_not_advertise_physical_soft_mounts() -> None:
+    provider = unirobosim_isaaclab.create_provider(IsaacLabAdapterConfig(deformable_mode="render_only"))
+    for name in ("physics.deformable.rigid-mount@1", "physics.deformable.elastic-material@1"):
+        assert CAPABILITIES.get(CapabilityId(name)) is not None
+        assert provider.descriptor.capabilities.get(CapabilityId(name)) is None
+
+
 def test_fluid_surface_color_is_normalized_and_bounded() -> None:
     assert IsaacLabAdapterConfig(fluid_surface_color_rgb=(1, 0.5, 0)).fluid_surface_color_rgb == (1.0, 0.5, 0.0)
     with pytest.raises(ValidationError, match="fluid_surface_color_rgb"):
@@ -159,9 +166,7 @@ def test_gpu_partition_auto_selection_avoids_small_world_partition_overhead() ->
     replicated = SimpleNamespace(environments=SimpleNamespace(count=2), entities=())
     many_rigids = SimpleNamespace(
         environments=SimpleNamespace(count=1),
-        entities=tuple(
-            SimpleNamespace(kind=EntityKind.RIGID_BODY, joint_names=()) for _ in range(17)
-        ),
+        entities=tuple(SimpleNamespace(kind=EntityKind.RIGID_BODY, joint_names=()) for _ in range(17)),
     )
     fluid = SimpleNamespace(
         environments=SimpleNamespace(count=1),
@@ -173,10 +178,7 @@ def test_gpu_partition_auto_selection_avoids_small_world_partition_overhead() ->
     assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), replicated) == 8
     assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), many_rigids) == 8
     assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(), fluid) == 8
-    assert (
-        _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(gpu_max_num_partitions=4), small)
-        == 4
-    )
+    assert _resolved_gpu_max_num_partitions(IsaacLabAdapterConfig(gpu_max_num_partitions=4), small) == 4
 
 
 def test_default_worker_startup_budget_covers_cold_kit_without_unbounded_wait() -> None:
@@ -565,7 +567,10 @@ def test_native_pure_conversions() -> None:
     assert _native_name(_path) == _native_name(_path)
     rotated = _rotate_xyzw((1.0, 0.0, 0.0), (0.0, 0.0, 2**-0.5, 2**-0.5))
     assert rotated == pytest.approx((0.0, 1.0, 0.0), abs=1e-12)
-    faces = _surface_from_tetrahedra(((0, 1, 2, 3), (0, 2, 1, 4)))
+    faces = _surface_from_tetrahedra(
+        ((0, 1, 2, 3), (0, 2, 1, 4)),
+        ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, -1.0)),
+    )
     assert len(faces) == 6
 
 

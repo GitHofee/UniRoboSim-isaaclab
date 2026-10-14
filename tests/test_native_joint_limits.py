@@ -167,3 +167,113 @@ def test_position_layout_and_environment_mismatch_rejected(raw, change):
         rows[1][0][1] = 0.01
     with pytest.raises(NativePlanningError, match="catalog_invalid"):
         effective_joint_drive_limits(world, spec, binding, (joint,))
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("bad", [True, False, "0", None, 10**1000])
+def test_position_endpoint_type_and_overflow_rejected(raw, bad):
+    world, spec, binding, joint, _, _ = _fixture(raw)
+    world.position_limits.values[0][0][0] = bad
+    with pytest.raises(NativePlanningError, match="catalog_invalid"):
+        effective_joint_drive_limits(world, spec, binding, (joint,))
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("case", ["nonarticulation", "fixed", "empty"])
+def test_nonmovable_descriptor_is_preserved(raw, case):
+    world, spec, binding, joint, _, _ = _fixture(raw)
+    if case == "nonarticulation":
+        spec.kind = EntityKind.RIGID_BODY
+    elif case == "fixed":
+        binding.joint_bindings[0].movable_name = None
+    else:
+        binding.joint_bindings = ()
+    original = (joint,)
+    assert effective_joint_drive_limits(world, spec, binding, original) is original
+    assert world.position_limits.reads == 0
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("case", ["duplicate_names", "missing_name", "out_of_range"])
+def test_native_dof_identity_rejects_ambiguity(raw, case):
+    world, spec, binding, joint, _, _ = _fixture(raw)
+    if raw:
+        if case == "duplicate_names":
+            spec.joint_names = ("slide", "slide")
+            world._joint_maps[spec.path] = (0, 1)
+        elif case == "missing_name":
+            spec.joint_names = ("other",)
+        else:
+            world._joint_maps[spec.path] = (7,)
+    else:
+        world._articulations[spec.path].joint_names = {
+            "duplicate_names": ("slide", "slide"),
+            "missing_name": ("other", "unused"),
+            "out_of_range": ("other", "unused", "slide"),
+        }[case]
+    with pytest.raises(NativePlanningError, match="catalog_invalid"):
+        effective_joint_drive_limits(world, spec, binding, (joint,))
+
+
+@pytest.mark.parametrize("mapping", [None, (), (0, 1), (True,), (0, 0)])
+def test_raw_mapping_shape_type_and_duplicates_rejected(mapping):
+    world, spec, binding, joint, _, _ = _fixture(True)
+    world._joint_maps[spec.path] = mapping
+    if mapping == (0, 0):
+        spec.joint_names = ("slide", "other")
+    with pytest.raises(NativePlanningError, match="catalog_invalid"):
+        effective_joint_drive_limits(world, spec, binding, (joint,))
+
+
+def test_catalog_admission_and_binding_share_effective_descriptor():
+    from unirobosim import PlanningGeometryLocalPose
+
+    from unirobosim_isaaclab.native_planning import _EntityBinding, _JointBinding, _PlanningAdmission
+
+    world, spec, _, joint, _, _ = _fixture()
+    spec.embedded_binding = None
+    world._spec.entities = (spec,)
+    binding = _EntityBinding(
+        spec.path,
+        "entity.robot",
+        "base",
+        "link.base",
+        {},
+        (_JointBinding(joint, "base", "tip", PlanningGeometryLocalPose(), "slide"),),
+        ("/robot",),
+    )
+    admission = object.__new__(_PlanningAdmission)
+    admission._world = world
+    admission._frames = {}
+    admission._geometries = {}
+    admission._entities = {}
+    admission._ground_geometry = lambda: None
+    admission._entity_catalog = lambda _: (NS(entity_id="entity.robot"), (), (joint,), (), (), binding)
+    admission._verify_complete_native_world = lambda: None
+    catalog = admission._build_catalog()
+    effective = catalog.joints[0]
+    assert effective is admission._entities[spec.path].joint_bindings[0].descriptor
+    assert effective.upper == 0.019999999552965164
+    assert joint.upper == 0.02
+
+
+def test_public_catalog_preserves_effective_native_precision(tmp_path):
+    from unirobosim_isaaclab.config import IsaacLabAdapterConfig
+    from unirobosim_isaaclab.descriptor import descriptor_for_config
+    from unirobosim_isaaclab.provider import IsaacLabSession
+
+    from .test_planning_scene import _FakePlanningRuntime, _make_planning_fixture
+
+    fixture = _make_planning_fixture(tmp_path)
+    updated = replace(fixture.catalog.joints[0], lower=-6.2831854820251465, upper=6.2831854820251465)
+    fixture = replace(fixture, catalog=replace(fixture.catalog, joints=(updated, *fixture.catalog.joints[1:])))
+    runtime = _FakePlanningRuntime(fixture)
+    config = IsaacLabAdapterConfig()
+    session = IsaacLabSession(descriptor_for_config(config), runtime, config=config, on_close=lambda _: None)
+    try:
+        world = session.build(fixture.spec)
+        actual = next(j for j in world.planning_scene_catalog().joints if j.joint_id == updated.joint_id)
+        assert actual is updated
+        assert (actual.lower, actual.upper) == (-6.2831854820251465, 6.2831854820251465)
+    finally:
+        session.close()
