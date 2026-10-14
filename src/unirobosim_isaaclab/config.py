@@ -27,6 +27,8 @@ class IsaacLabAdapterConfig:
     render: bool = False
     anti_aliasing: str = "fxaa"
     texture_streaming: bool = False
+    # Primary-only exclusions retain original shadow/GI contributions.
+    camera_primary_ray_exclusions: bool = False
     render_on_step: bool = True
     max_render_hz: float | None = None
     default_dome_light_intensity: float | None = None
@@ -61,6 +63,10 @@ class IsaacLabAdapterConfig:
     worker_kit_launch_idle_timeout_s: float = 90.0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.camera_primary_ray_exclusions, bool):
+            raise ValidationError("camera_primary_ray_exclusions must be boolean", operation="isaaclab.config.validate")
+        if self.camera_primary_ray_exclusions and (not self.enable_cameras or not self.render):
+            raise ValidationError("primary ray exclusions require cameras/render", operation="isaaclab.config.validate")
         if (
             not isinstance(self.headless, bool)
             or not isinstance(self.enable_cameras, bool)

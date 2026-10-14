@@ -1,3 +1,7 @@
+## 0.10.27 production compatibility
+
+Restores the previously production-validated static primary-ray camera partition and stationary kinematic render-state support from 0.10.25.post2, while retaining 0.10.26 soft-mount and effective-joint-limit behavior. No extra render pass or per-frame visibility switching is introduced. Production headless-physics keeps `UNIROBOSIM_ISAACLAB_CAMERA_PRIMARY_RAY_EXCLUSIONS=false`; enable it explicitly for the validated camera replay profile. Nonzero kinematic replay velocity remains rejected before any frame mutation.
+
 # Changelog
 
 ## 0.10.26

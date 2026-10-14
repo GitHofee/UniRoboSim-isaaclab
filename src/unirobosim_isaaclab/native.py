@@ -951,6 +951,8 @@ def _launcher_kwargs(config: IsaacLabAdapterConfig, *, process_isolated: bool = 
         # Register the RTX lens schema before Kit creates any USD schema registry.
         # Late extension enablement cannot refresh an already cached registry.
         launcher_args["kit_args"] = "--enable omni.usd.schema.omni_lens_distortion"
+        if config.camera_primary_ray_exclusions:
+            launcher_args["kit_args"] += " --/renderer/scenePartitioning/enabled=true"
         launcher_args["anti_aliasing"] = _ANTI_ALIASING_MODES[config.anti_aliasing]
         # Isaac Sim 6 defaults SimulationApp to RealTimePathTracing.  That path
         # depends on the NGX/DLSS Ray Reconstruction denoiser and degrades to a
@@ -1277,6 +1279,8 @@ class IsaacLabNativeWorld:
         self._debug_mesh_signatures: dict[tuple[str, str, str], tuple[object, ...]] = {}
         self._step_index = 0
         self._render_revision = 0
+        self._camera_ensure_render_calls = 0
+        self._camera_group_render_transactions = 0
         self._rendered_revision = -1
         self._joint_maps: dict[EntityPath, tuple[int, ...]] = {}
         self._initial_articulation: dict[EntityPath, tuple[Any, Any, Any]] = {}
@@ -1551,7 +1555,10 @@ class IsaacLabNativeWorld:
             self._appearance_keys = apply_appearance(
                 self._m.sim_utils.get_current_stage(), self._m.carb.settings.get_settings(), self._config.appearance
             )
-        self._configure_camera_render_exclusions()
+        if self._config.camera_primary_ray_exclusions:
+            self._configure_primary_ray_partitions()
+        else:
+            self._configure_camera_render_exclusions()
         self._apply_runtime_physics_profile()
         self._initialize_physics_activation()
         self._sim.reset()
@@ -2698,6 +2705,44 @@ class IsaacLabNativeWorld:
             bindingStrength=self._m.UsdShade.Tokens.strongerThanDescendants,
         )
 
+    def _configure_primary_ray_partitions(self) -> None:
+        self._camera_exclusion_groups = {}
+        self._primary_ray_partition_scope = None
+        cameras = tuple(entity for entity in self._spec.entities if entity.camera is not None)
+        if not any(entity.camera.render_exclusions for entity in cameras):
+            return
+        from .primary_ray_partition import concrete_camera_path
+
+        selections = {}
+        known = {entity.path for entity in self._spec.entities}
+        for environment in range(self._spec.environments.count):
+            for entity in cameras:
+                paths = []
+                for selection in entity.camera.render_exclusions:
+                    if selection.entity_path not in known:
+                        raise ValueError("primary exclusion refers to unknown entity")
+                    paths.append(
+                        f"/World/env_{environment}/{_native_name(selection.entity_path)}/{selection.relative_prim_path}"
+                    )
+                camera = concrete_camera_path(self._cameras[entity.path].cfg.prim_path, environment)
+                selections[camera] = tuple(sorted(set(paths)))
+        import carb
+        from pxr import UsdShade
+
+        from .primary_ray_partition import PrimaryRayPartitionScope
+
+        self._primary_ray_partition_scope = PrimaryRayPartitionScope(
+            self._m.sim_utils.get_current_stage(),
+            selections,
+            usd=self._m.Usd,
+            sdf=self._m.Sdf,
+            usd_geom=self._m.UsdGeom,
+            usd_physics=self._m.UsdPhysics,
+            usd_shade=UsdShade,
+            settings=carb.settings.get_settings(),
+        )
+        print("[FastSim primary ray partitions]", self._primary_ray_partition_scope.receipt, flush=True)
+
     def _configure_camera_render_exclusions(self) -> None:
         cameras = tuple(entity for entity in self._spec.entities if entity.camera is not None)
         self._camera_exclusion_groups = {}
@@ -2959,8 +3004,10 @@ class IsaacLabNativeWorld:
                 if self._config.fluid_render_mode == "particles" or fluid_set.render_state_visualization_enabled:
                     self._sync_particle_visual(fluid_set.points, float(fluid_set.points.GetWidthsAttr().Get()[0]) / 2.0)
         if getattr(self, "_camera_exclusion_groups", None):
+            self._camera_group_render_transactions = getattr(self, "_camera_group_render_transactions", 0) + 1
             self._render_camera_exclusion_groups()
         else:
+            self._camera_ensure_render_calls = getattr(self, "_camera_ensure_render_calls", 0) + 1
             self._sim.render()
         self._rendered_revision = revision
 
@@ -3775,8 +3822,6 @@ class IsaacLabNativeWorld:
         for rigid_update in frame.rigid_bodies:
             if rigid_update.path not in self._kinematic_rigids:
                 raise ValueError("native render state references an unknown rigid body")
-            if self._kinematic_rigids[rigid_update.path]:
-                raise ValueError("native render state rigid updates require a dynamic body")
             environments = selection(rigid_update.environment_indices, environment_count, "environment")
             row_count = len(environments)
             if rigid_update.path in self._usd_rigid_views:
@@ -3827,6 +3872,12 @@ class IsaacLabNativeWorld:
                 poses = torch.cat((positions + self._origins[env_ids], orientations), dim=1)
                 velocities = torch.cat((linear, angular), dim=1)
                 rigid_stages.append(("high", rigid_update.path, target, env_ids, poses, velocities))
+            # PhysX kinematic bodies have no independently writable velocity.
+            # Admit stationary recorded state through the same mode-aware pose
+            # path as reset/restore; never silently discard a nonzero velocity.
+            # Keep this in prevalidation so rejection cannot partially apply a frame.
+            if self._kinematic_rigids[rigid_update.path] and bool(torch.any(velocities != 0).item()):
+                raise ValueError("native render state cannot restore nonzero kinematic rigid velocities")
             quaternion_norms = torch.linalg.vector_norm(orientations, dim=1)
             if not bool(torch.allclose(quaternion_norms, torch.ones_like(quaternion_norms), rtol=0.0, atol=1.0e-6)):
                 raise ValueError("native render state rigid orientations must be unit quaternions")
@@ -3955,13 +4006,14 @@ class IsaacLabNativeWorld:
                 target.set_joint_effort_target_index(target=zeros, env_ids=indices)
 
         for kind, path, target, indices, poses, velocities in rigid_stages:
+            kinematic = self._kinematic_rigids[path]
             if kind == "usd":
-                _write_usd_rigid_state(target, poses, velocities, indices, kinematic=False)
+                _write_usd_rigid_state(target, poses, velocities, indices, kinematic=kinematic)
                 forces, torques = self._usd_rigid_wrenches[path]
                 forces[indices] = 0.0
                 torques[indices] = 0.0
             else:
-                _write_high_level_rigid_state(target, poses, velocities, indices, kinematic=False)
+                _write_high_level_rigid_state(target, poses, velocities, indices, kinematic=kinematic)
                 zeros = torch.zeros((len(indices), 1, 3), device=poses.device, dtype=poses.dtype)
                 target.permanent_wrench_composer.set_forces_and_torques_index(
                     forces=zeros,
@@ -5898,7 +5950,29 @@ class IsaacLabNativeWorld:
             )
         return tuple(positions), tuple(velocities)
 
+    def _sample_capture_settings(self) -> None:
+        modules = getattr(self, "_m", None)
+        carb = getattr(modules, "carb", None)
+        if carb is None:
+            return
+        settings = carb.settings.get_settings()
+        values = tuple(
+            settings.get(key)
+            for key in (
+                "/rtx/rendermode",
+                "/rtx/post/aa/op",
+                "/rtx/indirectDiffuse/enabled",
+                "/rtx/ambientOcclusion/enabled",
+                "/rtx/hydra/faceCulling/enabled",
+                "/renderer/scenePartitioning/enabled",
+            )
+        )
+        histogram = getattr(self, "_capture_settings_histogram", {})
+        histogram[values] = histogram.get(values, 0) + 1
+        self._capture_settings_histogram = histogram
+
     def _camera_channel_output(self, camera: Any, name: str) -> Any:
+        self._sample_capture_settings()
         if getattr(self, "_camera_exclusion_groups", None):
             outputs = getattr(self, "_camera_group_outputs", {}).get(id(camera))
             if outputs is None or name not in outputs:
@@ -6387,6 +6461,19 @@ class IsaacLabNativeWorld:
     def _close(self, *, notify_runtime: bool) -> None:
         if self._closed:
             return
+        print("[FastSim capture settings histogram]", getattr(self, "_capture_settings_histogram", {}), flush=True)
+        print(
+            "[FastSim render counters]",
+            {
+                "ensure_global_render_calls": getattr(self, "_camera_ensure_render_calls", 0),
+                "group_render_transactions": getattr(self, "_camera_group_render_transactions", 0),
+            },
+            flush=True,
+        )
+        primary_scope = getattr(self, "_primary_ray_partition_scope", None)
+        if primary_scope is not None:
+            primary_scope.close()
+            self._primary_ray_partition_scope = None
         self._restore_render_quality()
         self._closed = True
         sim = self._sim

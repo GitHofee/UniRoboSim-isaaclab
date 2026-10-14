@@ -1,6 +1,7 @@
 """Public lightweight entry point for the Isaac Lab adapter."""
 
 import os
+from collections.abc import Mapping
 
 from unirobosim import ValidationError
 
@@ -79,7 +80,12 @@ def create_provider(config: IsaacLabAdapterConfig | None = None) -> IsaacLabProv
     return IsaacLabProvider(config)
 
 
-def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvider:
+def create_easy_provider(
+    *,
+    launch_profile: str | None = None,
+    backend_options: Mapping[str, object] | None = None,
+    camera_primary_ray_exclusions: bool | None = None,
+) -> IsaacLabProvider:
     """Create the installed EasyAPI profile selected by an argument or the environment.
 
     An explicit profile is authoritative and deliberately avoids consulting process
@@ -116,6 +122,42 @@ def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvid
             operation="isaaclab.launch_profile.resolve",
         )
 
+    if backend_options is not None and not isinstance(backend_options, Mapping):
+        raise ValidationError(
+            "Isaac Lab backend_options must be a mapping", operation="isaaclab.backend_options.resolve"
+        )
+    options = dict(backend_options or {})
+    if set(options) - {"camera_primary_ray_exclusions"}:
+        raise ValidationError(
+            "unsupported Isaac Lab backend_options fields", operation="isaaclab.backend_options.resolve"
+        )
+    if "camera_primary_ray_exclusions" in options:
+        selected = options["camera_primary_ray_exclusions"]
+        if not isinstance(selected, bool):
+            raise ValidationError(
+                "camera_primary_ray_exclusions must be boolean", operation="isaaclab.backend_options.resolve"
+            )
+        if camera_primary_ray_exclusions is not None and camera_primary_ray_exclusions is not selected:
+            raise ValidationError(
+                "conflicting camera_primary_ray_exclusions arguments", operation="isaaclab.backend_options.resolve"
+            )
+        camera_primary_ray_exclusions = selected
+    raw_primary = os.environ.get("UNIROBOSIM_ISAACLAB_CAMERA_PRIMARY_RAY_EXCLUSIONS")
+    if raw_primary is not None:
+        if raw_primary not in {"true", "false"}:
+            raise ValidationError(
+                "primary ray exclusions environment value must be true or false",
+                operation="isaaclab.primary_ray.resolve",
+            )
+        env_primary = raw_primary == "true"
+        if camera_primary_ray_exclusions is not None and camera_primary_ray_exclusions is not env_primary:
+            raise ValidationError(
+                "conflicting primary ray exclusions environment and explicit options",
+                operation="isaaclab.primary_ray.resolve",
+            )
+        camera_primary_ray_exclusions = env_primary
+    if camera_primary_ray_exclusions is None:
+        camera_primary_ray_exclusions = False
     worker_startup_hard_timeout_s, worker_kit_launch_idle_timeout_s = recommended_startup_budgets()
     fluid_render_mode = os.environ.get(ISAACLAB_FLUID_RENDER_MODE_ENV, "particles")
     return IsaacLabProvider(
@@ -126,13 +168,10 @@ def create_easy_provider(*, launch_profile: str | None = None) -> IsaacLabProvid
             render_on_step=render_on_step,
             max_render_hz=max_render_hz,
             fluid_render_mode=fluid_render_mode,
+            camera_primary_ray_exclusions=camera_primary_ray_exclusions,
             fluid_surface_color_rgb=_fluid_surface_color_from_environment(),
-            fluid_surface_distance_scale=_positive_environment_float(
-                ISAACLAB_FLUID_SURFACE_DISTANCE_SCALE_ENV, 2.5
-            ),
-            fluid_surface_smoothing_scale=_positive_environment_float(
-                ISAACLAB_FLUID_SURFACE_SMOOTHING_SCALE_ENV, 3.0
-            ),
+            fluid_surface_distance_scale=_positive_environment_float(ISAACLAB_FLUID_SURFACE_DISTANCE_SCALE_ENV, 2.5),
+            fluid_surface_smoothing_scale=_positive_environment_float(ISAACLAB_FLUID_SURFACE_SMOOTHING_SCALE_ENV, 3.0),
             fluid_damping=_positive_environment_float(ISAACLAB_FLUID_DAMPING_ENV, 0.0),
             fluid_cohesion=_positive_environment_float(ISAACLAB_FLUID_COHESION_ENV, 0.0),
             fluid_adhesion=_positive_environment_float(ISAACLAB_FLUID_ADHESION_ENV, 0.0),
