@@ -55,6 +55,7 @@ from unirobosim import (
 )
 
 from ._collision_mesh import single_exact_convex_mesh
+from ._collision_offsets import collision_offset_provenance
 from ._planning_cache import PlanningMeshCache
 from ._planning_cache import cache_key as planning_cache_key
 from .native import IsaacLabNativeWorld, _native_name
@@ -1072,7 +1073,7 @@ class _PlanningAdmission:
         axis = str(self._m.UsdGeom.Plane(plane).GetAxisAttr().Get() or "Z").upper()
         if axis != "Z":
             raise NativePlanningError("collision_geometry_unsupported")
-        self._validate_collision_common(plane)
+        contact_response = self._validate_collision_common(plane)
         pose, scale = _matrix_local_pose(
             self._m,
             self._xform_cache.GetLocalToWorldTransform(plane),
@@ -1088,6 +1089,7 @@ class _PlanningAdmission:
                 "axis": axis,
                 "pose": [pose.position_m, pose.orientation_xyzw],
                 "native_uniform_scale": scale[0],
+                **({"contact_response": contact_response} if contact_response is not None else {}),
             }
         )
         return PlanningGeometryDescriptor(
@@ -2032,7 +2034,7 @@ class _PlanningAdmission:
             upper,
         )
 
-    def _validate_collision_common(self, prim: Any) -> None:
+    def _validate_collision_common(self, prim: Any) -> dict[str, Any] | None:
         if not collision_enabled_for_planning(self._m.UsdPhysics, prim):
             raise NativePlanningError("catalog_invalid")
         applied = set(prim.GetAppliedSchemas())
@@ -2057,12 +2059,9 @@ class _PlanningAdmission:
         ):
             raise NativePlanningError("collision_filter_unsupported")
         physx = self._m.PhysxSchema.PhysxCollisionAPI(prim)
-        if physx:
-            for attribute in (physx.GetContactOffsetAttr(), physx.GetRestOffsetAttr()):
-                if attribute.HasAuthoredValueOpinion():
-                    value = attribute.Get()
-                    if value is None or not math.isfinite(float(value)) or float(value) != 0.0:
-                        raise NativePlanningError("collision_geometry_unsupported")
+        if not physx:
+            return None
+        return collision_offset_provenance(physx, float(self._m.UsdGeom.GetStageMetersPerUnit(prim.GetStage())))
 
     def _collision_geometry(
         self,
@@ -2083,7 +2082,7 @@ class _PlanningAdmission:
         collision_filter_self_owner_count: int = 0,
         enabled_self_collisions: bool = True,
     ) -> tuple[PlanningGeometryDescriptor, ...]:
-        self._validate_collision_common(prim)
+        contact_response = self._validate_collision_common(prim)
         matrix = _effective_collision_relative_transform(self._m, prim, owner_body)
         mesh_capable = not any(
             prim.IsA(schema) for schema in (self._m.UsdGeom.Cube, self._m.UsdGeom.Sphere, self._m.UsdGeom.Cylinder)
@@ -2115,6 +2114,8 @@ class _PlanningAdmission:
             "collision_mask": collision_mask,
             "enabled_self_collisions": enabled_self_collisions,
         }
+        if contact_response is not None:
+            common["contact_response"] = contact_response
         if prim.IsA(self._m.UsdGeom.Cube):
             size = float(self._m.UsdGeom.Cube(prim).GetSizeAttr().Get())
             if not math.isfinite(size) or size <= 0.0:
@@ -2653,7 +2654,7 @@ class _PlanningAdmission:
         *,
         motion: PlanningGeometryMotionClass | None = None,
     ) -> tuple[object, ...]:
-        self._validate_collision_common(prim)
+        contact_response = self._validate_collision_common(prim)
         matrix = _effective_collision_relative_transform(
             self._m,
             prim,
@@ -2669,6 +2670,7 @@ class _PlanningAdmission:
         )
         common: tuple[object, ...] = (
             self._prim_signature(prim, root_path),
+            _json_sha256(contact_response) if contact_response is not None else None,
             local_pose,
             scale,
             reflection,

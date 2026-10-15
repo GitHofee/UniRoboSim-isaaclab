@@ -370,3 +370,58 @@ def test_native_tcp_roundoff_admission_keeps_affine_rejections(kind: str, explic
             assert native_planning._rotate(axis, binding.local_pose.orientation_xyzw) == pytest.approx(
                 tuple(matrix.TransformDir(Gf.Vec3d(*axis))), abs=1.0e-14
             )
+
+
+def test_real_usd_cube_offsets_change_provenance_not_geometric_surface():
+    Usd = pytest.importorskip("pxr.Usd")
+    UsdGeom = pytest.importorskip("pxr.UsdGeom")
+    UsdPhysics = pytest.importorskip("pxr.UsdPhysics")
+    Gf = pytest.importorskip("pxr.Gf")
+    Sdf = pytest.importorskip("pxr.Sdf")
+    from unirobosim import EntityPath, PlanningGeometryMotionClass
+
+    from unirobosim_isaaclab.native_planning import _PlanningAdmission
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    body = UsdGeom.Xform.Define(stage, "/Body").GetPrim()
+    cube = UsdGeom.Cube.Define(stage, "/Body/Shape")
+    cube.CreateSizeAttr(0.1)
+    prim = cube.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(prim)
+    contact = prim.CreateAttribute("physxCollision:contactOffset", Sdf.ValueTypeNames.Float)
+    rest = prim.CreateAttribute("physxCollision:restOffset", Sdf.ValueTypeNames.Float)
+    contact.Set(0.0005)
+    rest.Set(0.0)
+    admission = object.__new__(_PlanningAdmission)
+    admission._m = SimpleNamespace(
+        Usd=Usd,
+        UsdGeom=UsdGeom,
+        UsdPhysics=UsdPhysics,
+        Gf=Gf,
+        PhysxSchema=SimpleNamespace(
+            PhysxCollisionAPI=lambda p: SimpleNamespace(
+                GetContactOffsetAttr=lambda: p.GetAttribute("physxCollision:contactOffset"),
+                GetRestOffsetAttr=lambda: p.GetAttribute("physxCollision:restOffset"),
+            )
+        ),
+    )
+    admission._source_sha256 = lambda _: "a" * 64
+    spec = SimpleNamespace(path=EntityPath("/robot"))
+
+    def geometry():
+        return admission._collision_geometry(
+            spec, "robot", prim, body, None, "body", motion=PlanningGeometryMotionClass.STATIC
+        )[0]
+
+    before = stage.GetRootLayer().ExportToString()
+    first = geometry()
+    assert stage.GetRootLayer().ExportToString() == before
+    contact.Set(0.001)
+    second = geometry()
+    rest.Set(-0.0001)
+    third = geometry()
+    assert len({x.provenance_sha256 for x in (first, second, third)}) == 3
+    for field in ("inline", "parent_frame_T_geometry", "scale", "representation", "geometry_id"):
+        assert getattr(first, field) == getattr(second, field) == getattr(third, field)
+    assert first.inline.dimensions_m == pytest.approx((0.1, 0.1, 0.1))
