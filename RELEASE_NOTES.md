@@ -1,3 +1,9 @@
+# UniRoboSim Isaac Lab 0.10.29
+
+Adds explicit replay visibility on a single static/composite environment, requiring UniRoboSim >=0.10.12,<0.11. All bounded requests are validated before a world-owned anonymous USD session layer is installed. Source/effective visibility, native readback and ordered receipts are checked; failed reads roll back, and reset/close remove the scope. One batch is permitted until reset. Source assets, geometry and physics are not edited. Existing camera partition exclusions are retained.
+
+Focused CPU/backend/worker/package tests: 133 passed. Actual scene011/scene015 calibrated camera replay remains a required GPU canary before batch acceptance; this release note does not claim it passed. No simulator SDK, Mission or cuRobo changes.
+
 ## 0.10.27 production compatibility
 
 Restores the previously production-validated static primary-ray camera partition and stationary kinematic render-state support from 0.10.25.post2, while retaining 0.10.26 soft-mount and effective-joint-limit behavior. No extra render pass or per-frame visibility switching is introduced. Production headless-physics keeps `UNIROBOSIM_ISAACLAB_CAMERA_PRIMARY_RAY_EXCLUSIONS=false`; enable it explicitly for the validated camera replay profile. Nonzero kinematic replay velocity remains rejected before any frame mutation.
