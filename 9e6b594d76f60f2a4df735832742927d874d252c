@@ -1,0 +1,9 @@
+{
+  "tag": "v0.10.29.post1",
+  "source_sha": "9e6b594d76f60f2a4df735832742927d874d252c",
+  "release_url": "https://github.com/GitHofee/UniRoboSim-isaaclab/releases/tag/v0.10.29.post1",
+  "assets_sha256": {
+    "unirobosim_isaaclab-0.10.29.post1-py3-none-any.whl": "9ebb5b45bdf2dd0ccf61818a9569f1e168d1753579d1bc8d3d4c3f07fcc1ae28",
+    "unirobosim_isaaclab-0.10.29.post1.tar.gz": "7eaf66cdb1ba78973a38d369a53a7e4e798afdc9fe20b1f5fdc6a60e8b6c73d6"
+  }
+}
