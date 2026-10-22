@@ -33,7 +33,8 @@ def case_only_visibility_and_cleanup():
     scope.close()
     scope.close()
     assert UsdGeom.Imageable(mesh).ComputeVisibility() == "invisible"
-    assert list(stage.GetSessionLayer().subLayerPaths) == []
+    assert list(stage.GetSessionLayer().subLayerPaths) == [scope.layer.identifier]
+    assert scope.layer.empty
 
 
 def case_batch_validation_before_mutation():
@@ -89,6 +90,7 @@ def case_apply_once_reset_scope():
     roof = UsdGeom.Xform.Define(stage, path + "/ceilings")
     roof.GetVisibilityAttr().Set("invisible")
     world = SimpleNamespace(
+        _runtime=SimpleNamespace(_retained_visibility_layers=[]),
         _spec=SimpleNamespace(
             entities=(SimpleNamespace(path=EntityPath("/environment"), kind=EntityKind.COMPOSITE_SCENE),),
             environments=SimpleNamespace(count=1),
@@ -100,9 +102,13 @@ def case_apply_once_reset_scope():
     with pytest.raises(ValueError, match="already applied"):
         apply(world, (request(),))
     clear(world)
+    layer = world._render_visibility_layer
+    assert layer.empty
     assert roof.GetVisibilityAttr().Get() == "invisible"
     apply(world, (request(),))
     clear(world)
+    assert world._render_visibility_layer is layer
+    assert world._runtime._retained_visibility_layers == [layer]
     assert roof.GetVisibilityAttr().Get() == "invisible"
 
 
@@ -130,3 +136,24 @@ if __name__ == "__main__":
     from pxr import Usd, UsdGeom, Sdf
 
     globals()["case_" + sys.argv[1]](*sys.argv[2:])
+
+
+def test_runtime_retains_layers_until_application_teardown():
+    from types import SimpleNamespace
+    from unirobosim_isaaclab.native import IsaacLabNativeRuntime
+
+    runtime = IsaacLabNativeRuntime.__new__(IsaacLabNativeRuntime)
+    layer = object()
+    runtime._closed = False
+    runtime._active_world = None
+    runtime._retained_visibility_layers = [layer]
+    events = []
+
+    def close_app():
+        assert runtime._retained_visibility_layers == [layer]
+        events.append("closed")
+
+    runtime._app = SimpleNamespace(close=close_app)
+    runtime.close()
+    assert events == ["closed"]
+    assert runtime._retained_visibility_layers == []

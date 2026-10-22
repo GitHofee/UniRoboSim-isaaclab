@@ -1171,6 +1171,7 @@ class IsaacLabNativeRuntime:
         )
         self._config = config
         self._active_world: IsaacLabNativeWorld | None = None
+        self._retained_visibility_layers: list[object] = []
         self._closed = False
         if startup_progress is not None:
             startup_progress("runtime_ready")
@@ -1216,7 +1217,10 @@ class IsaacLabNativeRuntime:
             if world is not None:
                 world._close(notify_runtime=False)
         finally:
-            self._app.close()
+            try:
+                self._app.close()
+            finally:
+                self._retained_visibility_layers.clear()
 
 
 class IsaacLabNativeWorld:

@@ -1,3 +1,7 @@
+# UniRoboSim Isaac Lab 0.10.29.post1
+
+Retains the cleared replay visibility layer through native renderer teardown. Reset restores source visibility and reuses the same world-owned layer; runtime keeps a strong reference until SimulationApp.close completes. Avoids releasing the replay USD layer while RTX may retain weak references. Source assets and replay physics remain unchanged. Installed-wheel focused checks: 124 passed. A real Kit two-generation RGB render/clear/reapply/close check exited zero. The minimal old-version comparison also exited zero; the original production cleanup abort was not reproduced in the tiny scene, so full production-scene cleanup acceptance remains pending.
+
 # UniRoboSim Isaac Lab 0.10.29
 
 Adds explicit replay visibility on a single static/composite environment, requiring UniRoboSim >=0.10.12,<0.11. All bounded requests are validated before a world-owned anonymous USD session layer is installed. Source/effective visibility, native readback and ordered receipts are checked; failed reads roll back, and reset/close remove the scope. One batch is permitted until reset. Source assets, geometry and physics are not edited. Existing camera partition exclusions are retained.

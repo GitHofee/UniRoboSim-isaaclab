@@ -4,7 +4,7 @@ from unirobosim import EntityKind, RenderVisibilityOverride, RenderVisibilityRec
 
 
 class RenderVisibilityScope:
-    def __init__(self, stage, overrides, roots):
+    def __init__(self, stage, overrides, roots, *, layer=None):
         from pxr import Usd, UsdGeom, Sdf
 
         if type(overrides) is not tuple or not 1 <= len(overrides) <= 32:
@@ -42,9 +42,11 @@ class RenderVisibilityScope:
                     raise ValueError("visibility ancestor remains hidden")
                 ancestor = ancestor.GetParent()
             selected.append((request, path, str(attr.Get()), str(imageable.ComputeVisibility())))
-        self.layer = Sdf.Layer.CreateAnonymous("replay-render-visibility.usda")
+        self.layer = layer if layer is not None else Sdf.Layer.CreateAnonymous("replay-render-visibility.usda")
         session = stage.GetSessionLayer()
-        session.subLayerPaths = [self.layer.identifier, *session.subLayerPaths]
+        attached = self.layer.identifier in session.subLayerPaths
+        if not attached:
+            session.subLayerPaths = [self.layer.identifier, *session.subLayerPaths]
         receipts = []
         try:
             with Usd.EditContext(stage, self.layer):
@@ -65,13 +67,16 @@ class RenderVisibilityScope:
             self.receipts = tuple(receipts)
         except BaseException:
             self.close()
+            if not attached:
+                # No render has observed a failed transaction.
+                session.subLayerPaths = [p for p in session.subLayerPaths if p != self.layer.identifier]
             raise
 
     def close(self):
         if self.layer is not None:
-            session = self.stage.GetSessionLayer()
-            session.subLayerPaths = [p for p in session.subLayerPaths if p != self.layer.identifier]
-            self.layer = None
+            # RTX retains native weak references to rendered USD layers. Restore
+            # opinions without detaching or releasing the world-owned layer.
+            self.layer.Clear()
 
 
 def apply(world, overrides):
@@ -85,7 +90,15 @@ def apply(world, overrides):
         if e.kind in (EntityKind.STATIC_SCENE, EntityKind.COMPOSITE_SCENE)
         for i in range(world._spec.environments.count)
     }
-    scope = RenderVisibilityScope(world._m.sim_utils.get_current_stage(), overrides, roots)
+    from pxr import Sdf
+
+    layer = getattr(world, "_render_visibility_layer", None)
+    if layer is None:
+        layer = Sdf.Layer.CreateAnonymous("replay-render-visibility.usda")
+        world._render_visibility_layer = layer
+        # World teardown precedes SimulationApp teardown in the worker.
+        world._runtime._retained_visibility_layers.append(layer)
+    scope = RenderVisibilityScope(world._m.sim_utils.get_current_stage(), overrides, roots, layer=layer)
     world._render_visibility_scope = scope
     world._invalidate_render()
     return scope.receipts
