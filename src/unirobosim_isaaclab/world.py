@@ -1089,6 +1089,19 @@ class IsaacLabWorld:
         self._ensure_ready("world.capture_appearance")
         return self._native_call("world.capture_appearance", self._native.capture_appearance)
 
+    def apply_render_visibility(self, overrides):
+        from unirobosim import RENDER_VISIBILITY_CAPABILITY_ID
+        self._ensure_ready("world.apply_render_visibility")
+        if self._descriptor.capabilities.get(RENDER_VISIBILITY_CAPABILITY_ID) is None:
+            raise UnsupportedCapabilityError("render visibility is unavailable", operation="world.apply_render_visibility")
+        if self._spec.environments.count != 1:
+            raise UnsupportedCapabilityError("render visibility currently requires one environment", operation="world.apply_render_visibility")
+        before = self.tick
+        receipts = self._native_call("world.apply_render_visibility", lambda: self._native.apply_render_visibility(overrides))
+        if self.tick != before:
+            raise RuntimeError("render visibility advanced physics")
+        return receipts
+
     def apply_appearance(self, snapshot):
         self._ensure_ready("world.apply_appearance")
         return self._native_call("world.apply_appearance", lambda: self._native.apply_appearance(snapshot))

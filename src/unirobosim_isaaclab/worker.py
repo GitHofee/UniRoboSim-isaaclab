@@ -524,6 +524,8 @@ def _dispatch(
         return active, None, False
     if operation == "capture_appearance":
         return active, active.capture_appearance(), False
+    if operation == "apply_render_visibility":
+        return active, active.apply_render_visibility(args[0]), False
     if operation == "apply_appearance":
         return active, active.apply_appearance(args[0]), False
     if operation == "read_render_appearance":
@@ -1361,6 +1363,10 @@ class IsaacLabWorkerWorld:
     def capture_appearance(self):
         self._ensure_open("capture_appearance")
         return self._runtime._request("capture_appearance")
+
+    def apply_render_visibility(self, overrides):
+        self._ensure_open("apply_render_visibility")
+        return self._runtime._request("apply_render_visibility", overrides)
 
     def apply_appearance(self, snapshot):
         self._ensure_open("apply_appearance")

@@ -3310,6 +3310,8 @@ class IsaacLabNativeWorld:
             self._initial_deformable[path] = (state, target)
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
+        from .render_visibility import clear
+        clear(self)
         for path, meshes in getattr(self, "_render_deformables", {}).items():
             entity = self._entity_specs[path]
             spec = entity.deformable
@@ -5805,6 +5807,10 @@ class IsaacLabNativeWorld:
         self._sim.forward()
         self._invalidate_render()
 
+    def apply_render_visibility(self, overrides):
+        from .render_visibility import apply
+        return apply(self, overrides)
+
     def capture_appearance(self):
         from .native_appearance import capture
 
@@ -6470,6 +6476,8 @@ class IsaacLabNativeWorld:
             },
             flush=True,
         )
+        from .render_visibility import clear
+        clear(self)
         primary_scope = getattr(self, "_primary_ray_partition_scope", None)
         if primary_scope is not None:
             primary_scope.close()
