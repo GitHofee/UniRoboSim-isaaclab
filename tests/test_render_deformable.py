@@ -132,7 +132,7 @@ def test_public_deformable_replay_validates_topology_before_native_call():
         session.close()
 
 
-def test_particle_world_procedural_box_uses_raw_rigid_bridge():
+def test_particle_world_procedural_box_uses_managed_readback_asset():
     from unirobosim import BoxGeometrySpec, EntityKind, EntitySpec, Pose
 
     from unirobosim_isaaclab.native import IsaacLabNativeWorld
@@ -142,12 +142,20 @@ def test_particle_world_procedural_box_uses_raw_rigid_bridge():
     class Cfg(SimpleNamespace):
         InitialStateCfg = SimpleNamespace
 
-    def spawn(path, cfg, **kwargs):
-        calls.append((path, cfg, kwargs))
+    rigid_factory = object()
+    contact_factory = object()
+
+    def managed_factory(factory):
+        def construct(cfg):
+            asset = SimpleNamespace(cfg=cfg)
+            calls.append((factory, asset))
+            return asset
+
+        return construct
 
     prim = SimpleNamespace(HasAPI=lambda api: True)
     utils = SimpleNamespace(
-        CuboidCfg=lambda **kwargs: SimpleNamespace(func=spawn, **kwargs),
+        CuboidCfg=lambda **kwargs: SimpleNamespace(**kwargs),
         RigidBodyPropertiesCfg=SimpleNamespace,
         MassPropertiesCfg=SimpleNamespace,
         CollisionPropertiesCfg=SimpleNamespace,
@@ -156,10 +164,17 @@ def test_particle_world_procedural_box_uses_raw_rigid_bridge():
         get_current_stage=lambda: SimpleNamespace(GetPrimAtPath=lambda path: prim),
     )
     world = object.__new__(IsaacLabNativeWorld)
-    world._m = SimpleNamespace(RigidObjectCfg=Cfg, sim_utils=utils, UsdPhysics=SimpleNamespace(RigidBodyAPI=object()))
+    world._m = SimpleNamespace(
+        RigidObjectCfg=Cfg, RigidObject=rigid_factory,
+        ContactSensorCfg=SimpleNamespace, ContactSensor=contact_factory,
+        sim_utils=utils, UsdPhysics=SimpleNamespace(RigidBodyAPI=object()),
+    )
+    world._physical_asset_type = managed_factory
     world._has_fluid = True
     world._spec = SimpleNamespace(environments=SimpleNamespace(count=2))
     world._usd_rigids = {}
+    world._rigids = {}
+    world._contacts = {}
     world._kinematic_rigids = {}
     entity = EntitySpec(
         EntityPath("/box"),
@@ -168,10 +183,13 @@ def test_particle_world_procedural_box_uses_raw_rigid_bridge():
         box=BoxGeometrySpec(dimensions_m=(0.2, 0.3, 0.4), mass_kg=0.7),
     )
     world._author_rigid(entity)
-    assert len(world._usd_rigids[entity.path]) == 2
-    assert calls[0][1].mass_props.mass == 0.7
-    assert calls[0][1].size == (0.2, 0.3, 0.4)
-    assert calls[0][2]["translation"] == (1.0, 2.0, 3.0)
+    assert world._usd_rigids == {}
+    assert calls[0] == (rigid_factory, world._rigids[entity.path])
+    assert calls[1] == (contact_factory, world._contacts[entity.path])
+    cfg = world._rigids[entity.path].cfg
+    assert cfg.spawn.mass_props.mass == 0.7
+    assert cfg.spawn.size == (0.2, 0.3, 0.4)
+    assert cfg.init_state.pos == (1.0, 2.0, 3.0)
     assert world._kinematic_rigids[entity.path] is False
 
 
