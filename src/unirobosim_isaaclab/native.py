@@ -1447,6 +1447,8 @@ class IsaacLabNativeWorld:
         sim_cfg = sim_utils.SimulationCfg(
             dt=self._native_dt,
             gravity=self._spec.physics.gravity_m_s2,
+            # Keep rendering and official camera buffers on the configured GPU.
+            # Particle-world physical assets use the CPU readback frontend below.
             device=self._config.device,
             physics=physx_cfg,
             # PhysX 6 exposes particle state through USD sync, not the removed particle tensor view.
@@ -1497,9 +1499,8 @@ class IsaacLabNativeWorld:
                 )
         if has_fluid:
             # Isaac Sim 6.0 has no public particle tensor view. Particle state therefore uses
-            # PhysX-to-USD readback. Articulations and rigid bodies in these worlds use the raw
-            # Omni Physics bridge below because Isaac Lab's high-level assets assume a CUDA tensor
-            # frontend while readback deliberately selects a CPU frontend.
+            # PhysX-to-USD readback. The managed robot and rigid assets use the CPU tensor
+            # frontend so controls remain stable alongside that particle readback.
             self._sim.set_setting("/physics/suppressReadback", False)
             self._sim.set_setting("/physics/updateToUsd", True)
             self._sim.set_setting("/physics/updateParticlesToUsd", True)
@@ -1560,12 +1561,21 @@ class IsaacLabNativeWorld:
         else:
             self._configure_camera_render_exclusions()
         self._apply_runtime_physics_profile()
+        if has_fluid:
+            # PBD particles still require GPU dynamics. The CPU asset device
+            # selects the tensor frontend, not the PhysX particle solver.
+            scene_prim = self._m.sim_utils.get_current_stage().GetPrimAtPath("/physicsScene")
+            scene_api = self._m.PhysxSchema.PhysxSceneAPI.Apply(scene_prim)
+            scene_api.CreateEnableGPUDynamicsAttr().Set(True)
+            scene_api.CreateBroadphaseTypeAttr().Set("GPU")
         self._initialize_physics_activation()
         self._sim.reset()
         self._initialize_usd_articulations()
         self._initialize_usd_rigids()
         self._initialize_composite_physics()
-        self._origins = self._m.torch.tensor(self._origins_cpu, device=self._sim.device, dtype=self._m.torch.float32)
+        self._origins = self._m.torch.tensor(
+            self._origins_cpu, device=self._physical_tensor_device(), dtype=self._m.torch.float32
+        )
         self._initialize_articulations()
         self._initialize_rigids()
         self._initialize_deformables()
@@ -1736,7 +1746,7 @@ class IsaacLabNativeWorld:
                         tuple(entity.pose.position[axis] + origin[axis] for axis in range(3))
                         for origin in self._origins_cpu
                     ],
-                    device=self._sim.device,
+                    device=self._physical_tensor_device(),
                     dtype=self._m.torch.float32,
                 )
             elif path in self._articulations:
@@ -1816,11 +1826,44 @@ class IsaacLabNativeWorld:
             rot=first.orientation_xyzw,
         )
 
+    def _physical_tensor_device(self) -> Any:
+        assert self._sim is not None
+        return "cpu" if getattr(self, "_has_fluid", False) else self._sim.device
+
+    def _physical_asset_type(self, asset_type: Any) -> Any:
+        if not self._has_fluid:
+            return asset_type
+        # The public Lab classes are backend factories, not implementation
+        # bases. Subclass the pinned PhysX implementations without changing the
+        # global factory registry or any other world/camera.
+        from isaaclab_physx.assets.articulation import Articulation
+        from isaaclab_physx.assets.rigid_object import RigidObject
+        from isaaclab_physx.sensors.contact_sensor import ContactSensor
+
+        implementations = {
+            self._m.Articulation: Articulation,
+            self._m.RigidObject: RigidObject,
+            self._m.ContactSensor: ContactSensor,
+        }
+        implementation = implementations[asset_type]
+
+        class ParticleReadbackAsset(implementation):
+            # The pinned Lab SDK assigns SimulationContext.device during asset
+            # callbacks. PhysX particle USD readback exposes CPU state tensors;
+            # pin only physical assets to that frontend. Cameras keep their
+            # unmodified SDK class and the SimulationContext rendering device.
+            @property
+            def _device(self) -> str:
+                return "cpu"
+
+            @_device.setter
+            def _device(self, value: Any) -> None:
+                del value
+
+        return ParticleReadbackAsset
+
     def _author_articulation(self, entity: EntitySpec) -> None:
         assert entity.asset_uri is not None
-        if self._has_fluid:
-            self._author_usd_articulation(entity)
-            return
         cfg = self._m.ArticulationCfg(
             prim_path=f"/World/env_.*/{_native_name(entity.path)}",
             spawn=_usd_file_cfg(self._m, entity),
@@ -1843,7 +1886,7 @@ class IsaacLabNativeWorld:
                 )
             },
         )
-        asset = self._m.Articulation(cfg)
+        asset = self._physical_asset_type(self._m.Articulation)(cfg)
         self._articulations[entity.path] = asset
         root_paths = tuple(
             root + _articulation_mount_body_suffix(self._m, root, None)
@@ -1907,25 +1950,7 @@ class IsaacLabNativeWorld:
                     rot=entity.pose.orientation_xyzw,
                 ),
             )
-            if self._has_fluid:
-                # The particle readback profile selects the raw USD/PhysX tensor
-                # bridge for every rigid, including procedural cuboids. Creating
-                # a high-level RigidObject here mixes incompatible frontends.
-                bodies = []
-                stage = self._m.sim_utils.get_current_stage()
-                for index in range(self._spec.environments.count):
-                    root = f"/World/env_{index}/{_native_name(entity.path)}"
-                    cfg.spawn.func(
-                        root, cfg.spawn, translation=entity.pose.position, orientation=entity.pose.orientation_xyzw
-                    )
-                    prim = stage.GetPrimAtPath(root)
-                    if not prim.HasAPI(self._m.UsdPhysics.RigidBodyAPI):
-                        raise ValueError("procedural cuboid did not author a rigid body")
-                    bodies.append(_UsdRigid(rigid_prim=prim))
-                self._usd_rigids[entity.path] = tuple(bodies)
-                self._kinematic_rigids[entity.path] = False
-                return
-            self._rigids[entity.path] = self._m.RigidObject(cfg)
+            self._rigids[entity.path] = self._physical_asset_type(self._m.RigidObject)(cfg)
             self._kinematic_rigids[entity.path] = False
             contact_cfg = self._m.ContactSensorCfg(
                 prim_path=f"/World/env_.*/{_native_name(entity.path)}",
@@ -1937,12 +1962,9 @@ class IsaacLabNativeWorld:
                 history_length=0,
                 debug_vis=False,
             )
-            self._contacts[entity.path] = self._m.ContactSensor(contact_cfg)
+            self._contacts[entity.path] = self._physical_asset_type(self._m.ContactSensor)(contact_cfg)
             return
         assert entity.asset_uri is not None
-        if self._has_fluid:
-            self._author_usd_rigid(entity)
-            return
         name = _native_name(entity.path)
         cfg = self._m.RigidObjectCfg(
             prim_path=f"/World/env_.*/{name}",
@@ -1952,7 +1974,7 @@ class IsaacLabNativeWorld:
                 rot=entity.pose.orientation_xyzw,
             ),
         )
-        asset = self._m.RigidObject(cfg)
+        asset = self._physical_asset_type(self._m.RigidObject)(cfg)
         self._rigids[entity.path] = asset
         body_suffix: str | None = None
         kinematic: bool | None = None
@@ -1994,7 +2016,7 @@ class IsaacLabNativeWorld:
             history_length=0,
             debug_vis=False,
         )
-        self._contacts[entity.path] = self._m.ContactSensor(contact_cfg)
+        self._contacts[entity.path] = self._physical_asset_type(self._m.ContactSensor)(contact_cfg)
 
     def _author_usd_rigid(self, entity: EntitySpec) -> None:
         """Author a rigid through USD for worlds that require particle readback."""
@@ -3027,7 +3049,8 @@ class IsaacLabNativeWorld:
             assert self._origins is not None
             root_pose[:, :3] += self._origins
             positions = torch.zeros(
-                (self._spec.environments.count, len(native_names)), device=self._sim.device, dtype=torch.float32
+                (self._spec.environments.count, len(native_names)),
+                device=self._physical_tensor_device(), dtype=torch.float32
             )
             for public_index, native_index in enumerate(joint_map):
                 positions[:, native_index] = entity.initial_joint_positions[public_index]
@@ -3042,6 +3065,11 @@ class IsaacLabNativeWorld:
             ]
 
     def _usd_simulation_view(self) -> Any:
+        if self._has_fluid:
+            raise RuntimeError(
+                "particle-readback worlds require Isaac Lab managed assets; embedded or unbound "
+                "composite dynamics cannot use the raw PhysX tensor bridge"
+            )
         if self._usd_tensor_view is None:
             self._usd_tensor_view = self._m.physics_tensors.create_simulation_view("torch")
             self._usd_tensor_view.set_subspace_roots("/")
@@ -3126,7 +3154,6 @@ class IsaacLabNativeWorld:
 
         if not self._composite_scene_roots:
             return
-        tensor_view = self._usd_simulation_view()
         bound_articulation_roots = {
             self._prim_path_string(articulation.root_prim)
             for articulations in self._usd_articulations.values()
@@ -3162,7 +3189,7 @@ class IsaacLabNativeWorld:
             # that can have different DOF/link counts.
             for relative in expected_relative_roots:
                 paths = tuple(row[relative] for row in root_rows)
-                view = tensor_view.create_articulation_view(list(paths))
+                view = self._usd_simulation_view().create_articulation_view(list(paths))
                 if view.count != len(paths) or tuple(view.prim_paths) != paths:
                     raise RuntimeError(
                         "composite articulation view did not preserve environment order; "
@@ -3240,7 +3267,7 @@ class IsaacLabNativeWorld:
             environment_by_path = {path: environment for path, environment in path_rows}
             if len(environment_by_path) != len(requested_paths):
                 raise ValueError("composite rigid-body paths are not globally unique")
-            view = tensor_view.create_rigid_body_view(list(requested_paths))
+            view = self._usd_simulation_view().create_rigid_body_view(list(requested_paths))
             actual_paths = tuple(view.prim_paths)
             if view.count != len(requested_paths) or set(actual_paths) != set(requested_paths):
                 raise RuntimeError(
@@ -3296,7 +3323,9 @@ class IsaacLabNativeWorld:
                 _rotate_xyzw((float(row[0]), float(row[1]), float(row[2])), entity.pose.orientation_xyzw)
                 for row in entity.deformable.initial_velocities().rows()
             )
-            state[..., 3:] = torch.tensor(velocities, device=self._sim.device, dtype=state.dtype).unsqueeze(0)
+            state[..., 3:] = torch.tensor(
+                velocities, device=self._physical_tensor_device(), dtype=state.dtype
+            ).unsqueeze(0)
             target = None
             if entity.kind is EntityKind.VOLUME_DEFORMABLE:
                 target = asset.data.nodal_kinematic_target.torch.clone()
@@ -3853,21 +3882,23 @@ class IsaacLabNativeWorld:
                 if target is None or self._sim is None or self._origins is None:
                     raise ValueError("native render state references an unavailable rigid body")
                 env_ids = list(environments)
-                positions = tensor_payload(rigid_update.positions_m, (row_count, 3), device=self._sim.device)
+                positions = tensor_payload(
+                    rigid_update.positions_m, (row_count, 3), device=self._physical_tensor_device()
+                )
                 orientations = tensor_payload(
                     rigid_update.orientations_xyzw,
                     (row_count, 4),
-                    device=self._sim.device,
+                    device=self._physical_tensor_device(),
                 )
                 linear = tensor_payload(
                     rigid_update.linear_velocities_m_s,
                     (row_count, 3),
-                    device=self._sim.device,
+                    device=self._physical_tensor_device(),
                 )
                 angular = tensor_payload(
                     rigid_update.angular_velocities_rad_s,
                     (row_count, 3),
-                    device=self._sim.device,
+                    device=self._physical_tensor_device(),
                 )
                 poses = torch.cat((positions + self._origins[env_ids], orientations), dim=1)
                 velocities = torch.cat((linear, angular), dim=1)
@@ -4193,7 +4224,7 @@ class IsaacLabNativeWorld:
         if gains_changed:
             versions.invalidate()
         try:
-            target = self._m.torch.tensor(targets, device=self._sim.device, dtype=self._m.torch.float32)
+            target = self._m.torch.tensor(targets, device=self._physical_tensor_device(), dtype=self._m.torch.float32)
             zeros = (
                 self._m.torch.zeros_like(target)
                 if (mode is CommandMode.POSITION and (write_velocity or write_effort))
@@ -4603,9 +4634,15 @@ class IsaacLabNativeWorld:
             return
         asset = self._rigids[path]
         assert self._sim is not None
-        env_ids = self._m.torch.tensor(environment_indices, device=self._sim.device, dtype=self._m.torch.int64)
-        forces = self._m.torch.tensor(forces_n, device=self._sim.device, dtype=self._m.torch.float32).unsqueeze(1)
-        torques = self._m.torch.tensor(torques_n_m, device=self._sim.device, dtype=self._m.torch.float32).unsqueeze(1)
+        env_ids = self._m.torch.tensor(
+            environment_indices, device=self._physical_tensor_device(), dtype=self._m.torch.int64
+        )
+        forces = self._m.torch.tensor(
+            forces_n, device=self._physical_tensor_device(), dtype=self._m.torch.float32
+        ).unsqueeze(1)
+        torques = self._m.torch.tensor(
+            torques_n_m, device=self._physical_tensor_device(), dtype=self._m.torch.float32
+        ).unsqueeze(1)
         stored_forces, stored_torques = self._rigid_wrenches[path]
         stored_forces[list(environment_indices)] = forces[:, 0, :].to(
             device=stored_forces.device,
@@ -5458,14 +5495,17 @@ class IsaacLabNativeWorld:
             asset = self._rigids[path]
             assert self._sim is not None and self._origins is not None
             pose = self._m.torch.tensor(
-                ((*position_m, *orientation_xyzw),), device=self._sim.device, dtype=self._m.torch.float32
+                ((*position_m, *orientation_xyzw),),
+                device=self._physical_tensor_device(), dtype=self._m.torch.float32
             )
             pose[:, :3] += self._origins[environment_index : environment_index + 1]
-            env_ids = self._m.torch.tensor((environment_index,), device=self._sim.device, dtype=self._m.torch.int64)
+            env_ids = self._m.torch.tensor(
+                (environment_index,), device=self._physical_tensor_device(), dtype=self._m.torch.int64
+            )
             _write_high_level_rigid_state(
                 asset,
                 pose,
-                self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
+                self._m.torch.zeros((1, 6), device=self._physical_tensor_device(), dtype=self._m.torch.float32),
                 env_ids,
                 kinematic=self._kinematic_rigids[path],
             )
@@ -5517,13 +5557,18 @@ class IsaacLabNativeWorld:
         asset = self._articulations[path]
         assert self._sim is not None and self._origins is not None
         root_pose = self._m.torch.tensor(
-            ((*pose.position, *pose.orientation_xyzw),), device=self._sim.device, dtype=self._m.torch.float32
+            ((*pose.position, *pose.orientation_xyzw),),
+            device=self._physical_tensor_device(), dtype=self._m.torch.float32
         )
         root_pose[:, :3] += self._origins[environment_index : environment_index + 1]
-        env_ids = self._m.torch.tensor((environment_index,), device=self._sim.device, dtype=self._m.torch.int64)
+        env_ids = self._m.torch.tensor(
+            (environment_index,), device=self._physical_tensor_device(), dtype=self._m.torch.int64
+        )
         asset.write_root_pose_to_sim_index(root_pose=root_pose, env_ids=env_ids)
         asset.write_root_velocity_to_sim_index(
-            root_velocity=self._m.torch.zeros((1, 6), device=self._sim.device, dtype=self._m.torch.float32),
+            root_velocity=self._m.torch.zeros(
+                (1, 6), device=self._physical_tensor_device(), dtype=self._m.torch.float32
+            ),
             env_ids=env_ids,
         )
 
@@ -5755,7 +5800,7 @@ class IsaacLabNativeWorld:
         assert self._origins is not None
         for row_index, environment in enumerate(environment_indices):
             for column_index, point in enumerate(point_indices):
-                value = self._m.torch.tensor(targets[row_index][column_index], device=self._sim.device)
+                value = self._m.torch.tensor(targets[row_index][column_index], device=self._physical_tensor_device())
                 current[row_index, point, :3] = value + self._origins[environment]
                 current[row_index, point, 3] = 0.0
         asset.write_nodal_kinematic_target_to_sim_index(current, env_ids=env_ids)
