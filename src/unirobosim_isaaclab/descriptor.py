@@ -225,6 +225,13 @@ CAPABILITIES = CapabilitySet(
                 "unavailable for USD-bridged rigid bodies in particle-fluid worlds",
             ),
         ),
+        CapabilityDeclaration(
+            CapabilityId("contact.diagnostics@1"),
+            FrozenMap({"sampling": "physics-substep", "frame": "environment-local-world", "default_enabled": False}),
+            limitations=(
+                "one environment; standalone rigid subject; rigid or articulation-link partners; no particle fluid",
+            ),
+        ),
         CapabilityDeclaration(CapabilityId("state.articulation@1")),
         CapabilityDeclaration(RENDER_QUALITY_CAPABILITY_ID),
         CapabilityDeclaration(RENDER_VISIBILITY_CAPABILITY_ID),

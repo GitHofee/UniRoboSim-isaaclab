@@ -19,8 +19,12 @@ from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 from unirobosim import (
+    ArticulationDiagnosticsRequest,
+    ArticulationDriveEvidence,
     CameraModality,
     CommandMode,
+    ContactDiagnosticsRequest,
+    ContactDiagnosticsSample,
     DebugBatch,
     DebugLifetimeMode,
     DebugMeshResource,
@@ -1276,6 +1280,8 @@ class IsaacLabNativeWorld:
         self._render_transform_publishers: dict[tuple[str, ...], Any] = {}
         self._usd_tensor_view: Any | None = None
         self._contacts: dict[EntityPath, Any] = {}
+        self._contact_diagnostics: Any = None
+        self._contact_diagnostics_epoch = 0
         self._render_deformables: dict[EntityPath, list[Any]] = {}
         self._deformables: dict[EntityPath, Any] = {}
         self._fluids: dict[EntityPath, tuple[_FluidSet, ...]] = {}
@@ -3324,6 +3330,8 @@ class IsaacLabNativeWorld:
             self._initial_deformable[path] = (state, target)
 
     def reset(self, environment_indices: tuple[int, ...]) -> None:
+        self.stop_contact_diagnostics()
+
         from .compliant_connection import clear
 
         clear(self, environment_indices)
@@ -5261,6 +5269,7 @@ class IsaacLabNativeWorld:
         if type(state) is not dict:
             raise ValueError("checkpoint native state must be a dictionary")
         staged = self._stage_checkpoint(state)
+        self.stop_contact_diagnostics()
         rollback = self._stage_checkpoint(self.capture_checkpoint())
         try:
             self._apply_staged_checkpoint(staged)
@@ -5774,6 +5783,102 @@ class IsaacLabNativeWorld:
         self._sim.forward()
         self._update_assets(0.0)
         self._invalidate_render()
+
+    def articulation_diagnostics(
+        self, request: ArticulationDiagnosticsRequest,
+    ) -> tuple[ArticulationDriveEvidence, ...]:
+        if self._spec.environments.count != 1:
+            raise ValueError("drive diagnostics requires one environment")
+        path = request.entity_path
+        if path not in self._usd_articulation_views and path not in self._articulations:
+            raise ValueError("drive diagnostics requires an articulation tensor view")
+        spec = self._entity_specs[path]
+        if any(name not in spec.joint_names for name in request.joint_names):
+            raise ValueError("drive diagnostics selected an unknown joint")
+        indices = [self._joint_maps[path][spec.joint_names.index(name)] for name in request.joint_names]
+        usd_view = path in self._usd_articulation_views
+        view = self._usd_articulation_views[path] if usd_view else self._articulations[path].root_view
+        # Read the existing simulator-owned view. No setters, stepping, waking, or USD inference.
+        getters = (view.get_dof_positions, view.get_dof_velocities,
+                   view.get_dof_position_targets, view.get_dof_velocity_targets,
+                   view.get_dof_stiffnesses, view.get_dof_dampings,
+                   view.get_dof_max_forces, view.get_dof_actuation_forces)
+        columns = [getter()[0, indices].detach().cpu().tolist() if usd_view
+                   else getter().numpy()[0, indices].tolist() for getter in getters]
+        return tuple(ArticulationDriveEvidence(name, *(float(c[i]) for c in columns))
+                     for i, name in enumerate(request.joint_names))
+
+    def _static_contact_path_pose(self, geometry_id: str) -> tuple[str, tuple[float, ...]]:
+        raise ValueError("static contact selection requires admitted planning geometry")
+
+    def start_contact_diagnostics(self, request: ContactDiagnosticsRequest) -> int:
+        from unirobosim import StaticContactTarget
+
+        from .contact_diagnostics import NativeContactDiagnostics
+
+        if self._contact_diagnostics is not None:
+            raise RuntimeError("contact diagnostics already has an owner")
+        if self._spec.environments.count != 1 or self._has_fluid:
+            raise ValueError("contact diagnostics requires one environment without particle fluid")
+        if request.subject.entity_path not in self._rigids and request.subject.entity_path not in self._articulations:
+            raise ValueError("contact diagnostics subject must be a rigid or articulation body")
+        stage = self._m.sim_utils.get_current_stage()
+        paths = []
+        static_poses: dict[int, tuple[float, ...]] = {}
+        for index, target in enumerate((request.subject, *request.partners)):
+            if isinstance(target, StaticContactTarget):
+                path, pose = self._static_contact_path_pose(target.geometry_id)
+                paths.append(path)
+                static_poses[index] = pose
+                continue
+            if target.entity_path not in self._rigids and target.entity_path not in self._articulations:
+                raise ValueError("contact diagnostics target is not a supported rigid/articulation body")
+            root = stage.GetPrimAtPath(f"/World/env_0/{_native_name(target.entity_path)}")
+            if not root:
+                raise ValueError("contact diagnostics target root is absent")
+            matches = [str(p.GetPath()) for p in self._m.Usd.PrimRange(root)
+                       if p.HasAPI(self._m.UsdPhysics.RigidBodyAPI)
+                       and (target.link_name is None or p.GetName() == target.link_name)]
+            if len(matches) != 1:
+                raise ValueError("contact diagnostics target must resolve to exactly one rigid body")
+            paths.append(matches[0])
+        if len(set(paths)) != len(paths):
+            raise ValueError("contact diagnostics selections resolve to the same physical body")
+        assert self._sim is not None
+        actual_dt = float(self._sim.get_physics_dt())
+        if not math.isclose(actual_dt, self._native_dt, rel_tol=1e-10, abs_tol=1e-12):
+            raise ValueError("contact diagnostics native timestep differs from the admitted timestep")
+        # Reuse the simulator-owned public Warp view; do not create another lifecycle owner.
+        tensor = self._sim.physics_sim_view
+        if tensor is None:
+            raise RuntimeError("contact diagnostics requires an active simulation view")
+        bodies: list[Any] = [static_poses[i] if i in static_poses else tensor.create_rigid_body_view(p)
+                  for i, p in enumerate(paths)]
+        if any(v.count != 1 or tuple(v.prim_paths) != (p,)
+               for i, (v, p) in enumerate(zip(bodies, paths, strict=True)) if i not in static_poses):
+            raise ValueError("contact diagnostics rigid-body mapping changed")
+        contact = tensor.create_rigid_contact_view(paths[0], filter_patterns=paths[1:],
+                                                  max_contact_data_count=request.max_contact_points)
+        raw_filters = contact.filter_paths
+        filters = tuple(p for group in raw_filters for p in ((group,) if isinstance(group, str) else group))
+        if (contact.sensor_count != 1 or contact.filter_count != len(paths)-1
+                or tuple(contact.sensor_paths) != (paths[0],) or filters != tuple(paths[1:])):
+            raise ValueError(
+                f"contact diagnostics pair mapping is ambiguous: sensors={contact.sensor_paths!r}, "
+                f"filters={raw_filters!r}, counts={(contact.sensor_count, contact.filter_count)!r}"
+            )
+        self._contact_diagnostics = NativeContactDiagnostics(request, bodies, contact, self._origins_cpu[0])
+        self._contact_diagnostics_epoch += 1
+        return self._contact_diagnostics_epoch
+
+    def contact_diagnostics(self, epoch: int, after_sequence: int) -> tuple[int, tuple[ContactDiagnosticsSample, ...]]:
+        evidence = self._contact_diagnostics
+        if evidence is None or epoch != self._contact_diagnostics_epoch:
+            raise ValueError("contact diagnostics is inactive or its epoch is stale")
+        return evidence.sequence, evidence.read(after_sequence)
+
+    def stop_contact_diagnostics(self) -> None:
+        self._contact_diagnostics = None
 
     def read_contact(self, path: EntityPath) -> Matrix:
         if path in self._usd_rigids:
@@ -6474,11 +6579,17 @@ class IsaacLabNativeWorld:
                     self._sync_all_mounted_cameras()
                 # Particle instances must see the positions after this physics step.
                 deferred_particle_render = render and bool(self._fluids)
+                evidence = getattr(self, "_contact_diagnostics", None)
+                if evidence is not None:
+                    evidence.begin_step()
                 self._sim.step(render=render and not deferred_particle_render)
                 self._invalidate_render()
                 if render and not deferred_particle_render:
                     self._mark_rendered()
                 self._update_assets(self._native_dt)
+                if evidence is not None:
+                    evidence.sample(self._step_index+1, substep_index+1, self._spec.physics.substeps, self._native_dt)
+
                 if (getattr(self, "_runtime_connections", None)
                         or getattr(self._spec, "compliant_connections", ())):
                     from .compliant_connection import update, update_declared
@@ -6514,6 +6625,7 @@ class IsaacLabNativeWorld:
     def _close(self, *, notify_runtime: bool) -> None:
         if self._closed:
             return
+        self.stop_contact_diagnostics()
         print("[FastSim capture settings histogram]", getattr(self, "_capture_settings_histogram", {}), flush=True)
         print(
             "[FastSim render counters]",

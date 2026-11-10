@@ -35,6 +35,7 @@ def _check_capsule(axis, expected, rotated):
         expected = tuple(matrix.TransformDir(Gf.Vec3d(*expected)).GetNormalized())
     UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = SimpleNamespace(
         Usd=Usd,
         UsdGeom=UsdGeom,
@@ -75,6 +76,7 @@ def _check_elliptical():
     capsule.AddScaleOp().Set((1.0, 1.01, 1.0))
     UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = SimpleNamespace(
         Usd=Usd,
         UsdGeom=UsdGeom,

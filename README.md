@@ -219,6 +219,14 @@ the target dimensions when non-uniform scaling of a mechanism is required.
 
 ## Planning-scene compatibility
 
+Convex planning resources reproduce the composed PhysX convex hull or convex
+decomposition cooking attributes, including registered defaults. The source USD
+is not modified. These parameters participate in both cooking and resolved-resource
+cache identities and geometry provenance; pre-fix cache entries are not reused.
+Time-varying, blocked or nonfinite cooking values fail closed. This corrects
+planning geometry without changing physical collision filters, drives or visuals;
+it is not a readback of the simulator's already-cooked contact hulls.
+
 Adapter 0.10.22 requires UniRoboSim Core `>=0.10.8,<0.11`, authors its implicit ground plane locally without Isaac Nucleus access, adds physical checkpoints, and defines entity pose as the imported asset-root USD Prim pose. Physical root-link and child-link poses remain explicit planning link states. Initial spawn captures the authored entity-to-physical-root transform and converts the public entity pose into Isaac Lab's physical-root `init_state`; runtime `set_pose` uses the same retargeting rule, and reset restores both frames. Pose-preserving runtime attachments write USD FixedJoint frames relative to the targeted rigid-body Prims, so authored center-of-mass offsets cannot snap an attached child. Entity-level pose reads and writes remove authored scale and shear before extracting rotation and normalize the quaternion explicitly; they target the same Prim and move the associated physical bodies coherently without changing articulation joints or authored scale. FastSim worlds may additionally carry an immutable `balanced` physics profile, which caps effective PhysX articulation solver iterations at `16/1`; `accurate` and standalone worlds preserve authored values. The adapter also renders resource-backed debug meshes as filled native USD overlays and exposes `planning.scene@2`. Named planning frames are physical references declared with `name`, `owner_link_name`, and `source`; they do not encode grasp, place, handle, or task semantics. Older declaration schemas fail explicitly. A PhysX `convexHull` collision carrier may be the Mesh itself or a container with exactly one descendant Mesh that has no nested `PhysicsCollisionAPI`; ambiguous multi-Mesh and nested-collider carriers still fail closed.
 
 Static and composite USD scenes expose immutable planning resources plus live world
@@ -375,6 +383,45 @@ refreshing parents; selected backing nodes require zero relative initial velocit
 the installed schema does not document a unit. It is not `linear_damping_per_s`.
 Initial authoring failures fail the whole World build and clean the newly created
 soft-body roots; partially authored bodies must never continue simulation.
+
+
+## Optional contact diagnostics
+
+`contact.diagnostics@1` is a default-off `ContactDiagnosticsWorld` extension.
+Start it with a `ContactDiagnosticsRequest` selecting a standalone rigid subject
+and explicit rigid/articulation-link partners (`KinematicTarget`). Start returns
+an epoch. `contact_diagnostics(epoch, after_sequence)` reads bounded,
+non-destructive history, bounded by the requested substep count and 262,144 force points;
+a stale epoch or overwritten cursor fails explicitly.
+Stop, reset, checkpoint restore, or world close releases collection.
+Each sample identifies its world step, one-based substep, substep count, and
+actual physics timestep. Forces act on the subject, in environment-local world
+coordinates, in newtons. Normal and friction points are separate. Torque is
+computed at the **start-of-substep** subject COM from each force's own application point.
+`*_start_*` fields preserve that contact-generation frame; other body poses/velocities
+are post-integration. Native mass is included for force-balance checks. Pose arrays
+contain XYZ followed by XYZW; velocity contains linear then angular SI components.
+The measurements alone do not establish a friction limit. Isaac Lab currently
+supports one environment without particle fluid; unsupported backends reject the
+optional capability. Collection adds readback cost and does not command bodies
+or change material values.
+
+Only explicitly selected contact pairs are reported. Unfiltered SDK aggregate forces
+are excluded: the validated runtime returned a doubled static-support aggregate,
+while selected pair forces passed per-substep momentum-balance checks.
+
+### Read-only navigation diagnostics
+
+Optional contact diagnostics can select an articulation link and static collision
+geometry IDs from the current admitted planning catalog. The adapter resolves
+exact native collider paths and rejects duplicate physical mappings. Static pose
+readback does not require adding a rigid body. Collection remains bounded and
+default-off. Drive diagnostics reads existing USD articulation tensor views in
+one environment, preserving requested joint order, without setters or stepping.
+Sleep values not exposed by this tensor interface are explicitly unsupported;
+no authored-value substitution is performed. Runtime support for selected static
+contact filters must be validated on the installed PhysX SDK; unsupported or
+ambiguous mappings fail rather than returning fabricated evidence.
 
 ### Explicit replay visibility
 

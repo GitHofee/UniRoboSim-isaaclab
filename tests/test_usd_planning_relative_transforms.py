@@ -71,6 +71,7 @@ def test_composed_owner_relative_queries_preserve_scale_and_mesh_coordinates(
     assert source
     shared = UsdGeom.XformCache()
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = MODULES
     admission._xform_cache = shared
     admission._walk = lambda prim: tuple(Usd.PrimRange(prim, Usd.TraverseInstanceProxies()))
@@ -130,6 +131,7 @@ def test_composed_mesh_reset_below_carrier_is_rejected() -> None:
     source, stage = _composed_stage(instanceable=True, owner_reset=True)
     UsdGeom.Xformable(source.GetPrimAtPath("/Asset/Body/Carrier/Mesh")).SetResetXformStack(True)
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = MODULES
     admission._walk = lambda prim: tuple(Usd.PrimRange(prim, Usd.TraverseInstanceProxies()))
     with pytest.raises(NativePlanningError, match="collision_cooking_failed"):
@@ -198,6 +200,7 @@ def test_same_prim_collision_and_clone_keep_body_and_ancestor_scale(instanceable
     body.CreateSizeAttr(1.0)
     UsdPhysics.CollisionAPI.Apply(body.GetPrim())
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = MODULES
     admission._validate_collision_common = lambda prim: None
     admission._source_sha256 = lambda spec: "a" * 64
@@ -230,6 +233,7 @@ def test_mesh_as_its_own_carrier_keeps_original_vertices(instanceable: bool) -> 
     source, stage = _composed_stage(instanceable=instanceable, owner_reset=True)
     assert source
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = MODULES
     admission._walk = lambda prim: tuple(Usd.PrimRange(prim, Usd.TraverseInstanceProxies()))
     for name in ("reference", "clone"):
@@ -266,6 +270,7 @@ def test_native_named_frames_and_clones_handle_self_but_reject_intermediate_rese
         ),
     )
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = MODULES
     admission._xform_cache = UsdGeom.XformCache()
     admission._walk = lambda prim: tuple(Usd.PrimRange(prim, Usd.TraverseInstanceProxies()))
@@ -345,6 +350,7 @@ def test_native_tcp_roundoff_admission_keeps_affine_rejections(kind: str, explic
         }}),
     )
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = MODULES
     admission._xform_cache = UsdGeom.XformCache()
     admission._walk = lambda prim: tuple(Usd.PrimRange(prim))
@@ -394,6 +400,7 @@ def test_real_usd_cube_offsets_change_provenance_not_geometric_surface():
     contact.Set(0.0005)
     rest.Set(0.0)
     admission = object.__new__(_PlanningAdmission)
+    admission._contact_prim_paths = {}
     admission._m = SimpleNamespace(
         Usd=Usd,
         UsdGeom=UsdGeom,

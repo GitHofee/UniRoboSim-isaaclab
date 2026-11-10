@@ -56,6 +56,7 @@ from unirobosim import (
 
 from ._collision_mesh import single_exact_convex_mesh
 from ._collision_offsets import collision_offset_provenance
+from ._convex_cooking import ConvexCookingParameters, apply_convex_cooking_parameters, convex_cooking_parameters
 from ._planning_cache import PlanningMeshCache
 from ._planning_cache import cache_key as planning_cache_key
 from .native import IsaacLabNativeWorld, _native_name
@@ -78,7 +79,7 @@ _MAX_GEOMETRY_RESOURCE_BYTES = 64 * 1024 * 1024
 _MAX_FILTERED_COLLISION_BODIES = 128
 _MAX_FILTER_CLIQUE_SEARCH_STATES = 1_000_000
 _COLLISION_FILTER_PROFILE = "usd-effective-owner-pairs-to-bilateral-bitmask-v1"
-_PROVENANCE_PROFILE = "isaaclab-3.0-complete-collision-forest-v5"
+_PROVENANCE_PROFILE = "isaaclab-3.0-complete-collision-forest-v6"
 _MESH_CANONICALIZATION = "float32-le-vertices-then-uint32-le-triangles-v1"
 _COMPOSITE_ENTITY_POSE = "__container_entity_pose__"
 _SUPPORTED_COLLISION_SCHEMAS = frozenset(
@@ -846,9 +847,10 @@ class _PlanningAdmission:
         self._entities: dict[EntityPath, _EntityBinding] = {}
         self._frames: dict[str, _FrameBinding] = {}
         self._geometries: dict[str, _GeometryBinding] = {}
+        self._contact_prim_paths: dict[str, str] = {}
         self._source_sha_by_entity: dict[EntityPath, str] = {}
         self._mesh_inputs: dict[tuple[str, str], _MeshInput] = {}
-        self._convex_cache: dict[tuple[str, str], tuple[tuple[bytes, int, int], ...]] = {}
+        self._convex_cache: dict[tuple[str, str, str], tuple[tuple[bytes, int, int], ...]] = {}
         self._triangle_cache: dict[str, tuple[bytes, int, int]] = {}
         self._accounted_bodies: set[str] = set()
         self._accounted_colliders: set[str] = set()
@@ -2197,6 +2199,7 @@ class _PlanningAdmission:
             mesh_capable=mesh_capable,
         )
         geometry_id = _stable_id("geometry", spec.path.value, str(prim.GetPath()))
+        self._contact_prim_paths[geometry_id] = str(prim.GetPath())
         motion = _motion_class(self._m, owner_body) if motion is None else motion
         source_spec = spec if source_spec is None else source_spec
         source_sha = self._source_sha256(source_spec)
@@ -2323,12 +2326,15 @@ class _PlanningAdmission:
             "none",
         }:
             raise NativePlanningError("collision_geometry_unsupported")
+        cooking = convex_cooking_parameters(self._m, prim, approximation)
+        cooking_identity = cooking.identity if cooking is not None else "none"
         resolved_key = planning_cache_key(
             _PROVENANCE_PROFILE,
             _MESH_CANONICALIZATION,
             str(self._world._spec.build_resource_manifest_sha256),
             json.dumps(common, sort_keys=True, separators=(",", ":")),
             approximation,
+            cooking_identity,
         )
         mesh_source_sha = planning_cache_key("effective-mesh-v1", resolved_key)
         resolved_components = (
@@ -2386,7 +2392,7 @@ class _PlanningAdmission:
             components = (
                 resolved_components
                 if resolved_components is not None
-                else self._cook_convex_components(mesh_input, approximation)  # type: ignore[arg-type]
+                else self._cook_convex_components(mesh_input, approximation, cooking)  # type: ignore[arg-type]
             )
             if approximation == "convexHull" and len(components) != 1:
                 raise NativePlanningError("collision_cooking_failed")
@@ -2426,6 +2432,7 @@ class _PlanningAdmission:
                     "approximation": approximation,
                     "mesh_source_sha256": mesh_source_sha,
                     "component_index": component_index,
+                    "convex_cooking": cooking_identity,
                     "component_count": len(components),
                     "content_sha256": digest,
                     "canonicalization": _MESH_CANONICALIZATION,
@@ -2449,6 +2456,7 @@ class _PlanningAdmission:
                 content_profile=PlanningGeometryContentProfile.MESH_TRIANGLES_RAW_LE_V1,
                 resource_layout=layout,
             )
+            self._contact_prim_paths[component_geometry_id] = str(prim.GetPath())
             self._resources[component_geometry_id] = NativePlanningResource(
                 component_geometry_id,
                 representation,
@@ -2525,8 +2533,9 @@ class _PlanningAdmission:
         self,
         mesh_input: _MeshInput,
         approximation: str,
+        cooking: ConvexCookingParameters,
     ) -> tuple[tuple[bytes, int, int], ...]:
-        cache_key = (approximation, mesh_input.source_sha256)
+        cache_key = (approximation, mesh_input.source_sha256, cooking.identity)
         cached = self._convex_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -2534,9 +2543,10 @@ class _PlanningAdmission:
         persistent_key = planning_cache_key(
             _PROVENANCE_PROFILE,
             _MESH_CANONICALIZATION,
-            "physx-convex-v1",
+            "physx-convex-v2",
             approximation,
             mesh_input.source_sha256,
+            cooking.identity,
         )
         persistent = self._persistent_mesh_cache.get(persistent_key)
         if persistent is not None:
@@ -2558,6 +2568,7 @@ class _PlanningAdmission:
         UsdPhysics.CollisionAPI.Apply(clone.GetPrim())
         mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(clone.GetPrim())
         mesh_collision.GetApproximationAttr().Set(approximation)
+        apply_convex_cooking_parameters(self._m, clone.GetPrim(), cooking)
         cache = UsdUtils.StageCache.Get()
         stage_id_object = cache.Insert(temporary)
         result_values: list[object] = []
@@ -3311,6 +3322,21 @@ class IsaacLabNativePlanningWorld(IsaacLabNativeWorld):
         if self._planning_admission is None:
             raise NativePlanningError("native_failure")
         return self._planning_admission
+
+    def _static_contact_path_pose(self, geometry_id: str) -> tuple[str, tuple[float, ...]]:
+        admission = self._planning()
+        binding = admission._geometries.get(geometry_id)
+        if binding is None or binding.descriptor.motion_class is not PlanningGeometryMotionClass.STATIC:
+            raise ValueError("contact geometry is absent or not static")
+        path = admission._contact_prim_paths.get(geometry_id)
+        if path is None:
+            raise ValueError("static contact geometry has no native collider mapping")
+        prim = admission._stage.GetPrimAtPath(path)
+        if not prim or not prim.HasAPI(self._m.UsdPhysics.CollisionAPI):
+            raise ValueError("static contact collider is absent")
+        matrix = self._m.UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+        q = matrix.ExtractRotationQuat().GetNormalized()
+        return path, (*tuple(matrix.ExtractTranslation()), *tuple(q.GetImaginary()), float(q.GetReal()))
 
     def planning_catalog(self, environment_index: int = 0) -> NativePlanningCatalog:
         if type(environment_index) is not int or not 0 <= environment_index < self._spec.environments.count:

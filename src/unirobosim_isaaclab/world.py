@@ -19,6 +19,8 @@ from unirobosim import (
     RENDER_STATE_CAPABILITY_ID,
     ArrayValue,
     ArticulationCommand,
+    ArticulationDiagnosticsRequest,
+    ArticulationDiagnosticsSnapshot,
     ArticulationState,
     BuildFingerprint,
     BuildReport,
@@ -27,6 +29,8 @@ from unirobosim import (
     CheckpointFidelity,
     CheckpointRestoreResult,
     CommandError,
+    ContactDiagnosticsBatch,
+    ContactDiagnosticsRequest,
     ContactState,
     DebugBatch,
     DebugPublishReport,
@@ -66,6 +70,7 @@ from unirobosim import (
     SensorChannel,
     SensorSample,
     StaleHandleError,
+    StaticContactTarget,
     Tick,
     UniRoboSimError,
     UnsupportedCapabilityError,
@@ -78,7 +83,9 @@ from unirobosim import (
 
 from .native_protocols import (
     NativeArticulationCommand,
+    NativeArticulationDiagnosticsDriver,
     NativeCameraCalibration,
+    NativeContactDiagnosticsDriver,
     NativeEncodedSensorFrame,
     NativeEncodedSensorRequest,
     NativeEntityPrimState,
@@ -940,6 +947,54 @@ class IsaacLabWorld:
             angular_velocities_rad_s=ArrayValue.from_rows(angular_velocities),
             tick=self.tick,
         )
+
+    def articulation_diagnostics(self, request: ArticulationDiagnosticsRequest) -> ArticulationDiagnosticsSnapshot:
+        operation = "world.articulation_diagnostics"
+        self._ensure_ready(operation)
+        if type(request) is not ArticulationDiagnosticsRequest:
+            raise ValidationError("invalid articulation diagnostics request", operation=operation)
+        self.resolve(request.entity_path)
+        if not isinstance(self._native, NativeArticulationDiagnosticsDriver):
+            raise UnsupportedCapabilityError("native drive diagnostics is unavailable", operation=operation)
+        driver = self._native
+        drives = self._native_call(operation, lambda: driver.articulation_diagnostics(request))
+        return ArticulationDiagnosticsSnapshot(
+            self.world_id, self.generation, self._step_index, request.entity_path, drives,
+        )
+
+    def start_contact_diagnostics(self, request: ContactDiagnosticsRequest) -> int:
+        operation = "world.start_contact_diagnostics"
+        self._ensure_ready(operation)
+        if type(request) is not ContactDiagnosticsRequest:
+            raise ValidationError("request must be a ContactDiagnosticsRequest", operation=operation)
+        if self._spec.environments.count != 1 or any(e.kind is EntityKind.PARTICLE_FLUID for e in self._spec.entities):
+            raise UnsupportedCapabilityError(
+                "contact diagnostics requires one environment without fluid", operation=operation,
+            )
+        for target in (request.subject, *request.partners):
+            if not isinstance(target, StaticContactTarget):
+                self.resolve(target.entity_path)
+        driver = self._contact_diagnostics_driver(operation)
+        return self._native_call(operation, lambda: driver.start_contact_diagnostics(request))
+
+    def _contact_diagnostics_driver(self, operation: str) -> NativeContactDiagnosticsDriver:
+        if not isinstance(self._native, NativeContactDiagnosticsDriver):
+            raise UnsupportedCapabilityError("native contact diagnostics is unavailable", operation=operation)
+        return self._native
+
+    def contact_diagnostics(self, epoch: int, after_sequence: int = 0) -> ContactDiagnosticsBatch:
+        operation = "world.contact_diagnostics"
+        self._ensure_ready(operation)
+        if type(epoch) is not int or epoch < 1 or type(after_sequence) is not int or after_sequence < 0:
+            raise ValidationError("invalid contact diagnostics epoch or cursor", operation=operation)
+        driver = self._contact_diagnostics_driver(operation)
+        last, samples = self._native_call(operation, lambda: driver.contact_diagnostics(epoch, after_sequence))
+        return ContactDiagnosticsBatch(self.world_id, self.generation, epoch, last, samples)
+
+    def stop_contact_diagnostics(self) -> None:
+        operation = "world.stop_contact_diagnostics"
+        self._ensure_ready(operation)
+        self._native_call(operation, self._contact_diagnostics_driver(operation).stop_contact_diagnostics)
 
     def read_contact(self, handle: EntityHandle, force_threshold_n: float = 1.0e-6) -> ContactState:
         operation = "world.read_contact"
