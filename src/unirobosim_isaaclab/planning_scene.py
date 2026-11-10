@@ -82,6 +82,10 @@ def validate_planning_build_spec(spec: WorldSpec, *, backend_id: str) -> None:
                 world_id=spec.world_id,
                 entity_path=entity.path.value,
             ) from None
+        # Particle fluids are simulated but intentionally excluded from the
+        # native planning catalog; they do not provide static collision geometry.
+        if entity.kind is EntityKind.PARTICLE_FLUID:
+            continue
         if entity.kind in _SOFT_KINDS:
             raise PlanningSceneIncompleteError(
                 "the Isaac Lab planning profile does not admit soft-matter collision participants",
